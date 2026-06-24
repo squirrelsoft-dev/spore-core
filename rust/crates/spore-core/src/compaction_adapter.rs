@@ -540,6 +540,34 @@ mod tests {
         assert_eq!(block, "# audit\nAUDIT BODY\n\n# style\nSTYLE BODY");
     }
 
+    #[test]
+    fn render_context_block_appends_memory_after_guides() {
+        // #160: memory items render into the SAME structural block, after the
+        // guides, as plain content joined by blank lines.
+        use crate::memory::{MemoryId, MemoryItem, MemorySource, MemoryStatus, SemanticMemory};
+        let mem = SemanticMemory {
+            id: MemoryId::new("m1"),
+            content: "MEMORY CONTENT".into(),
+            source: MemorySource::Manual,
+            domain: None,
+            version: 1,
+            previous_versions: vec![],
+            created_at: crate::memory::Timestamp::new("2026-06-24T00:00:00Z"),
+            updated_at: crate::memory::Timestamp::new("2026-06-24T00:00:00Z"),
+            status: MemoryStatus::Active,
+        };
+        let sources = ContextSources {
+            guides: vec![crate::guide_registry::Guide::skill("audit", "AUDIT BODY")],
+            memory: vec![MemoryItem {
+                memory: mem,
+                relevance_score: 0.9,
+            }],
+            ..Default::default()
+        };
+        let block = render_context_block(&sources);
+        assert_eq!(block, "# audit\nAUDIT BODY\n\nMEMORY CONTENT");
+    }
+
     // ---- should_compact threshold ---------------------------------------
 
     #[test]

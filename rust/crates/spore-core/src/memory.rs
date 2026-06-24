@@ -36,7 +36,9 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::harness::SessionId;
+use std::sync::Arc;
+
+use crate::harness::{BoxFut, SessionId};
 
 // ============================================================================
 // Identity & time
@@ -248,31 +250,101 @@ pub enum MemoryError {
 // Trait
 // ============================================================================
 
-#[trait_variant::make(Send)]
+/// Boundary for persisting and retrieving knowledge across sessions (issue #8).
+///
+/// Declared with the hand-rolled [`BoxFut`] idiom — NOT `#[trait_variant::make]`
+/// / RPITIT — so it is **`dyn`-compatible** (the [`ModelInterface`] /
+/// [`RunStrategy`] precedent, Deviation #12). This lets a consumer hold one
+/// `Arc<dyn MemoryProvider>` and inject it into
+/// [`HarnessBuilder::memory`](crate::HarnessBuilder::memory) so relevant
+/// memories reach the model structurally each turn (issue #160 / SC-26).
 pub trait MemoryProvider: Send + Sync {
     // ── Episodic ────────────────────────────────────────────────────────────
-    async fn store_episodic(&self, memory: EpisodicMemory) -> Result<MemoryId, MemoryError>;
-    async fn get_episodic(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Vec<EpisodicMemory>, MemoryError>;
+    fn store_episodic<'a>(
+        &'a self,
+        memory: EpisodicMemory,
+    ) -> BoxFut<'a, Result<MemoryId, MemoryError>>;
+    fn get_episodic<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+    ) -> BoxFut<'a, Result<Vec<EpisodicMemory>, MemoryError>>;
 
     // ── Semantic ────────────────────────────────────────────────────────────
-    async fn store_semantic(
-        &self,
+    fn store_semantic<'a>(
+        &'a self,
         memory: SemanticMemory,
         on_conflict: MergeStrategy,
-    ) -> Result<MemoryId, MemoryError>;
-    async fn get_semantic(&self, id: &MemoryId) -> Result<SemanticMemory, MemoryError>;
+    ) -> BoxFut<'a, Result<MemoryId, MemoryError>>;
+    fn get_semantic<'a>(&'a self, id: &'a MemoryId)
+        -> BoxFut<'a, Result<SemanticMemory, MemoryError>>;
 
     /// Primary retrieval path. Returns items with score >= `min_relevance`,
     /// capped at `max_items`, sorted by score descending. Only `Active` memories.
-    async fn query(&self, query: MemoryQuery) -> Result<Vec<MemoryItem>, MemoryError>;
+    fn query<'a>(&'a self, query: MemoryQuery) -> BoxFut<'a, Result<Vec<MemoryItem>, MemoryError>>;
 
     // ── Lifecycle ───────────────────────────────────────────────────────────
-    async fn deprecate(&self, id: &MemoryId, reason: &str) -> Result<(), MemoryError>;
-    async fn get_version_history(&self, id: &MemoryId) -> Result<Vec<SemanticMemory>, MemoryError>;
-    async fn mark_pending_review(&self, id: &MemoryId) -> Result<(), MemoryError>;
+    fn deprecate<'a>(
+        &'a self,
+        id: &'a MemoryId,
+        reason: &'a str,
+    ) -> BoxFut<'a, Result<(), MemoryError>>;
+    fn get_version_history<'a>(
+        &'a self,
+        id: &'a MemoryId,
+    ) -> BoxFut<'a, Result<Vec<SemanticMemory>, MemoryError>>;
+    fn mark_pending_review<'a>(&'a self, id: &'a MemoryId) -> BoxFut<'a, Result<(), MemoryError>>;
+}
+
+/// Blanket impl so an `Arc`-wrapped provider is itself a [`MemoryProvider`].
+/// Now that the trait is object-safe (`BoxFut`, not RPITIT), this makes
+/// `Arc<dyn MemoryProvider>` a first-class `MemoryProvider` — mirrors the
+/// `Arc<dyn ModelInterface>` blanket impl from SC-2. `?Sized` covers the `dyn`
+/// case; `Arc<StandardMemoryProvider>` works too.
+impl<T: MemoryProvider + ?Sized> MemoryProvider for Arc<T> {
+    fn store_episodic<'a>(
+        &'a self,
+        memory: EpisodicMemory,
+    ) -> BoxFut<'a, Result<MemoryId, MemoryError>> {
+        (**self).store_episodic(memory)
+    }
+    fn get_episodic<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+    ) -> BoxFut<'a, Result<Vec<EpisodicMemory>, MemoryError>> {
+        (**self).get_episodic(session_id)
+    }
+    fn store_semantic<'a>(
+        &'a self,
+        memory: SemanticMemory,
+        on_conflict: MergeStrategy,
+    ) -> BoxFut<'a, Result<MemoryId, MemoryError>> {
+        (**self).store_semantic(memory, on_conflict)
+    }
+    fn get_semantic<'a>(
+        &'a self,
+        id: &'a MemoryId,
+    ) -> BoxFut<'a, Result<SemanticMemory, MemoryError>> {
+        (**self).get_semantic(id)
+    }
+    fn query<'a>(&'a self, query: MemoryQuery) -> BoxFut<'a, Result<Vec<MemoryItem>, MemoryError>> {
+        (**self).query(query)
+    }
+    fn deprecate<'a>(
+        &'a self,
+        id: &'a MemoryId,
+        reason: &'a str,
+    ) -> BoxFut<'a, Result<(), MemoryError>> {
+        (**self).deprecate(id, reason)
+    }
+    fn get_version_history<'a>(
+        &'a self,
+        id: &'a MemoryId,
+    ) -> BoxFut<'a, Result<Vec<SemanticMemory>, MemoryError>> {
+        (**self).get_version_history(id)
+    }
+    fn mark_pending_review<'a>(&'a self, id: &'a MemoryId) -> BoxFut<'a, Result<(), MemoryError>> {
+        (**self).mark_pending_review(id)
+    }
 }
 
 // ============================================================================
@@ -370,151 +442,180 @@ fn jaccard(a: &str, b: &str) -> f32 {
 }
 
 impl MemoryProvider for StandardMemoryProvider {
-    async fn store_episodic(&self, memory: EpisodicMemory) -> Result<MemoryId, MemoryError> {
-        validate_content(&memory.content)?;
-        let mut store = self.inner.lock().unwrap();
-        let id = memory.id.clone();
-        store
-            .episodic
-            .entry(memory.session_id.clone())
-            .or_default()
-            .push(memory);
-        Ok(id)
+    fn store_episodic<'a>(
+        &'a self,
+        memory: EpisodicMemory,
+    ) -> BoxFut<'a, Result<MemoryId, MemoryError>> {
+        Box::pin(async move {
+            validate_content(&memory.content)?;
+            let mut store = self.inner.lock().unwrap();
+            let id = memory.id.clone();
+            store
+                .episodic
+                .entry(memory.session_id.clone())
+                .or_default()
+                .push(memory);
+            Ok(id)
+        })
     }
 
-    async fn get_episodic(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Vec<EpisodicMemory>, MemoryError> {
-        let store = self.inner.lock().unwrap();
-        Ok(store.episodic.get(session_id).cloned().unwrap_or_default())
+    fn get_episodic<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+    ) -> BoxFut<'a, Result<Vec<EpisodicMemory>, MemoryError>> {
+        Box::pin(async move {
+            let store = self.inner.lock().unwrap();
+            Ok(store.episodic.get(session_id).cloned().unwrap_or_default())
+        })
     }
 
-    async fn store_semantic(
-        &self,
+    fn store_semantic<'a>(
+        &'a self,
         mut memory: SemanticMemory,
         on_conflict: MergeStrategy,
-    ) -> Result<MemoryId, MemoryError> {
-        validate_content(&memory.content)?;
-        enforce_meta_agent_review(&mut memory);
+    ) -> BoxFut<'a, Result<MemoryId, MemoryError>> {
+        Box::pin(async move {
+            validate_content(&memory.content)?;
+            enforce_meta_agent_review(&mut memory);
 
-        let mut store = self.inner.lock().unwrap();
-        let id = memory.id.clone();
+            let mut store = self.inner.lock().unwrap();
+            let id = memory.id.clone();
 
-        if let Some(existing) = store.semantic.get(&id).cloned() {
-            match on_conflict {
-                MergeStrategy::Reject => {
-                    return Err(MemoryError::MergeConflict {
-                        existing: existing.id,
-                        reason: "memory exists; on_conflict=Reject".into(),
-                    });
-                }
-                MergeStrategy::Append => {
-                    let mut merged = existing;
-                    merged.content.push_str(&memory.content);
-                    merged.updated_at = memory.updated_at;
-                    store.semantic.insert(id.clone(), merged);
-                    return Ok(id);
-                }
-                MergeStrategy::Replace => {
-                    // Archive the existing record under a fresh archival id,
-                    // link it into the new memory's previous_versions, bump
-                    // version, and write the new record under the original id.
-                    let archive_id = Self::next_archive_id(&mut store, &existing.id);
-                    let mut archived = existing.clone();
-                    archived.id = archive_id.clone();
-                    store.semantic.insert(archive_id.clone(), archived);
+            if let Some(existing) = store.semantic.get(&id).cloned() {
+                match on_conflict {
+                    MergeStrategy::Reject => {
+                        return Err(MemoryError::MergeConflict {
+                            existing: existing.id,
+                            reason: "memory exists; on_conflict=Reject".into(),
+                        });
+                    }
+                    MergeStrategy::Append => {
+                        let mut merged = existing;
+                        merged.content.push_str(&memory.content);
+                        merged.updated_at = memory.updated_at;
+                        store.semantic.insert(id.clone(), merged);
+                        return Ok(id);
+                    }
+                    MergeStrategy::Replace => {
+                        // Archive the existing record under a fresh archival id,
+                        // link it into the new memory's previous_versions, bump
+                        // version, and write the new record under the original id.
+                        let archive_id = Self::next_archive_id(&mut store, &existing.id);
+                        let mut archived = existing.clone();
+                        archived.id = archive_id.clone();
+                        store.semantic.insert(archive_id.clone(), archived);
 
-                    memory.version = existing.version + 1;
-                    memory.previous_versions = {
-                        let mut v = existing.previous_versions.clone();
-                        v.push(archive_id);
-                        v
-                    };
+                        memory.version = existing.version + 1;
+                        memory.previous_versions = {
+                            let mut v = existing.previous_versions.clone();
+                            v.push(archive_id);
+                            v
+                        };
+                    }
                 }
             }
-        }
 
-        store.semantic.insert(id.clone(), memory);
-        Ok(id)
+            store.semantic.insert(id.clone(), memory);
+            Ok(id)
+        })
     }
 
-    async fn get_semantic(&self, id: &MemoryId) -> Result<SemanticMemory, MemoryError> {
-        let store = self.inner.lock().unwrap();
-        store
-            .semantic
-            .get(id)
-            .cloned()
-            .ok_or_else(|| MemoryError::NotFound(id.clone()))
+    fn get_semantic<'a>(
+        &'a self,
+        id: &'a MemoryId,
+    ) -> BoxFut<'a, Result<SemanticMemory, MemoryError>> {
+        Box::pin(async move {
+            let store = self.inner.lock().unwrap();
+            store
+                .semantic
+                .get(id)
+                .cloned()
+                .ok_or_else(|| MemoryError::NotFound(id.clone()))
+        })
     }
 
-    async fn query(&self, query: MemoryQuery) -> Result<Vec<MemoryItem>, MemoryError> {
-        let store = self.inner.lock().unwrap();
-        let mut scored: Vec<MemoryItem> = store
-            .semantic
-            .values()
-            .filter(|m| matches!(m.status, MemoryStatus::Active))
-            .filter(|m| match (&query.domain, &m.domain) {
-                (Some(want), Some(have)) => want == have,
-                (Some(_), None) => false,
-                _ => true,
-            })
-            .map(|m| MemoryItem {
-                memory: m.clone(),
-                relevance_score: jaccard(&query.task_instruction, &m.content),
-            })
-            .filter(|item| item.relevance_score >= query.min_relevance)
-            .collect();
-        scored.sort_by(|a, b| {
-            b.relevance_score
-                .partial_cmp(&a.relevance_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        scored.truncate(query.max_items as usize);
-        Ok(scored)
+    fn query<'a>(&'a self, query: MemoryQuery) -> BoxFut<'a, Result<Vec<MemoryItem>, MemoryError>> {
+        Box::pin(async move {
+            let store = self.inner.lock().unwrap();
+            let mut scored: Vec<MemoryItem> = store
+                .semantic
+                .values()
+                .filter(|m| matches!(m.status, MemoryStatus::Active))
+                .filter(|m| match (&query.domain, &m.domain) {
+                    (Some(want), Some(have)) => want == have,
+                    (Some(_), None) => false,
+                    _ => true,
+                })
+                .map(|m| MemoryItem {
+                    memory: m.clone(),
+                    relevance_score: jaccard(&query.task_instruction, &m.content),
+                })
+                .filter(|item| item.relevance_score >= query.min_relevance)
+                .collect();
+            scored.sort_by(|a, b| {
+                b.relevance_score
+                    .partial_cmp(&a.relevance_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            scored.truncate(query.max_items as usize);
+            Ok(scored)
+        })
     }
 
-    async fn deprecate(&self, id: &MemoryId, reason: &str) -> Result<(), MemoryError> {
-        let mut store = self.inner.lock().unwrap();
-        // Stamp the transition with "now", not the stale `updated_at` (which
-        // predates this deprecation).
-        let now = store.now_override.clone().unwrap_or_else(Timestamp::now);
-        let m = store
-            .semantic
-            .get_mut(id)
-            .ok_or_else(|| MemoryError::NotFound(id.clone()))?;
-        m.status = MemoryStatus::Deprecated {
-            reason: reason.to_string(),
-            at: now,
-        };
-        Ok(())
+    fn deprecate<'a>(
+        &'a self,
+        id: &'a MemoryId,
+        reason: &'a str,
+    ) -> BoxFut<'a, Result<(), MemoryError>> {
+        Box::pin(async move {
+            let mut store = self.inner.lock().unwrap();
+            // Stamp the transition with "now", not the stale `updated_at` (which
+            // predates this deprecation).
+            let now = store.now_override.clone().unwrap_or_else(Timestamp::now);
+            let m = store
+                .semantic
+                .get_mut(id)
+                .ok_or_else(|| MemoryError::NotFound(id.clone()))?;
+            m.status = MemoryStatus::Deprecated {
+                reason: reason.to_string(),
+                at: now,
+            };
+            Ok(())
+        })
     }
 
-    async fn get_version_history(&self, id: &MemoryId) -> Result<Vec<SemanticMemory>, MemoryError> {
-        let store = self.inner.lock().unwrap();
-        let head = store
-            .semantic
-            .get(id)
-            .ok_or_else(|| MemoryError::NotFound(id.clone()))?;
-        let mut chain = vec![head.clone()];
-        for prev_id in &head.previous_versions {
-            if let Some(prev) = store.semantic.get(prev_id) {
-                chain.push(prev.clone());
+    fn get_version_history<'a>(
+        &'a self,
+        id: &'a MemoryId,
+    ) -> BoxFut<'a, Result<Vec<SemanticMemory>, MemoryError>> {
+        Box::pin(async move {
+            let store = self.inner.lock().unwrap();
+            let head = store
+                .semantic
+                .get(id)
+                .ok_or_else(|| MemoryError::NotFound(id.clone()))?;
+            let mut chain = vec![head.clone()];
+            for prev_id in &head.previous_versions {
+                if let Some(prev) = store.semantic.get(prev_id) {
+                    chain.push(prev.clone());
+                }
             }
-        }
-        Ok(chain)
+            Ok(chain)
+        })
     }
 
-    async fn mark_pending_review(&self, id: &MemoryId) -> Result<(), MemoryError> {
-        let mut store = self.inner.lock().unwrap();
-        // Stamp the transition with "now", not the stale `updated_at`.
-        let now = store.now_override.clone().unwrap_or_else(Timestamp::now);
-        let m = store
-            .semantic
-            .get_mut(id)
-            .ok_or_else(|| MemoryError::NotFound(id.clone()))?;
-        m.status = MemoryStatus::PendingReview { proposed_at: now };
-        Ok(())
+    fn mark_pending_review<'a>(&'a self, id: &'a MemoryId) -> BoxFut<'a, Result<(), MemoryError>> {
+        Box::pin(async move {
+            let mut store = self.inner.lock().unwrap();
+            // Stamp the transition with "now", not the stale `updated_at`.
+            let now = store.now_override.clone().unwrap_or_else(Timestamp::now);
+            let m = store
+                .semantic
+                .get_mut(id)
+                .ok_or_else(|| MemoryError::NotFound(id.clone()))?;
+            m.status = MemoryStatus::PendingReview { proposed_at: now };
+            Ok(())
+        })
     }
 }
 
@@ -904,5 +1005,31 @@ mod tests {
         for (i, e) in eps.iter().enumerate() {
             assert_eq!(e.id, MemoryId::new(format!("e{i}")));
         }
+    }
+
+    // ── #160: the trait is dyn-compatible (BoxFut, not RPITIT), and the blanket
+    // `impl MemoryProvider for Arc<T>` makes an `Arc<dyn MemoryProvider>` a
+    // first-class provider you can store-and-query (the SC-2 precedent). If the
+    // conversion regressed to RPITIT, this would not compile. ──────────────────
+    #[tokio::test]
+    async fn arc_dyn_memory_provider_is_object_safe() {
+        let provider: Arc<dyn MemoryProvider> = Arc::new(StandardMemoryProvider::new());
+        provider
+            .store_semantic(sem("g1", "alpha beta gamma"), MergeStrategy::Reject)
+            .await
+            .unwrap();
+        // Query through the trait object (blanket Arc impl forwarding).
+        let hits = provider
+            .query(MemoryQuery {
+                task_instruction: "alpha beta gamma".into(),
+                domain: None,
+                session_id: None,
+                min_relevance: 0.1,
+                max_items: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].memory.id, MemoryId::new("g1"));
     }
 }

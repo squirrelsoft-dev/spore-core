@@ -1773,6 +1773,7 @@ mod tests {
             system_prompt: None,
             guides: Vec::new(),
             skills: None,
+            memory: None,
             model_params: crate::model::ModelParams::default(),
             auto_persist_sessions: false,
             prompt_tool_call_flag: None,

@@ -81,6 +81,7 @@ fn harness_for(fixture: &str) -> (StandardHarness, Arc<StorageProvider>) {
         system_prompt: None,
         guides: Vec::new(),
         skills: None,
+        memory: None,
         model_params: spore_core::ModelParams::default(),
         auto_persist_sessions: false,
         prompt_tool_call_flag: None,

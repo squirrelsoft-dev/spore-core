@@ -6234,6 +6234,85 @@ pub trait Harness: Send + Sync {
 // StandardHarness — the canonical implementation
 // ============================================================================
 
+/// A configured memory source for the live loop (issue #160 / SC-26 follow-up).
+///
+/// Bundles an `Arc<dyn MemoryProvider>` (now object-safe — see
+/// [`MemoryProvider`](crate::memory::MemoryProvider)) with the per-turn query
+/// policy. When present on [`HarnessConfig::memory`], the harness queries the
+/// provider each turn in
+/// [`build_context_sources`](StandardHarness::build_context_sources) and injects
+/// the returned items into [`ContextSources::memory`], which the production
+/// [`StandardCompactionAdapter`](crate::compaction_adapter::StandardCompactionAdapter)
+/// renders into the leading structural System block — alongside guides and
+/// skills, with no consumer-side wrapper. `None` (the default) leaves
+/// `ContextSources::memory` empty, byte-identical to pre-#160 behaviour.
+#[derive(Clone)]
+pub struct MemoryConfig {
+    /// The provider queried each turn.
+    pub provider: Arc<dyn crate::memory::MemoryProvider>,
+    /// Fixed query text. `None` (the default) uses the current task's
+    /// `instruction`, so retrieved memory tracks what the agent is working on.
+    pub query: Option<String>,
+    /// Optional domain filter passed to [`MemoryQuery::domain`](crate::memory::MemoryQuery).
+    pub domain: Option<String>,
+    /// Minimum relevance score; items below it are dropped. Defaults to `0.5`
+    /// (matching [`MemoryQuery`](crate::memory::MemoryQuery)'s default).
+    pub min_relevance: f32,
+    /// Maximum number of items injected per turn. Defaults to `10`.
+    pub max_items: u32,
+}
+
+impl MemoryConfig {
+    /// A memory source with the default query policy: query by the current
+    /// task instruction, `min_relevance = 0.5`, `max_items = 10`, no domain
+    /// filter.
+    pub fn new(provider: Arc<dyn crate::memory::MemoryProvider>) -> Self {
+        Self {
+            provider,
+            query: None,
+            domain: None,
+            min_relevance: 0.5,
+            max_items: 10,
+        }
+    }
+
+    /// Override the per-turn query text. Without this the task instruction is
+    /// used.
+    pub fn query(mut self, query: impl Into<String>) -> Self {
+        self.query = Some(query.into());
+        self
+    }
+
+    /// Restrict retrieval to a single memory `domain`.
+    pub fn domain(mut self, domain: impl Into<String>) -> Self {
+        self.domain = Some(domain.into());
+        self
+    }
+
+    /// Override the minimum relevance threshold.
+    pub fn min_relevance(mut self, min_relevance: f32) -> Self {
+        self.min_relevance = min_relevance;
+        self
+    }
+
+    /// Override the per-turn item cap.
+    pub fn max_items(mut self, max_items: u32) -> Self {
+        self.max_items = max_items;
+        self
+    }
+}
+
+impl std::fmt::Debug for MemoryConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryConfig")
+            .field("query", &self.query)
+            .field("domain", &self.domain)
+            .field("min_relevance", &self.min_relevance)
+            .field("max_items", &self.max_items)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Components injected at construction. Mirrors `HarnessConfig` in the spec.
 /// Components not yet covered by their own issue are optional here so the
 /// harness can be exercised before #4–#13 land.
@@ -6405,6 +6484,13 @@ pub struct HarnessConfig {
     /// its shared active set. `None` (the default) means no skills. See
     /// [`HarnessBuilder::skills`].
     pub skills: Option<Arc<SkillCatalog>>,
+    /// Optional memory source (issue #160 / SC-26 follow-up). When set, the
+    /// harness queries the provider each turn and injects the returned items
+    /// into [`ContextSources::memory`], rendered into the structural System
+    /// block alongside guides + skills. `None` (the default) leaves memory
+    /// empty, byte-identical to pre-#160 behaviour. See
+    /// [`HarnessBuilder::memory`] and [`MemoryConfig`].
+    pub memory: Option<MemoryConfig>,
     /// Authoritative per-run model sampling/decoding parameters (issue #93).
     /// The harness replaces each turn's `Context.params` with this value
     /// UNCONDITIONALLY (builder params win) right before the request is built,
@@ -6496,6 +6582,7 @@ impl Clone for HarnessConfig {
             system_prompt: self.system_prompt.clone(),
             guides: self.guides.clone(),
             skills: self.skills.clone(),
+            memory: self.memory.clone(),
             model_params: self.model_params.clone(),
             auto_persist_sessions: self.auto_persist_sessions,
             prompt_tool_call_flag: self.prompt_tool_call_flag.clone(),
@@ -6606,6 +6693,9 @@ pub struct HarnessBuilder {
     guides: Vec<Guide>,
     /// Optional skill catalog (issue #115 / SC-26). See [`skills`](HarnessBuilder::skills).
     skills: Option<Arc<SkillCatalog>>,
+    /// Optional memory source (issue #160). `None` (the default) leaves memory
+    /// empty. See [`memory`](HarnessBuilder::memory).
+    memory: Option<MemoryConfig>,
     /// Authoritative per-run model sampling/decoding parameters (issue #93).
     /// Defaults to [`ModelParams::default`]. See
     /// [`model_params`](HarnessBuilder::model_params).
@@ -6676,6 +6766,7 @@ impl HarnessBuilder {
             system_prompt: None,
             guides: Vec::new(),
             skills: None,
+            memory: None,
             model_params: ModelParams::default(),
             auto_persist_sessions: false,
             prompt_tool_call_flag: None,
@@ -7044,6 +7135,21 @@ impl HarnessBuilder {
     /// already registered via [`guide`](Self::guide).
     pub fn guides(mut self, guides: impl IntoIterator<Item = Guide>) -> Self {
         self.guides.extend(guides);
+        self
+    }
+
+    /// Wire a memory source (issue #160 / SC-26 follow-up). The harness queries
+    /// the provider each turn and injects the relevant memories into the
+    /// structural System block — alongside guides + skills via the rich
+    /// `ContextSources` seam — with no consumer-side context-manager shim.
+    ///
+    /// Pass a [`MemoryConfig`] to control the query policy, e.g.
+    /// `MemoryConfig::new(provider).min_relevance(0.6).max_items(5)`. Without an
+    /// explicit query text the current task instruction is used, so retrieved
+    /// memory tracks what the agent is working on. Not set (the default) leaves
+    /// memory empty, byte-identical to pre-#160 behaviour.
+    pub fn memory(mut self, memory: MemoryConfig) -> Self {
+        self.memory = Some(memory);
         self
     }
 
@@ -7542,6 +7648,7 @@ impl HarnessBuilder {
             system_prompt: self.system_prompt,
             guides: self.guides,
             skills: self.skills,
+            memory: self.memory,
             model_params: self.model_params,
             auto_persist_sessions: self.auto_persist_sessions,
             prompt_tool_call_flag: self.prompt_tool_call_flag,
@@ -7618,11 +7725,16 @@ impl StandardHarness {
     }
 
     /// Build the per-turn [`ContextSources`] threaded into the structural
-    /// `ContextManager::assemble` seam (issue #115 / SC-26). Slice 1 supplies the
-    /// tool schemas only; guides (guide source + active skills), merged memory,
-    /// and the composed static prompt populate in later slices. An empty result
-    /// renders to nothing, so a harness with no sources stays byte-identical.
-    fn build_context_sources(&self, tool_schemas: Vec<ToolSchema>) -> ContextSources {
+    /// `ContextManager::assemble` seam (issue #115 / SC-26). Supplies the tool
+    /// schemas, guides (guide source + active skills), and merged memory (#160);
+    /// the composed static prompt populates once the chunk-provider path is
+    /// wired. An empty result renders to nothing, so a harness with no sources
+    /// stays byte-identical.
+    async fn build_context_sources(
+        &self,
+        tool_schemas: Vec<ToolSchema>,
+        task_instruction: &str,
+    ) -> ContextSources {
         // #115 / SC-26 / #9: configured guides reach the model structurally through
         // the assemble seam, not as an ad-hoc User-message prepend. Skills (the
         // manifest + active bodies, progressive disclosure) are appended as guides
@@ -7632,12 +7744,34 @@ impl StandardHarness {
         if let Some(skills) = self.config.skills.as_ref() {
             guides.extend(skills.active_guides());
         }
+        // #160 / SC-26 follow-up: query the configured memory provider and inject
+        // the relevant items structurally (rendered into the same System block as
+        // guides). The query text defaults to the task instruction, so retrieved
+        // memory tracks the current work; a configured `query` overrides it. A
+        // query error is swallowed (empty memory) — memory is best-effort context,
+        // never a halt. `None` leaves memory empty (byte-identical pre-#160 path).
+        let memory = match self.config.memory.as_ref() {
+            Some(mem) => {
+                let query = crate::memory::MemoryQuery {
+                    task_instruction: mem
+                        .query
+                        .clone()
+                        .unwrap_or_else(|| task_instruction.to_string()),
+                    domain: mem.domain.clone(),
+                    session_id: None,
+                    min_relevance: mem.min_relevance,
+                    max_items: mem.max_items,
+                };
+                mem.provider.query(query).await.unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
         ContextSources {
             guides,
             tool_schemas,
-            // Memory stays empty pending the MemoryProvider object-safety
-            // conversion (#8); the composed static prompt is empty until the
-            // chunk-provider path is wired.
+            memory,
+            // The composed static prompt is empty until the chunk-provider path
+            // is wired.
             ..Default::default()
         }
     }
@@ -8337,7 +8471,9 @@ impl StandardHarness {
             // Slice 1 threads the seam with tool schemas only; guides/memory/skills
             // populate in later slices. An empty `sources` renders to nothing, so
             // the no-source path stays byte-identical.
-            let sources = self.build_context_sources(tool_registry.schemas());
+            let sources = self
+                .build_context_sources(tool_registry.schemas(), &task.instruction)
+                .await;
             let mut context = self
                 .config
                 .context_manager
@@ -13985,6 +14121,7 @@ mod tests {
             system_prompt: None,
             guides: Vec::new(),
             skills: None,
+            memory: None,
             model_params: ModelParams::default(),
             auto_persist_sessions: false,
             prompt_tool_call_flag: None,
@@ -15750,9 +15887,10 @@ mod tests {
         }
     }
 
-    /// Minimal context manager that renders `sources.guides` into a leading
-    /// System block — mirroring the production `StandardCompactionAdapter` so the
-    /// loop's sources-building + system-prompt merge can be asserted without the
+    /// Minimal context manager that renders `sources.guides` then
+    /// `sources.memory` into a leading System block — mirroring the production
+    /// `StandardCompactionAdapter`'s `render_context_block` so the loop's
+    /// sources-building + system-prompt merge can be asserted without the
     /// adapter's model machinery. (The adapter's own rendering is unit-tested in
     /// `compaction_adapter`.)
     struct GuideRenderingCm;
@@ -15768,6 +15906,7 @@ mod tests {
                 .guides
                 .iter()
                 .map(|g| format!("# {}\n{}", g.name, g.content))
+                .chain(sources.memory.iter().map(|m| m.memory.content.clone()))
                 .collect::<Vec<_>>()
                 .join("\n\n");
             Box::pin(async move {
@@ -15860,6 +15999,142 @@ mod tests {
                 (Role::User, Content::Text { text }) if text.contains("AUDIT PLAYBOOK BODY"))
         });
         assert!(!user_guide, "guide must not be injected as a User message");
+    }
+
+    /// Build a [`StandardMemoryProvider`] holding a single active semantic memory.
+    async fn memory_with(id: &str, content: &str) -> Arc<crate::memory::StandardMemoryProvider> {
+        use crate::memory::{MemoryProvider, MemorySource, MemoryStatus, SemanticMemory};
+        let provider = Arc::new(crate::memory::StandardMemoryProvider::new());
+        let mem = SemanticMemory {
+            id: crate::memory::MemoryId::new(id),
+            content: content.into(),
+            source: MemorySource::Manual,
+            domain: None,
+            version: 1,
+            previous_versions: vec![],
+            created_at: crate::memory::Timestamp::new("2026-06-24T00:00:00Z"),
+            updated_at: crate::memory::Timestamp::new("2026-06-24T00:00:00Z"),
+            status: MemoryStatus::Active,
+        };
+        // `store_semantic` is awaited on the dyn-compatible (BoxFut) trait — the
+        // conversion under test.
+        provider
+            .store_semantic(mem, crate::memory::MergeStrategy::Reject)
+            .await
+            .unwrap();
+        provider
+    }
+
+    // #160 / SC-26 acceptance (memory half): a memory provider registered on the
+    // harness has its relevant items reach the model through the SAME structural
+    // assemble seam as guides — a leading System block, NOT an ad-hoc User
+    // message. Exercises `Arc<dyn MemoryProvider>` (the object-safety conversion).
+    #[tokio::test]
+    async fn memory_reaches_model_via_assemble_seam() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent: Arc<dyn crate::agent::Agent> = Arc::new(RecordingAgent { seen: seen.clone() });
+        let mut cfg = standard_config(make_agent());
+        set_worker_agent(&mut cfg, agent);
+        cfg.context_manager = Arc::new(GuideRenderingCm);
+        cfg.system_prompt = Some("SYSTEM PROMPT".into());
+        // Stored as the object-safe trait object — the whole point of #160.
+        let provider: Arc<dyn crate::memory::MemoryProvider> =
+            memory_with("m1", "REFUND IDEMPOTENCY: audit the payments refund path").await;
+        cfg.memory = Some(MemoryConfig::new(provider).min_relevance(0.1));
+        let h = StandardHarness::new(cfg);
+
+        // The query text defaults to the task instruction, so a related task
+        // surfaces the memory.
+        let task = Task::new(
+            "audit the payments refund path",
+            SessionId::new("s1"),
+            LoopStrategy::ReAct(ReactConfig::per_loop(5)),
+        );
+        let _ = h.run(HarnessRunOptions::new(task)).await;
+
+        let contexts = seen.lock().unwrap();
+        assert!(!contexts.is_empty(), "the agent must have been called");
+        let first = &contexts[0];
+        match first.messages.first() {
+            Some(Message {
+                role: Role::System,
+                content: Content::Text { text },
+            }) => {
+                assert!(
+                    text.starts_with("SYSTEM PROMPT"),
+                    "system prompt must lead the merged System block: {text:?}"
+                );
+                assert!(
+                    text.contains("REFUND IDEMPOTENCY"),
+                    "the memory must reach the model structurally: {text:?}"
+                );
+            }
+            other => panic!("expected a leading System text message, got {other:?}"),
+        }
+        // Memory is NOT delivered as a stray User message.
+        let user_memory = first.messages.iter().any(|m| {
+            matches!((&m.role, &m.content),
+                (Role::User, Content::Text { text }) if text.contains("REFUND IDEMPOTENCY"))
+        });
+        assert!(!user_memory, "memory must not be injected as a User message");
+    }
+
+    // #160: `build_context_sources` queries the configured provider with the task
+    // instruction by default, honors an explicit query override, and leaves
+    // `memory` empty when no provider is configured (the byte-identical pre-#160
+    // path).
+    #[tokio::test]
+    async fn build_context_sources_populates_memory_from_provider() {
+        // (a) No memory configured → empty, regardless of instruction.
+        let h_none = StandardHarness::new(standard_config(make_agent()));
+        let none = h_none
+            .build_context_sources(vec![], "audit the payments refund path")
+            .await;
+        assert!(
+            none.memory.is_empty(),
+            "no provider configured must leave memory empty"
+        );
+
+        // (b) Provider configured, query defaults to the task instruction.
+        let provider: Arc<dyn crate::memory::MemoryProvider> =
+            memory_with("m1", "REFUND IDEMPOTENCY: audit the payments refund path").await;
+        let mut cfg = standard_config(make_agent());
+        // 0.3 cleanly separates the related instruction (jaccard ≈0.83) from the
+        // unrelated one below (≈0.11 — a shared stopword), so (c) is meaningful.
+        cfg.memory = Some(MemoryConfig::new(provider.clone()).min_relevance(0.3));
+        let h = StandardHarness::new(cfg);
+        let by_task = h
+            .build_context_sources(vec![], "audit the payments refund path")
+            .await;
+        assert_eq!(by_task.memory.len(), 1, "the relevant memory must surface");
+        assert!(by_task.memory[0].memory.content.contains("REFUND IDEMPOTENCY"));
+
+        // (c) An unrelated instruction surfaces nothing at the same threshold.
+        let unrelated = h
+            .build_context_sources(vec![], "compile the rust workspace")
+            .await;
+        assert!(
+            unrelated.memory.is_empty(),
+            "an unrelated instruction must not surface the memory"
+        );
+
+        // (d) A configured `query` overrides the task instruction — so even an
+        // unrelated instruction surfaces the memory when the fixed query matches.
+        let mut cfg2 = standard_config(make_agent());
+        cfg2.memory = Some(
+            MemoryConfig::new(provider)
+                .query("audit the payments refund path")
+                .min_relevance(0.1),
+        );
+        let h2 = StandardHarness::new(cfg2);
+        let by_override = h2
+            .build_context_sources(vec![], "compile the rust workspace")
+            .await;
+        assert_eq!(
+            by_override.memory.len(),
+            1,
+            "the configured query must override the task instruction"
+        );
     }
 
     // Rule: always_halt tool annotation halts the loop.
@@ -19460,6 +19735,7 @@ mod tests {
                 system_prompt: None,
                 guides: Vec::new(),
                 skills: None,
+                memory: None,
                 model_params: ModelParams::default(),
                 auto_persist_sessions: false,
                 prompt_tool_call_flag: None,
