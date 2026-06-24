@@ -1772,6 +1772,7 @@ mod tests {
             toolset_catalogues: std::collections::HashMap::new(),
             system_prompt: None,
             guides: Vec::new(),
+            skills: None,
             model_params: crate::model::ModelParams::default(),
             auto_persist_sessions: false,
             prompt_tool_call_flag: None,

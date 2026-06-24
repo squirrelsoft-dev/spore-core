@@ -43,6 +43,7 @@ pub mod prompt_chunk_registry;
 pub mod prompt_tool_call;
 pub mod sandbox;
 pub mod sensor;
+pub mod skills;
 pub mod storage;
 pub mod tasklist;
 pub mod termination;
@@ -156,6 +157,7 @@ pub use sensor::{
     SensorOutcome, SensorResult, SensorSignalFlag, SensorSignalThresholds, SensorStats,
     SensorTrigger, StandardSensorChain,
 };
+pub use skills::{parse_skill_doc, SkillCatalog, SkillEntry, LOAD_SKILL};
 pub use storage::{
     complete_active_run, load_active_run, parse_otlp_endpoints, start_or_resume_active_run,
     ActiveRun, ActiveRunDecision, ActiveRunStatus, CompositeStorageProvider,

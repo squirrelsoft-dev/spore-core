@@ -144,6 +144,7 @@ use crate::context::{
 };
 use crate::execution_registry::{AutoGrantInfo, EscalationMode, ExecutionRegistry};
 use crate::guide_registry::{Guide, SessionOutcome};
+use crate::skills::SkillCatalog;
 use crate::memory::Timestamp;
 // Issue #11 — the canonical (rich) middleware surface lives in `crate::middleware`.
 // The harness loop wires it directly (Q2 / Phase 3): the former harness-local
@@ -6376,6 +6377,12 @@ pub struct HarnessConfig {
     /// not as ad-hoc User messages. Empty (the default) preserves today's
     /// behaviour byte-for-byte. See [`HarnessBuilder::guide`].
     pub guides: Vec<Guide>,
+    /// Optional skill catalog (issue #115 / SC-26). When set, the harness injects
+    /// its manifest + active skill bodies into [`ContextSources::guides`] each turn
+    /// (progressive disclosure) and the `load_skill` tool activates skills against
+    /// its shared active set. `None` (the default) means no skills. See
+    /// [`HarnessBuilder::skills`].
+    pub skills: Option<Arc<SkillCatalog>>,
     /// Authoritative per-run model sampling/decoding parameters (issue #93).
     /// The harness replaces each turn's `Context.params` with this value
     /// UNCONDITIONALLY (builder params win) right before the request is built,
@@ -6466,6 +6473,7 @@ impl Clone for HarnessConfig {
             toolset_catalogues: self.toolset_catalogues.clone(),
             system_prompt: self.system_prompt.clone(),
             guides: self.guides.clone(),
+            skills: self.skills.clone(),
             model_params: self.model_params.clone(),
             auto_persist_sessions: self.auto_persist_sessions,
             prompt_tool_call_flag: self.prompt_tool_call_flag.clone(),
@@ -6574,6 +6582,8 @@ pub struct HarnessBuilder {
     /// #115 / #9). Empty (the default) preserves today's behaviour. See
     /// [`guide`](HarnessBuilder::guide).
     guides: Vec<Guide>,
+    /// Optional skill catalog (issue #115 / SC-26). See [`skills`](HarnessBuilder::skills).
+    skills: Option<Arc<SkillCatalog>>,
     /// Authoritative per-run model sampling/decoding parameters (issue #93).
     /// Defaults to [`ModelParams::default`]. See
     /// [`model_params`](HarnessBuilder::model_params).
@@ -6643,6 +6653,7 @@ impl HarnessBuilder {
             toolset_tools: std::collections::HashMap::new(),
             system_prompt: None,
             guides: Vec::new(),
+            skills: None,
             model_params: ModelParams::default(),
             auto_persist_sessions: false,
             prompt_tool_call_flag: None,
@@ -6966,6 +6977,18 @@ impl HarnessBuilder {
     /// via [`tool_registry`](Self::tool_registry).
     pub fn tool(mut self, tool: crate::tools::StandardTool) -> Self {
         self.standard_tools.push(tool);
+        self
+    }
+
+    /// Register a [`SkillCatalog`](crate::skills::SkillCatalog) (issue #115 /
+    /// SC-26). This both (a) injects the catalog's manifest + active skill bodies
+    /// into every turn's structural context (progressive disclosure) and (b)
+    /// registers the `load_skill` tool, sharing the catalog's active set, so the
+    /// model can activate a skill on demand. Replaces the architect-side
+    /// skill-injecting context-manager shim.
+    pub fn skills(mut self, catalog: Arc<SkillCatalog>) -> Self {
+        self.standard_tools.push(catalog.load_skill_tool());
+        self.skills = Some(catalog);
         self
     }
 
@@ -7496,6 +7519,7 @@ impl HarnessBuilder {
             toolset_catalogues,
             system_prompt: self.system_prompt,
             guides: self.guides,
+            skills: self.skills,
             model_params: self.model_params,
             auto_persist_sessions: self.auto_persist_sessions,
             prompt_tool_call_flag: self.prompt_tool_call_flag,
@@ -7577,10 +7601,17 @@ impl StandardHarness {
     /// and the composed static prompt populate in later slices. An empty result
     /// renders to nothing, so a harness with no sources stays byte-identical.
     fn build_context_sources(&self, tool_schemas: Vec<ToolSchema>) -> ContextSources {
+        // #115 / SC-26 / #9: configured guides reach the model structurally through
+        // the assemble seam, not as an ad-hoc User-message prepend. Skills (the
+        // manifest + active bodies, progressive disclosure) are appended as guides
+        // from the shared catalog, so loading a skill via `load_skill` makes its
+        // body sticky in the System block on the next turn.
+        let mut guides = self.config.guides.clone();
+        if let Some(skills) = self.config.skills.as_ref() {
+            guides.extend(skills.active_guides());
+        }
         ContextSources {
-            // #115 / SC-26 / #9: configured guides reach the model structurally
-            // through the assemble seam, not as an ad-hoc User-message prepend.
-            guides: self.config.guides.clone(),
+            guides,
             tool_schemas,
             // Memory stays empty pending the MemoryProvider object-safety
             // conversion (#8); the composed static prompt is empty until the
@@ -13879,6 +13910,7 @@ mod tests {
             toolset_catalogues: std::collections::HashMap::new(),
             system_prompt: None,
             guides: Vec::new(),
+            skills: None,
             model_params: ModelParams::default(),
             auto_persist_sessions: false,
             prompt_tool_call_flag: None,
@@ -19183,6 +19215,7 @@ mod tests {
                 toolset_catalogues: std::collections::HashMap::new(),
                 system_prompt: None,
                 guides: Vec::new(),
+                skills: None,
                 model_params: ModelParams::default(),
                 auto_persist_sessions: false,
                 prompt_tool_call_flag: None,

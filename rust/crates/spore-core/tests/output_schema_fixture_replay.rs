@@ -99,6 +99,7 @@ fn harness_for(fixture: &str, max_retries: u32) -> StandardHarness {
         catalogue_registry: None,
         system_prompt: None,
         guides: Vec::new(),
+        skills: None,
         model_params: spore_core::ModelParams::default(),
         auto_persist_sessions: false,
         prompt_tool_call_flag: None,
