@@ -413,6 +413,20 @@ export interface ReactConfig {
   agent: AgentRef;
   toolset: ToolsetRef;
   output?: SchemaRef;
+  /**
+   * Per-leaf operating system-prompt OVERRIDE (SC-10). `undefined` (the default)
+   * preserves today's behaviour: the leaf's turn window uses the global
+   * {@link StandardHarnessConfig.systemPrompt}. When set, THIS prompt REPLACES the
+   * global one for every turn of this leaf's window — the leaf sees ONLY its own
+   * prompt, nothing leaks from the configured global prompt. This is the per-leaf
+   * prompt half of SC-10; the per-leaf TOOLSET half is the existing
+   * {@link toolset} handle. In a {@link PlanExecuteConfig} this lets the plan and
+   * execute phases run under DISTINCT system prompts (each phase's leaf carries
+   * its own). OMITTED from the wire when unset, so existing strategy configs
+   * serialize byte-identically. Canonical position: LAST field (after
+   * {@link output}). Wire key is `system_prompt` (Rust serde parity).
+   */
+  system_prompt?: string;
 }
 
 /**
@@ -510,6 +524,9 @@ export const LoopStrategySchema: z.ZodType<LoopStrategy> = z.lazy(() =>
       agent: AgentRefSchema,
       toolset: ToolsetRefSchema,
       output: SchemaRefSchema.optional(),
+      // SC-10: per-leaf system-prompt override. Omitted from the wire when unset
+      // (mirrors `output`), so existing strategy fixtures stay byte-identical.
+      system_prompt: z.string().optional(),
     }),
     z.object({
       kind: z.literal("plan_execute"),
@@ -567,6 +584,9 @@ export function loopStrategyToJson(strategy: LoopStrategy): Record<string, unkno
         toolset: strategy.toolset,
       };
       if (strategy.output !== undefined) out.output = strategy.output;
+      // SC-10: LAST field, after `output`. Omitted when unset (mirrors `output`)
+      // so the no-override wire is byte-identical to pre-SC-10.
+      if (strategy.system_prompt !== undefined) out.system_prompt = strategy.system_prompt;
       return out;
     }
     case "plan_execute": {
@@ -1152,6 +1172,11 @@ export interface StrategyExecutor {
     // Issue #139: the `N` extra validation-retry turns (total attempts =
     // `1 + N`). Ignored when `outputSchema` is `undefined`.
     outputSchemaMaxRetries: number,
+    // SC-10: the leaf's per-node system-prompt OVERRIDE (`ReactConfig.system_prompt`).
+    // `undefined` ⇒ the window uses the global `config.systemPrompt` (byte-identical
+    // to pre-SC-10). Set ⇒ this prompt REPLACES the global one for every turn of this
+    // window, so the leaf sees ONLY its own prompt. Mirrors `toolset`.
+    systemPrompt: string | undefined,
   ): Promise<RunResult>;
 
   /**
@@ -2105,6 +2130,9 @@ async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<Str
     // retry budget so the window delivers + validates the terminal.
     outputSchema,
     outputSchemaMaxRetries,
+    // SC-10: thread THIS leaf's per-node system-prompt override (`undefined` ⇒
+    // the window keeps using the global prompt). Mirrors `c.toolset`.
+    c.system_prompt,
   );
   await executor.finalize(result);
 

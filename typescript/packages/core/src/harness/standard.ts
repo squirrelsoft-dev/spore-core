@@ -1207,6 +1207,10 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // delivers + validates the terminal.
     outputSchema: unknown | undefined,
     outputSchemaMaxRetries: number,
+    // SC-10: the leaf's per-node system-prompt override (or `undefined`). Threaded
+    // verbatim into `runReactInner`, which REPLACES the global prompt with it for
+    // every turn of this window when set.
+    systemPrompt: string | undefined,
   ): Promise<RunResult> {
     // The leaf seeds the task instruction (parity with the old top-level ReAct
     // entry, which called runReact(.., seedInstruction: true)). The resolved
@@ -1223,6 +1227,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
       toolset,
       outputSchema,
       outputSchemaMaxRetries,
+      systemPrompt,
     );
   }
 
@@ -2716,6 +2721,11 @@ export class StandardHarness implements Harness, StrategyExecutor {
       // `undefined`/`0` ⇒ byte-for-byte pre-#139.
       undefined,
       0,
+      // SC-10: the legacy `runReact` wrapper (single-shot run, resume, DAG/plan
+      // execute steps) carries no per-leaf prompt override (only the recursive
+      // `runReactConfig` does) ⇒ the window uses the global `config.systemPrompt`,
+      // byte-identical.
+      undefined,
     );
     switch (result.kind) {
       case "success":
@@ -2766,6 +2776,12 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // constrains decoding (Anthropic/OpenAI ignore it).
     outputSchema: unknown | undefined,
     outputSchemaMaxRetries: number,
+    // SC-10: the leaf's per-node system-prompt OVERRIDE. `undefined` ⇒ the global
+    // `config.systemPrompt` is used (byte-identical to pre-SC-10). Set ⇒ it
+    // REPLACES the global prompt for every turn of this window, so the leaf sees
+    // ONLY its own prompt (the per-leaf prompt half of SC-10; the toolset half is
+    // the `toolset` arg above).
+    systemPrompt: string | undefined,
   ): Promise<RunResult> {
     const sessionId = task.session_id;
     // Resolve the effective tool registry once per turn-loop window (issue #91).
@@ -2945,13 +2961,21 @@ export class StandardHarness implements Harness, StrategyExecutor {
       // message exactly as before, so the no-structural-block path stays
       // byte-identical. The `startsWith` guard keeps a resumed/seeded session that
       // already leads with the system prompt from being given it twice.
-      if (this.config.systemPrompt != null) {
+      //
+      // SC-10: a leaf's per-node `system_prompt` override WINS over the global
+      // `config.systemPrompt`. When this window's leaf carries one, it is used
+      // EXCLUSIVELY (the global prompt does not leak in), so the plan and execute
+      // phases of a `PlanExecuteConfig` can run under distinct prompts. With no
+      // leaf override (`undefined`) the global prompt applies exactly as before —
+      // byte-identical.
+      const effectiveSystemPrompt = systemPrompt ?? this.config.systemPrompt;
+      if (effectiveSystemPrompt != null) {
         const head = context.messages[0];
         if (head?.role === "system" && head.content.type === "text") {
-          if (!head.content.text.startsWith(this.config.systemPrompt)) {
+          if (!head.content.text.startsWith(effectiveSystemPrompt)) {
             head.content = {
               type: "text",
-              text: `${this.config.systemPrompt}\n\n${head.content.text}`,
+              text: `${effectiveSystemPrompt}\n\n${head.content.text}`,
             };
           }
           // Already leads with the system prompt — leave it.
@@ -2960,7 +2984,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
         } else {
           context.messages.unshift({
             role: "system",
-            content: { type: "text", text: this.config.systemPrompt },
+            content: { type: "text", text: effectiveSystemPrompt },
           });
         }
       }

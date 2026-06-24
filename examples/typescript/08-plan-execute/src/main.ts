@@ -96,16 +96,36 @@ import { StandardTools, WebSearchTool } from "@spore/tools";
 type Tool = toolRegistry.Tool;
 type ToolContext = toolRegistry.ToolContext;
 
+// The GLOBAL operating prompt — the shared capability contract. It is the
+// DEFAULT every leaf falls back to. Under SC-10 (#161) the plan and execute
+// leaves below each carry their OWN `system_prompt`, which REPLACES this for
+// those phases (each phase sees ONLY its own prompt). This global remains the
+// prompt any leaf WITHOUT an override would use.
 const SYSTEM_PROMPT =
   "You are a research-and-writing agent. Your ONLY capabilities are: web_search " +
   "(find current information online), read_file, and write_file (save your work " +
   "to the workspace). You have NO shell or terminal — you cannot install software, " +
   "set up projects or environments, run/compile/build code, or execute commands. " +
-  "Decompose the goal into subtasks that are each achievable with web_search and " +
-  "writing alone; never plan setup, installation, or build steps. For each subtask, " +
-  "use web_search to gather current information, then synthesize a clear, cited " +
-  "comparison and save the final document with write_file. Act using tools — do " +
-  "not answer from memory alone.";
+  "Act using tools — do not answer from memory alone.";
+
+// SC-10: the PLAN phase's own system prompt. The planner only DECOMPOSES — it
+// never executes a subtask, so its prompt is about producing a good plan, not
+// about searching/writing. This replaces SYSTEM_PROMPT for the plan leaf only.
+const PLAN_SYSTEM_PROMPT =
+  "You are the PLANNER. Your ONLY job is to decompose the goal into an ordered " +
+  "list of subtasks. Each subtask must be achievable with web_search and " +
+  "write_file alone — there is NO shell or terminal, so never plan setup, " +
+  "installation, or build steps. Do not perform any subtask yourself; output " +
+  "ONLY the plan.";
+
+// SC-10: the EXECUTE phase's own system prompt. The executor works ONE subtask
+// at a time — it does not re-plan. This replaces SYSTEM_PROMPT for the execute
+// leaf only, so plan-phase decomposition guidance never leaks into execution.
+const EXECUTE_SYSTEM_PROMPT =
+  "You are the EXECUTOR. You are given ONE subtask at a time. Use web_search to " +
+  "gather current information for it, then synthesize a clear, cited result and " +
+  "save your work with write_file. Do not re-plan or invent new subtasks — " +
+  "complete the one you were given, using tools rather than memory.";
 
 /**
  * The plan-phase output contract (`plan-schema`). Post-#119, `PlanExecute`'s
@@ -147,12 +167,28 @@ export function buildRegistry(): ExecutionRegistry {
  * (`reactPerLoop(Number.MAX_SAFE_INTEGER)`, the TS analogue of Rust's
  * `u32::MAX`) so the global `max_turns` backstop governs. Old flat shape was
  * `{ kind: "plan_execute" }`.
+ *
+ * SC-10 (#161, per-leaf system prompt): the plan and execute leaves each carry
+ * their OWN `system_prompt`. The plan phase runs under `PLAN_SYSTEM_PROMPT`
+ * (decompose only) and the execute phase under `EXECUTE_SYSTEM_PROMPT` (do one
+ * subtask) — each phase sees ONLY its own prompt, so planning guidance never
+ * leaks into execution and vice versa. (The per-leaf TOOLSET override is the
+ * existing `ReactConfig.toolset` handle; here both phases share the global
+ * catalogue.) The global `SYSTEM_PROMPT` remains the documented fallback any
+ * leaf WITHOUT an override would use.
  */
 export function planExecuteStrategy(): LoopStrategy {
   return {
     kind: "plan_execute",
-    plan: { ...reactPerLoop(Number.MAX_SAFE_INTEGER), output: "plan-schema" },
-    execute: reactPerLoop(Number.MAX_SAFE_INTEGER),
+    plan: {
+      ...reactPerLoop(Number.MAX_SAFE_INTEGER),
+      output: "plan-schema",
+      system_prompt: PLAN_SYSTEM_PROMPT,
+    },
+    execute: {
+      ...reactPerLoop(Number.MAX_SAFE_INTEGER),
+      system_prompt: EXECUTE_SYSTEM_PROMPT,
+    },
   };
 }
 
@@ -394,12 +430,9 @@ async function main(): Promise<void> {
   // MUST declare an output schema (`registry.validate()` enforces this). The turn
   // budget is divided across subtasks, so we give it generous headroom via
   // `max_turns`.
-  const task = newTask(
-    prompt,
-    SessionId.generate(),
-    planExecuteStrategy(),
-    { max_turns: 64 },
-  );
+  const task = newTask(prompt, SessionId.generate(), planExecuteStrategy(), {
+    max_turns: 64,
+  });
 
   console.log(`model    : ${modelId}`);
   console.log(`endpoint : ${endpoint}`);
