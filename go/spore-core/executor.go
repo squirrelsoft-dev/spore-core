@@ -122,7 +122,13 @@ type StrategyExecutor interface {
 	// remaining the window returns HaltOutputSchemaViolation. The schema is also
 	// set on every turn's ModelParams.OutputSchema so the Ollama `format` channel
 	// constrains decoding (Anthropic/OpenAI ignore it).
-	ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef, outputSchema json.RawMessage, outputSchemaMaxRetries uint32) RunResult
+	//
+	// SC-10 (per-leaf system prompt): systemPrompt is the leaf's per-node
+	// system-prompt OVERRIDE (ReactConfig.SystemPrompt). nil ⇒ the window uses
+	// the global config.SystemPrompt (byte-identical to pre-SC-10). Non-nil ⇒
+	// this prompt REPLACES the global one for every turn of this window, so the
+	// leaf sees ONLY its own prompt. Mirrors toolset.
+	ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef, outputSchema json.RawMessage, outputSchemaMaxRetries uint32, systemPrompt *string) RunResult
 
 	// ResolveWorkerAgent resolves the worker agent for a LoopStrategy tree from
 	// the ExecutionRegistry (#124): the agent on the LEAF reached by descending

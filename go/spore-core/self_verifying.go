@@ -229,7 +229,9 @@ func (h *StandardHarness) EvaluatePhase(
 	// the EMPTY handle → global-catalogue fallback, byte-for-byte.
 	// Issue #139: the evaluate phase does NOT enforce output schemas (only the
 	// recursive ReactConfig.Run is the enforcement seam). nil/0 ⇒ pre-#139.
-	evalResult := evalHarness.runReActInner(ctx, evalTask, cap, evalState, BudgetSnapshot{}, nil, evalAgent, ToolsetRef(""), nil, 0)
+	// SC-10: the evaluate phase carries no per-leaf system-prompt override ⇒ the
+	// window uses the global config.SystemPrompt, byte-identical.
+	evalResult := evalHarness.runReActInner(ctx, evalTask, cap, evalState, BudgetSnapshot{}, nil, evalAgent, ToolsetRef(""), nil, 0, nil)
 	foldSelfVerifyUsage(totalUsage, carried, evalResult)
 	return evalResult
 }

@@ -3944,8 +3944,8 @@ func (h *StandardHarness) driveStrategyWithResumeSeed(
 // resolved toolset handle is threaded down alongside the agent so the window
 // dispatches the per-node scoped catalogue (empty handle ⇒ global-catalogue
 // fallback).
-func (h *StandardHarness) ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef, outputSchema json.RawMessage, outputSchemaMaxRetries uint32) RunResult {
-	return h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, toolset, outputSchema, outputSchemaMaxRetries)
+func (h *StandardHarness) ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef, outputSchema json.RawMessage, outputSchemaMaxRetries uint32, systemPrompt *string) RunResult {
+	return h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, toolset, outputSchema, outputSchemaMaxRetries, systemPrompt)
 }
 
 // ResolveWorkerAgent resolves the worker agent for a LoopStrategy tree from the
@@ -4422,7 +4422,10 @@ func (h *StandardHarness) runReAct(
 	// Issue #139: the legacy wrapper does NOT enforce output schemas (the recursive
 	// ReactConfig.Run is the single enforcement seam). nil/0 ⇒ byte-for-byte
 	// pre-#139.
-	result := h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, ToolsetRef(""), nil, 0)
+	// SC-10: the legacy runReAct wrapper carries no per-leaf system-prompt override
+	// (only the recursive ReactConfig.Run does) ⇒ the window uses the global
+	// config.SystemPrompt, byte-identical.
+	result := h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, ToolsetRef(""), nil, 0, nil)
 	switch result.Kind {
 	case RunSuccess:
 		h.finalizeObservability(ctx, result.SessionID, TerminalSuccess, "")
@@ -4735,6 +4738,12 @@ func (h *StandardHarness) runReActInner(
 	// ModelParams.OutputSchema so the Ollama `format` channel constrains decoding.
 	outputSchema json.RawMessage,
 	outputSchemaMaxRetries uint32,
+	// SC-10: the leaf's per-node system-prompt OVERRIDE. nil ⇒ the global
+	// config.SystemPrompt is used (byte-identical to pre-SC-10). Non-nil ⇒ it
+	// REPLACES the global prompt for every turn of this window, so the leaf sees
+	// ONLY its own prompt (the per-leaf prompt half of SC-10; the toolset half is
+	// the toolset arg above).
+	systemPrompt *string,
 ) (out RunResult) {
 	// Issue #102 part 1: stamp the post-run conversation history onto the
 	// terminal Success/Failure result. The loop mutates `session` in place
@@ -4907,12 +4916,23 @@ func (h *StandardHarness) runReActInner(
 		// no-structural-block path stays byte-identical. The HasPrefix guard keeps
 		// a resumed/seeded session that already leads with the system prompt from
 		// being given it twice. Empty SystemPrompt (the default) is a no-op.
-		if h.config.SystemPrompt != "" {
+		//
+		// SC-10: a leaf's per-node systemPrompt override WINS over the global
+		// config.SystemPrompt. When this window's leaf carries one (non-nil), it
+		// is used EXCLUSIVELY (the global prompt does not leak in), so the plan
+		// and execute phases of a PlanExecuteConfig can run under distinct
+		// prompts. With no leaf override (nil) the global prompt applies exactly
+		// as before — byte-identical.
+		effectiveSystemPrompt := h.config.SystemPrompt
+		if systemPrompt != nil {
+			effectiveSystemPrompt = *systemPrompt
+		}
+		if effectiveSystemPrompt != "" {
 			if len(c.Messages) > 0 && c.Messages[0].Role == RoleSystem &&
 				c.Messages[0].Content.Type == ContentTypeText {
 				text := c.Messages[0].Content.Text
-				if !strings.HasPrefix(text, h.config.SystemPrompt) {
-					c.Messages[0].Content = NewTextContent(h.config.SystemPrompt + "\n\n" + text)
+				if !strings.HasPrefix(text, effectiveSystemPrompt) {
+					c.Messages[0].Content = NewTextContent(effectiveSystemPrompt + "\n\n" + text)
 				}
 				// Already leads with the system prompt — leave it.
 			} else if len(c.Messages) > 0 && c.Messages[0].Role == RoleSystem {
@@ -4920,7 +4940,7 @@ func (h *StandardHarness) runReActInner(
 			} else {
 				c.Messages = append([]Message{{
 					Role:    RoleSystem,
-					Content: NewTextContent(h.config.SystemPrompt),
+					Content: NewTextContent(effectiveSystemPrompt),
 				}}, c.Messages...)
 			}
 		}

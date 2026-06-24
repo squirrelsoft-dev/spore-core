@@ -76,6 +76,18 @@ type ReactConfig struct {
 	Toolset  ToolsetRef
 	// Output is omitted from JSON when nil (matches Rust Option + skip-if-none).
 	Output *SchemaRef
+	// SystemPrompt is the per-leaf operating system-prompt OVERRIDE (SC-10).
+	// nil (the default) preserves today's behaviour: the leaf's turn window uses
+	// the global HarnessConfig.SystemPrompt. When non-nil, THIS prompt REPLACES
+	// the global one for every turn of this leaf's window — the leaf sees ONLY
+	// its own prompt, nothing leaks from the configured global prompt. This is
+	// the per-leaf prompt half of SC-10; the per-leaf TOOLSET half is the Toolset
+	// handle above. In a PlanExecuteConfig this lets the plan and execute phases
+	// run under DISTINCT system prompts (each phase's leaf carries its own).
+	// Omitted from the wire when nil (matches Rust Option + skip-if-none), so
+	// existing strategy configs serialize byte-identically. Canonical position:
+	// LAST field (after Output).
+	SystemPrompt *string
 }
 
 // ReactPerLoop builds a bare ReAct leaf with a PerLoop{value} budget and empty
@@ -83,11 +95,12 @@ type ReactConfig struct {
 // This is the migration shim for the old ReAct{max_iterations} shape.
 func ReactPerLoop(value uint32) ReactConfig {
 	return ReactConfig{
-		Budget:   BudgetPolicy{Kind: BudgetPerLoop, Value: value},
-		Behavior: defaultBudgetBehavior(),
-		Agent:    AgentRef(""),
-		Toolset:  ToolsetRef(""),
-		Output:   nil,
+		Budget:       BudgetPolicy{Kind: BudgetPerLoop, Value: value},
+		Behavior:     defaultBudgetBehavior(),
+		Agent:        AgentRef(""),
+		Toolset:      ToolsetRef(""),
+		Output:       nil,
+		SystemPrompt: nil,
 	}
 }
 
@@ -279,16 +292,20 @@ func (s LoopStrategy) MarshalJSON() ([]byte, error) {
 			return nil, fmt.Errorf("LoopStrategy: react requires config")
 		}
 		c := s.ReActCfg
-		// Key order: kind, budget, behavior, agent, toolset, [output].
+		// Key order: kind, budget, behavior, agent, toolset, [output],
+		// [system_prompt]. SystemPrompt (SC-10) is the canonical LAST field
+		// (after output); omitted from the wire when nil so existing strategy
+		// configs serialize byte-identically.
 		type reactFlat struct {
-			Kind     LoopStrategyKind        `json:"kind"`
-			Budget   BudgetPolicy            `json:"budget"`
-			Behavior BudgetExhaustedBehavior `json:"behavior"`
-			Agent    AgentRef                `json:"agent"`
-			Toolset  ToolsetRef              `json:"toolset"`
-			Output   *SchemaRef              `json:"output,omitempty"`
+			Kind         LoopStrategyKind        `json:"kind"`
+			Budget       BudgetPolicy            `json:"budget"`
+			Behavior     BudgetExhaustedBehavior `json:"behavior"`
+			Agent        AgentRef                `json:"agent"`
+			Toolset      ToolsetRef              `json:"toolset"`
+			Output       *SchemaRef              `json:"output,omitempty"`
+			SystemPrompt *string                 `json:"system_prompt,omitempty"`
 		}
-		return json.Marshal(reactFlat{s.Kind, c.Budget, c.Behavior, c.Agent, c.Toolset, c.Output})
+		return json.Marshal(reactFlat{s.Kind, c.Budget, c.Behavior, c.Agent, c.Toolset, c.Output, c.SystemPrompt})
 	case StrategyPlanExecute:
 		if s.PlanExecute == nil {
 			return nil, fmt.Errorf("LoopStrategy: plan_execute requires config")
@@ -368,21 +385,23 @@ func (s *LoopStrategy) UnmarshalJSON(data []byte) error {
 	switch kindProbe.Kind {
 	case StrategyReAct:
 		var probe struct {
-			Budget   BudgetPolicy             `json:"budget"`
-			Behavior *BudgetExhaustedBehavior `json:"behavior"`
-			Agent    AgentRef                 `json:"agent"`
-			Toolset  ToolsetRef               `json:"toolset"`
-			Output   *SchemaRef               `json:"output"`
+			Budget       BudgetPolicy             `json:"budget"`
+			Behavior     *BudgetExhaustedBehavior `json:"behavior"`
+			Agent        AgentRef                 `json:"agent"`
+			Toolset      ToolsetRef               `json:"toolset"`
+			Output       *SchemaRef               `json:"output"`
+			SystemPrompt *string                  `json:"system_prompt"`
 		}
 		if err := json.Unmarshal(data, &probe); err != nil {
 			return err
 		}
 		s.ReActCfg = &ReactConfig{
-			Budget:   probe.Budget,
-			Behavior: behaviorOrDefault(probe.Behavior),
-			Agent:    probe.Agent,
-			Toolset:  probe.Toolset,
-			Output:   probe.Output,
+			Budget:       probe.Budget,
+			Behavior:     behaviorOrDefault(probe.Behavior),
+			Agent:        probe.Agent,
+			Toolset:      probe.Toolset,
+			Output:       probe.Output,
+			SystemPrompt: probe.SystemPrompt,
 		}
 		return nil
 	case StrategyPlanExecute:
@@ -784,7 +803,9 @@ func (c *ReactConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 	// Mirrors agent resolution.
 	// Issue #139: thread the resolved output schema (or nil) and the retry budget
 	// so the window validates the terminal.
-	result := executor.ReactWindow(ctx, task, c.MaxIterations(), session, budget, onStream, agent, c.Toolset, outputSchema, outputSchemaMaxRetries)
+	// SC-10: thread THIS leaf's per-node system-prompt override (nil ⇒ the window
+	// keeps using the global config.SystemPrompt). Mirrors c.Toolset.
+	result := executor.ReactWindow(ctx, task, c.MaxIterations(), session, budget, onStream, agent, c.Toolset, outputSchema, outputSchemaMaxRetries, c.SystemPrompt)
 	executor.Finalize(ctx, result)
 
 	// #125: charge the window's turns against this leaf's OWN scope. The leaf

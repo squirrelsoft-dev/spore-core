@@ -136,11 +136,23 @@ func buildRegistry() sporecore.ExecutionRegistry {
 // the execute leaf is a plain ReAct. The plan/execute leaves are effectively
 // unbounded (PerLoop{MaxUint32}) — the global MaxTurns backstop bounds the run.
 // Old flat shape was LoopStrategy{Kind: StrategyPlanExecute} (PlanExecute config nil).
+//
+// SC-10 (per-leaf system prompt): the plan and execute leaves each carry their
+// OWN SystemPrompt. The plan phase runs under planSystemPrompt (decompose only)
+// and the execute phase under executeSystemPrompt (do one subtask) — each phase
+// sees ONLY its own prompt, so planning guidance never leaks into execution and
+// vice versa. (The per-leaf TOOLSET override is the existing Toolset handle;
+// here both phases share the global catalogue.) The global systemPrompt below
+// remains the documented fallback for any leaf WITHOUT an override.
 func planExecuteStrategy() sporecore.LoopStrategy {
 	plan := sporecore.ReactPerLoop(math.MaxUint32)
 	schema := sporecore.SchemaRef("plan-schema")
 	plan.Output = &schema
+	planSys := planSystemPrompt
+	plan.SystemPrompt = &planSys
 	exec := sporecore.ReactPerLoop(math.MaxUint32)
+	execSys := executeSystemPrompt
+	exec.SystemPrompt = &execSys
 	return sporecore.PlanExecuteStrategy(sporecore.PlanExecuteConfig{
 		Plan:     sporecore.PtrStrategy(sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, ReActCfg: &plan}),
 		Execute:  sporecore.PtrStrategy(sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, ReActCfg: &exec}),
@@ -148,14 +160,34 @@ func planExecuteStrategy() sporecore.LoopStrategy {
 	})
 }
 
+// systemPrompt is the GLOBAL operating prompt — the shared capability contract.
+// It is the DEFAULT every leaf falls back to. Under SC-10 the plan and execute
+// leaves above each carry their OWN SystemPrompt, which REPLACES this for those
+// phases (each phase sees ONLY its own prompt). This global remains the prompt
+// any leaf WITHOUT an override would use.
 const systemPrompt = "You are a research-and-writing agent. Your ONLY capabilities are: " +
 	"web_search (find current information online), read_file, and write_file (save your work to " +
 	"the workspace). You have NO shell or terminal — you cannot install software, set up projects " +
-	"or environments, run/compile/build code, or execute commands. Decompose the goal into " +
-	"subtasks that are each achievable with web_search and writing alone; never plan setup, " +
-	"installation, or build steps. For each subtask, use web_search to gather current information, " +
-	"then synthesize a clear, cited comparison and save the final document with write_file. Act " +
-	"using tools — do not answer from memory alone."
+	"or environments, run/compile/build code, or execute commands. Act using tools — do not answer " +
+	"from memory alone."
+
+// planSystemPrompt is the PLAN phase's own system prompt (SC-10). The planner
+// only DECOMPOSES — it never executes a subtask, so its prompt is about
+// producing a good plan, not about searching/writing. This replaces systemPrompt
+// for the plan leaf only.
+const planSystemPrompt = "You are the PLANNER. Your ONLY job is to decompose the goal " +
+	"into an ordered list of subtasks. Each subtask must be achievable with web_search and " +
+	"write_file alone — there is NO shell or terminal, so never plan setup, installation, or " +
+	"build steps. Do not perform any subtask yourself; output ONLY the plan."
+
+// executeSystemPrompt is the EXECUTE phase's own system prompt (SC-10). The
+// executor works ONE subtask at a time — it does not re-plan. This replaces
+// systemPrompt for the execute leaf only, so plan-phase decomposition guidance
+// never leaks into execution.
+const executeSystemPrompt = "You are the EXECUTOR. You are given ONE subtask at a time. " +
+	"Use web_search to gather current information for it, then synthesize a clear, cited result " +
+	"and save your work with write_file. Do not re-plan or invent new subtasks — complete the one " +
+	"you were given, using tools rather than memory."
 
 // planMaxTurns is a generous turn budget. PlanExecute divides the budget across
 // subtasks (per-task cap = remaining_turns / remaining_tasks), so a stingy cap
