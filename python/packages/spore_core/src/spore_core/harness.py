@@ -135,6 +135,7 @@ if TYPE_CHECKING:
         SessionState as ContextSessionState,
     )
     from .skills import SkillCatalog
+    from .memory import MemoryProvider
     from .execution_registry import EscalationMode, ExecutionRegistry
     from .hooks import HookChain
     from .middleware import MiddlewareChain
@@ -5290,6 +5291,7 @@ from .guide_registry import (  # noqa: E402
     SessionOutcomeFailure,
     SessionOutcomeSuccess,
 )
+from .memory import MemoryError, MemoryItem, MemoryQuery  # noqa: E402
 from .memory import now as _now  # noqa: E402
 from .observability import (  # noqa: E402
     ContentCaptureConfig,
@@ -5459,6 +5461,43 @@ class Harness(Protocol):
 # ============================================================================
 
 
+@dataclass
+class MemoryConfig:
+    """A configured memory source for the live loop (issue #160 / SC-26
+    follow-up).
+
+    Bundles a :class:`~spore_core.memory.MemoryProvider` (held structurally /
+    by Protocol — Python dispatch is already dynamic, so the object-safety
+    conversion the Rust reference needed is a no-op here) with the per-turn
+    query policy. When present on :attr:`HarnessConfig.memory`, the harness
+    queries the provider each turn in
+    :meth:`StandardHarness._build_context_sources` and injects the returned
+    items into :attr:`~spore_core.context.ContextSources.memory`, which the
+    production ``StandardCompactionAdapter`` renders into the leading
+    structural System block — alongside guides + skills, with no consumer-side
+    wrapper. ``None`` (the default) leaves
+    :attr:`~spore_core.context.ContextSources.memory` empty, byte-identical to
+    the pre-#160 behaviour.
+
+    :param provider: The provider queried each turn.
+    :param query: Fixed query text. ``None`` (the default) uses the current
+        task's ``instruction``, so retrieved memory tracks what the agent is
+        working on; a configured ``query`` overrides it.
+    :param domain: Optional domain filter passed to
+        :attr:`~spore_core.memory.MemoryQuery.domain`.
+    :param min_relevance: Minimum relevance score; items below it are dropped.
+        Defaults to ``0.5`` (matching :class:`~spore_core.memory.MemoryQuery`).
+    :param max_items: Maximum number of items injected per turn. Defaults to
+        ``10``.
+    """
+
+    provider: MemoryProvider
+    query: str | None = None
+    domain: str | None = None
+    min_relevance: float = 0.5
+    max_items: int = 10
+
+
 class HarnessConfig:
     """Components injected at construction. Mirrors ``HarnessConfig`` in
     the spec. Optional components default to no-op stubs once the loop is
@@ -5499,6 +5538,7 @@ class HarnessConfig:
         system_prompt: str | None = None,
         guides: list[Guide] | None = None,
         skills: SkillCatalog | None = None,
+        memory: MemoryConfig | None = None,
         model_params: ModelParams | None = None,
         auto_persist_sessions: bool = False,
         prompt_tool_call_flag: PromptToolCallFlag | None = None,
@@ -5690,6 +5730,13 @@ class HarnessConfig:
         # skills against its shared active set. ``None`` (the default) means no
         # skills. See :meth:`HarnessBuilder.skills`.
         self.skills: SkillCatalog | None = skills
+        # Optional memory source (issue #160 / SC-26 follow-up). When set, the
+        # harness queries the provider each turn and injects the returned items
+        # into ``ContextSources.memory``, rendered into the structural System
+        # block alongside guides + skills. ``None`` (the default) leaves memory
+        # empty, byte-identical to the pre-#160 behaviour. See
+        # :meth:`HarnessBuilder.memory` and :class:`MemoryConfig`.
+        self.memory: MemoryConfig | None = memory
         # Authoritative per-run model sampling/decoding parameters (issue #93).
         # The harness replaces each turn's ``Context.params`` with this value
         # UNCONDITIONALLY (builder params win) right before the request is built,
@@ -5804,6 +5851,7 @@ class HarnessConfig:
             system_prompt=self.system_prompt,
             guides=self.guides,
             skills=self.skills,
+            memory=self.memory,
             model_params=self.model_params,
             auto_persist_sessions=self.auto_persist_sessions,
             prompt_tool_call_flag=self.prompt_tool_call_flag,
@@ -5896,6 +5944,9 @@ class HarnessBuilder:
         self._guides: list[Guide] = []
         # Optional skill catalog (issue #115 / SC-26). See :meth:`skills`.
         self._skills: SkillCatalog | None = None
+        # Optional memory source (issue #160). ``None`` (the default) leaves
+        # memory empty. See :meth:`memory`.
+        self._memory: MemoryConfig | None = None
         # Authoritative per-run model sampling/decoding parameters (issue #93).
         # Defaults to ``ModelParams()``. See :meth:`model_params`.
         self._model_params: ModelParams = ModelParams()
@@ -6148,6 +6199,21 @@ class HarnessBuilder:
         ``HarnessBuilder::skills``."""
         self._standard_tools.append(catalog.load_skill_tool())
         self._skills = catalog
+        return self
+
+    def memory(self, memory: MemoryConfig) -> HarnessBuilder:
+        """Wire a memory source (issue #160 / SC-26 follow-up). The harness
+        queries the provider each turn and injects the relevant memories into
+        the structural System block — alongside guides + skills via the rich
+        ``ContextSources`` seam — with no consumer-side context-manager shim.
+
+        Pass a :class:`MemoryConfig` to control the query policy, e.g.
+        ``MemoryConfig(provider, min_relevance=0.6, max_items=5)``. Without an
+        explicit ``query`` text the current task instruction is used, so
+        retrieved memory tracks what the agent is working on. Not set (the
+        default) leaves memory empty, byte-identical to the pre-#160 behaviour.
+        Mirrors Rust's ``HarnessBuilder::memory``."""
+        self._memory = memory
         return self
 
     def model_params(self, params: ModelParams) -> HarnessBuilder:
@@ -6487,6 +6553,7 @@ class HarnessBuilder:
             system_prompt=self._system_prompt,
             guides=self._guides,
             skills=self._skills,
+            memory=self._memory,
             model_params=self._model_params,
             auto_persist_sessions=self._auto_persist_sessions,
             prompt_tool_call_flag=self._prompt_tool_call_flag,
@@ -6737,8 +6804,11 @@ class StandardHarness:
         if isinstance(path, str) and path not in self._observed_writes:
             self._observed_writes.append(path)
 
-    def _build_context_sources(
-        self, config: HarnessConfig, tool_schemas: list[ToolSchema]
+    async def _build_context_sources(
+        self,
+        config: HarnessConfig,
+        tool_schemas: list[ToolSchema],
+        task_instruction: str,
     ) -> ContextSources:
         """Build the per-turn :class:`~spore_core.context.ContextSources` threaded
         into the structural ``ContextManager.assemble`` seam (issue #115 / SC-26).
@@ -6748,19 +6818,40 @@ class StandardHarness:
         prepend. Skills (the manifest + active bodies, progressive disclosure) are
         appended as guides from the shared catalog, so loading a skill via
         ``load_skill`` makes its body sticky in the System block on the next turn.
-        Memory stays empty pending the MemoryProvider object-safety conversion
-        (#8); the composed static prompt is empty until the chunk-provider path is
-        wired. An empty result renders to nothing, so a harness with no sources
-        stays byte-identical to the pre-#115 pass-through."""
+        Memory (#160 / SC-26 follow-up) is queried from the configured provider
+        each turn and injected structurally into the same System block; the
+        composed static prompt is empty until the chunk-provider path is wired.
+        An empty result renders to nothing, so a harness with no sources stays
+        byte-identical to the pre-#115 pass-through."""
         from .context import ComposedPrompt, ContextSources
 
         guides: list[Guide] = list(config.guides)
         catalog = config.skills
         if catalog is not None:
             guides.extend(catalog.active_guides())
+        # #160 / SC-26 follow-up: query the configured memory provider and inject
+        # the relevant items structurally (rendered into the same System block as
+        # guides). The query text defaults to the task instruction, so retrieved
+        # memory tracks the current work; a configured ``query`` overrides it. A
+        # query error is swallowed (empty memory) — memory is best-effort context,
+        # never a halt. ``None`` leaves memory empty (byte-identical pre-#160 path).
+        memory: list[MemoryItem] = []
+        mem = config.memory
+        if mem is not None:
+            query = MemoryQuery(
+                task_instruction=(mem.query if mem.query is not None else task_instruction),
+                domain=mem.domain,
+                session_id=None,
+                min_relevance=mem.min_relevance,
+                max_items=mem.max_items,
+            )
+            try:
+                memory = await mem.provider.query(query)
+            except MemoryError:
+                memory = []
         return ContextSources(
             guides=guides,
-            memory=[],
+            memory=memory,
             tool_schemas=tool_schemas,
             composed_prompt=ComposedPrompt(rendered="", block_1_hash=0),
         )
@@ -8955,7 +9046,9 @@ class StandardHarness:
             # seam: tool schemas, configured guides, and active skills. An empty
             # ``sources`` renders to nothing, so the no-source path stays
             # byte-identical.
-            sources = self._build_context_sources(config, tool_registry.schemas())
+            sources = await self._build_context_sources(
+                config, tool_registry.schemas(), task.instruction
+            )
             context = await config.context_manager.assemble(session_state, task, sources)
             # Fill the model-facing tool list from the effective registry only
             # when the context manager rendered none (the compaction adapter
