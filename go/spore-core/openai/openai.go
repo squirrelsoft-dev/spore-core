@@ -498,7 +498,7 @@ func (c *ModelInterface) sendWithRetry(
 				}
 				return nil, sporecore.NewTimeout()
 			}
-			return nil, sporecore.NewProviderError(0, fmt.Sprintf("HTTP transport error: %v", err))
+			return nil, sporecore.NewTransport(fmt.Sprintf("HTTP transport error: %v", err))
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}
@@ -699,7 +699,7 @@ func (c *ModelInterface) CallStreaming(ctx context.Context, req sporecore.ModelR
 		if isTimeout(err, reqCtx) {
 			return nil, sporecore.NewTimeout()
 		}
-		return nil, sporecore.NewProviderError(0, fmt.Sprintf("HTTP transport error: %v", err))
+		return nil, sporecore.NewTransport(fmt.Sprintf("HTTP transport error: %v", err))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		mapped := mapStatusError(resp)
@@ -881,7 +881,7 @@ func parseSSEStream(ctx context.Context, r io.Reader, ch chan<- sporecore.Stream
 	}
 	if err := scanner.Err(); err != nil {
 		select {
-		case ch <- sporecore.StreamEventOrErr{Err: sporecore.NewProviderError(0, fmt.Sprintf("stream read error: %v", err))}:
+		case ch <- sporecore.StreamEventOrErr{Err: sporecore.NewStreamInterrupted(fmt.Sprintf("stream chunk error: %v", err))}:
 		case <-ctx.Done():
 		}
 		return

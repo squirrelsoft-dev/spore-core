@@ -356,6 +356,67 @@ func TestModelErrorRoundtripsJSON(t *testing.T) {
 	}
 }
 
+// SC-3: Retryable() classifies transient vs deterministic model errors.
+// Transport drops, mid-stream interruptions, timeouts, and rate-limits are
+// transient; provider/context/budget errors are deterministic.
+func TestModelErrorRetryableClassification(t *testing.T) {
+	d := 5 * time.Second
+	retryable := []*ModelError{
+		NewTransport("boom"),
+		NewStreamInterrupted("eof"),
+		NewTimeout(),
+		NewRateLimited(&d),
+		NewRateLimited(nil),
+	}
+	for _, e := range retryable {
+		if !e.Retryable() {
+			t.Fatalf("%s should be retryable", e.Kind)
+		}
+	}
+	deterministic := []*ModelError{
+		NewProviderError(0, "x"),
+		NewProviderError(500, "x"),
+		NewContextLimitExceeded(1, 2),
+		NewBudgetExceeded(1, 2),
+	}
+	for _, e := range deterministic {
+		if e.Retryable() {
+			t.Fatalf("%s should NOT be retryable", e.Kind)
+		}
+	}
+}
+
+// SC-3: the two new variants carry the exact {"kind","message"} tag shape the
+// other languages mirror byte-for-byte, and round-trip back to the same kind.
+func TestTypedTransportErrorsSerdeTagShape(t *testing.T) {
+	cases := []struct {
+		err  *ModelError
+		want string
+	}{
+		{NewTransport("m"), `{"kind":"Transport","message":"m"}`},
+		{NewStreamInterrupted("m"), `{"kind":"StreamInterrupted","message":"m"}`},
+	}
+	for _, tc := range cases {
+		data, err := json.Marshal(tc.err)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", tc.err.Kind, err)
+		}
+		if string(data) != tc.want {
+			t.Fatalf("%s bytes: got %s want %s", tc.err.Kind, data, tc.want)
+		}
+		var back ModelError
+		if err := json.Unmarshal(data, &back); err != nil {
+			t.Fatalf("unmarshal %s: %v", tc.err.Kind, err)
+		}
+		if back.Kind != tc.err.Kind || back.Message != tc.err.Message {
+			t.Fatalf("round-trip %s: got kind=%q msg=%q", tc.err.Kind, back.Kind, back.Message)
+		}
+		if !back.Retryable() {
+			t.Fatalf("%s should be retryable after round-trip", back.Kind)
+		}
+	}
+}
+
 // JSON round-trip for every Content variant.
 func TestContentVariantsRoundtripJSON(t *testing.T) {
 	cases := []Content{

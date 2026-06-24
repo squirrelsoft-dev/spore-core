@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -550,4 +551,61 @@ func TestFixtureReplayRoundTrip(t *testing.T) {
 	if r.StopReason != sporecore.StopEndTurn {
 		t.Fatalf("stop: %s", r.StopReason)
 	}
+}
+
+// SC-3: a connection dropped mid-stream surfaces as the typed, retryable
+// StreamInterrupted variant — a consumer drives its retry off Retryable(), not
+// a substring match on the error text. A raw TCP server promises a 200-byte
+// body (Content-Length) but sends a few bytes then closes the socket, so the
+// client's body stream errors mid-read.
+func TestStreamingInterruptionIsTypedAndRetryable(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		// Drain the request headers so the client's write completes.
+		buf := make([]byte, 2048)
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, _ = conn.Read(buf)
+		// 200 OK so CallStreaming returns Ok (headers arrived), then promise 200
+		// body bytes but deliver only a partial SSE line and drop the socket —
+		// EOF before Content-Length errors the body stream mid-read.
+		_, _ = io.WriteString(conn,
+			"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 200\r\n\r\ndata: partial")
+		_ = conn.Close() // closes mid-body
+	}()
+
+	c := New("k", "gpt-4o").WithBaseURL("http://" + ln.Addr().String())
+	ch, err := c.CallStreaming(context.Background(), req(userMsg("hi")))
+	if err != nil {
+		t.Fatalf("headers (200) should arrive before the body is truncated: %v", err)
+	}
+
+	var streamErr error
+	for ev := range ch {
+		if ev.Err != nil {
+			streamErr = ev.Err
+			break
+		}
+	}
+	if streamErr == nil {
+		t.Fatal("the truncated body must error the stream")
+	}
+	var me *sporecore.ModelError
+	if !errors.As(streamErr, &me) || me.Kind != sporecore.ModelErrStreamInterrupted {
+		t.Fatalf("expected StreamInterrupted, got %v", streamErr)
+	}
+	if !me.Retryable() {
+		t.Fatal("a mid-stream interruption is retryable")
+	}
+	<-done
 }

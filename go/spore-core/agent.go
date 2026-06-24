@@ -67,6 +67,7 @@ package sporecore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -627,8 +628,15 @@ func (a *ModelAgent) ID() AgentID { return a.id }
 // wrapModelError normalises an error returned by the model layer into a
 // *ModelError so the AgentError always carries a *ModelError payload
 // (cross-language parity).
+//
+// An already-typed *ModelError is passed through unchanged (via errors.As, so
+// it survives even if a layer wrapped it) — this is what lets the SC-3 typed
+// Transport / StreamInterrupted variants (and their Retryable() classification)
+// reach the consumer instead of being flattened into an opaque ProviderError.
+// Only a genuinely untyped error is wrapped in a ProviderError.
 func wrapModelError(err error) *ModelError {
-	if me, ok := err.(*ModelError); ok {
+	var me *ModelError
+	if errors.As(err, &me) {
 		return me
 	}
 	return NewProviderError(0, err.Error())

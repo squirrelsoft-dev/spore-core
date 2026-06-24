@@ -63,3 +63,37 @@ func TestNewConversationalHarnessSingleTurnSuccess(t *testing.T) {
 		t.Fatalf("turns = %d, want 1", r.Turns)
 	}
 }
+
+// SC-2 acceptance: a conversational harness can be constructed from a model
+// bound to the INTERFACE type (not a concrete struct), and the run dispatches
+// against that interface value — the equivalent of Rust's
+// conversational_arc(Arc<dyn ModelInterface>). Go interfaces are already
+// dynamically dispatched, so the model is held once and shared by the agent and
+// context manager with no concrete-type enum or dispatch needed.
+func TestConversationalHarnessFromInterfaceTypedModel(t *testing.T) {
+	mock := sporecore.NewMockModel(sporecore.ProviderInfo{
+		Name: "mock", ModelID: "mock-1", ContextWindow: 1000,
+	})
+	mock.PushResponse(sporecore.ModelResponse{
+		Content:    []sporecore.ContentBlock{sporecore.NewTextBlock("from the interface")},
+		Usage:      sporecore.TokenUsage{InputTokens: 2, OutputTokens: 3},
+		StopReason: sporecore.StopEndTurn,
+	})
+	// Explicitly interface-typed — the harness must accept the interface value,
+	// not require the concrete *MockModel.
+	var model sporecore.ModelInterface = mock
+
+	h := NewConversationalHarness(model)
+	r := h.Run(context.Background(), sporecore.NewHarnessRunOptions(
+		sporecore.SimpleTask("Reply please.")))
+
+	if r.Kind != sporecore.RunSuccess {
+		t.Fatalf("kind = %q reason = %+v", r.Kind, r.Reason)
+	}
+	if r.Output != "from the interface" {
+		t.Fatalf("output = %q, want %q", r.Output, "from the interface")
+	}
+	if got := mock.CallCount(); got != 1 {
+		t.Fatalf("call count = %d, want 1 (one shared model instance dispatched once)", got)
+	}
+}

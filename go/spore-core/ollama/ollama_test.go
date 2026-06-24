@@ -784,11 +784,16 @@ func TestConnectionRefusedHelpfulMessage(t *testing.T) {
 		t.Fatal("expected error")
 	}
 	var merr *sporecore.ModelError
-	if !errors.As(err, &merr) || merr.Kind != sporecore.ModelErrProviderError {
-		t.Fatalf("expected ProviderError, got %v", err)
+	// SC-3: a connect failure is a typed, retryable Transport error (was
+	// ProviderError) so consumers can drop substring matching of the message.
+	if !errors.As(err, &merr) || merr.Kind != sporecore.ModelErrTransport {
+		t.Fatalf("expected Transport, got %v", err)
 	}
-	if merr.Code != 0 || !strings.Contains(merr.Message, "Ollama not running") {
+	if !strings.Contains(merr.Message, "Ollama not running") {
 		t.Fatalf("err: %+v", merr)
+	}
+	if !merr.Retryable() {
+		t.Fatal("a connect failure is retryable")
 	}
 }
 

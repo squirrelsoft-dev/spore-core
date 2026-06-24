@@ -690,8 +690,9 @@ func nameMatches(tag, requested string) bool {
 // ---------------------------------------------------------------------------
 
 // transportError classifies a transport-layer error into a typed ModelError.
-// Connection refused → helpful "Ollama not running" message. Timeout →
-// ModelErrTimeout. Anything else → generic ProviderError.
+// Connection refused → helpful "Ollama not running" Transport error. Timeout →
+// ModelErrTimeout. Anything else → generic Transport error. Transport and
+// Timeout are both retryable (SC-3).
 func (c *ModelInterface) transportError(reqCtx context.Context, err error) error {
 	if err == nil {
 		return nil
@@ -707,9 +708,9 @@ func (c *ModelInterface) transportError(reqCtx context.Context, err error) error
 		return sporecore.NewTimeout()
 	}
 	if isConnectionError(err) {
-		return sporecore.NewProviderError(0, fmt.Sprintf("Ollama not running at %s", c.baseURL))
+		return sporecore.NewTransport(fmt.Sprintf("Ollama not running at %s", c.baseURL))
 	}
-	return sporecore.NewProviderError(0, fmt.Sprintf("HTTP transport error: %v", err))
+	return sporecore.NewTransport(fmt.Sprintf("HTTP transport error: %v", err))
 }
 
 // isConnectionError reports whether the error looks like an inability to
@@ -1235,7 +1236,7 @@ func parseNDJSONStream(ctx context.Context, r io.Reader, ch chan<- sporecore.Str
 	}
 	if err := scanner.Err(); err != nil {
 		select {
-		case ch <- sporecore.StreamEventOrErr{Err: sporecore.NewProviderError(0, fmt.Sprintf("stream read error: %v", err))}:
+		case ch <- sporecore.StreamEventOrErr{Err: sporecore.NewStreamInterrupted(fmt.Sprintf("stream chunk error: %v", err))}:
 		case <-ctx.Done():
 		}
 		return

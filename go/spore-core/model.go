@@ -481,6 +481,16 @@ const (
 	ModelErrContextLimitExceeded ModelErrorKind = "ContextLimitExceeded"
 	ModelErrBudgetExceeded       ModelErrorKind = "BudgetExceeded"
 	ModelErrTimeout              ModelErrorKind = "Timeout"
+	// ModelErrTransport is a network/transport failure reaching the provider
+	// (connection refused, socket error, generic HTTP transport error) — the
+	// request never produced a usable response. Transient: Retryable() is true.
+	ModelErrTransport ModelErrorKind = "Transport"
+	// ModelErrStreamInterrupted is a mid-flight stream failure (a chunk
+	// read/decode failure while draining a streaming body). Transient:
+	// Retryable() is true — the turn can be retried. Distinct from a
+	// deterministic decode failure of a *complete* response, which stays
+	// ProviderError.
+	ModelErrStreamInterrupted ModelErrorKind = "StreamInterrupted"
 )
 
 // ModelError is the typed harness error returned by ModelInterface methods.
@@ -515,8 +525,28 @@ func (e *ModelError) Error() string {
 		return fmt.Sprintf("budget exceeded: %d > budget %d", e.Used, e.Budget)
 	case ModelErrTimeout:
 		return "model call timed out"
+	case ModelErrTransport:
+		return fmt.Sprintf("transport error: %s", e.Message)
+	case ModelErrStreamInterrupted:
+		return fmt.Sprintf("stream interrupted: %s", e.Message)
 	default:
 		return fmt.Sprintf("model error: %s", e.Kind)
+	}
+}
+
+// Retryable reports whether retrying the identical call could plausibly
+// succeed (SC-3).
+//
+// Transport drops, mid-stream interruptions, timeouts, and rate-limits are
+// transient. Provider/encode/decode/capability errors and context/budget
+// overflows are deterministic and will recur. Lets a consumer drive its retry
+// loop off a typed predicate instead of substring-matching the error text.
+func (e *ModelError) Retryable() bool {
+	switch e.Kind {
+	case ModelErrTransport, ModelErrStreamInterrupted, ModelErrTimeout, ModelErrRateLimited:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -569,6 +599,11 @@ func (e ModelError) MarshalJSON() ([]byte, error) {
 		return json.Marshal(struct {
 			Kind ModelErrorKind `json:"kind"`
 		}{e.Kind})
+	case ModelErrTransport, ModelErrStreamInterrupted:
+		return json.Marshal(struct {
+			Kind    ModelErrorKind `json:"kind"`
+			Message string         `json:"message"`
+		}{e.Kind, e.Message})
 	default:
 		return nil, fmt.Errorf("ModelError: unknown kind %q", e.Kind)
 	}
@@ -628,6 +663,18 @@ func NewBudgetExceeded(budget, used uint32) *ModelError {
 // NewTimeout builds a typed Timeout error.
 func NewTimeout() *ModelError {
 	return &ModelError{Kind: ModelErrTimeout}
+}
+
+// NewTransport builds a typed Transport error (SC-3). Transport drops are
+// transient — Retryable() returns true.
+func NewTransport(message string) *ModelError {
+	return &ModelError{Kind: ModelErrTransport, Message: message}
+}
+
+// NewStreamInterrupted builds a typed StreamInterrupted error (SC-3). A
+// mid-stream interruption is transient — Retryable() returns true.
+func NewStreamInterrupted(message string) *ModelError {
+	return &ModelError{Kind: ModelErrStreamInterrupted, Message: message}
 }
 
 // ============================================================================
