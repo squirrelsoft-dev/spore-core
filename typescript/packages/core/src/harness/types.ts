@@ -452,6 +452,23 @@ export interface SelfVerifyingConfig {
   inner: LoopStrategy;
   evaluator: SchemaRef;
   /**
+   * Optional dedicated reviewer agent for the evaluate phase (#151). `undefined`
+   * ⇒ the evaluate phase reuses the inner worker's resolved agent (Q1c default).
+   * Set this to a SEPARATE agent so the reviewer is not the same model that wrote
+   * the code (a builder reviewing its own work tends to rubber-stamp). Omitted
+   * from the wire when unset (existing configs stay byte-identical).
+   */
+  evalAgent?: AgentRef;
+  /**
+   * Optional read-only/inspection toolset for the evaluate phase (#151).
+   * `undefined` ⇒ the empty handle (global-catalogue fallback), byte-identical to
+   * prior behavior. The evaluate phase already runs on a read-only sandbox;
+   * scoping the toolset to read-only tools additionally prevents the reviewer
+   * from reaching non-filesystem side-effecting tools (web/MCP) that the sandbox
+   * does not gate. Omitted from the wire when unset.
+   */
+  evalToolset?: ToolsetRef;
+  /**
    * What this combinator does when its build↔evaluate budget is spent (#129).
    * Canonical position on a combinator: the LAST field. Always serialized (Q1) —
    * {@link loopStrategyToJson} emits `{"kind":"escalate"}` when absent.
@@ -539,6 +556,12 @@ export const LoopStrategySchema: z.ZodType<LoopStrategy> = z.lazy(() =>
       kind: z.literal("self_verifying"),
       inner: LoopStrategySchema,
       evaluator: SchemaRefSchema,
+      // #151: optional eval-phase reviewer agent / read-only toolset, declared
+      // BEFORE `behavior` (which stays last). No `.default()`, so an unset field
+      // stays `undefined` and is omitted from the wire (byte-parity with existing
+      // configs); `loopStrategyToJson` emits them only when defined.
+      evalAgent: AgentRefSchema.optional(),
+      evalToolset: ToolsetRefSchema.optional(),
       behavior: BudgetExhaustedBehaviorSchema.default(defaultBudgetBehavior()),
     }),
     z.object({
@@ -605,13 +628,20 @@ export function loopStrategyToJson(strategy: LoopStrategy): Record<string, unkno
       out.behavior = budgetExhaustedBehaviorToJson(strategy.behavior ?? defaultBudgetBehavior());
       return out;
     }
-    case "self_verifying":
-      return {
+    case "self_verifying": {
+      // #151: field order locked for parity — `evaluator < evalAgent <
+      // evalToolset < behavior`. The two optional overrides are emitted ONLY when
+      // defined (bare string handles), so the no-override wire stays byte-identical.
+      const out: Record<string, unknown> = {
         kind: "self_verifying",
         inner: loopStrategyToJson(strategy.inner),
         evaluator: strategy.evaluator,
-        behavior: budgetExhaustedBehaviorToJson(strategy.behavior ?? defaultBudgetBehavior()),
       };
+      if (strategy.evalAgent !== undefined) out.evalAgent = strategy.evalAgent;
+      if (strategy.evalToolset !== undefined) out.evalToolset = strategy.evalToolset;
+      out.behavior = budgetExhaustedBehaviorToJson(strategy.behavior ?? defaultBudgetBehavior());
+      return out;
+    }
     case "ralph":
       return {
         kind: "ralph",
@@ -1225,12 +1255,15 @@ export interface StrategyExecutor {
 
   /**
    * Run the SelfVerifying evaluate phase (#124): a fresh evaluator RUN over a
-   * read-only sandbox in a never-shared session, on `evalAgent`. Folds the run's
-   * usage into `totalUsage` / `carried`; returns its terminal {@link RunResult}.
+   * read-only sandbox in a never-shared session, on `evalAgent`, scoped to
+   * `evalToolset` (#151 — empty handle ⇒ global-catalogue fallback). Folds the
+   * run's usage into `totalUsage` / `carried`; returns its terminal
+   * {@link RunResult}.
    */
   evaluatePhase(
     task: Task,
     evalAgent: Agent,
+    evalToolset: ToolsetRef,
     carried: BudgetSnapshot,
     totalUsage: AggregateUsage,
   ): Promise<RunResult>;
@@ -3121,12 +3154,19 @@ async function runSelfVerifyingConfig(
     cx.stream = onStream;
     return finishCombinator(cx, executor, task, result);
   }
-  // Q1c: the evaluate-phase agent defaults to the inner worker's agent.
-  const evalAgent = executor.resolveAgentRef(workerAgentKeyOf(c.inner), buildSessionId);
+  // Q1c: the evaluate-phase agent defaults to the inner worker's agent; an
+  // explicit `evalAgent` override (#151 — a dedicated reviewer, distinct from the
+  // builder) takes precedence.
+  const evalAgentRef = c.evalAgent ?? workerAgentKeyOf(c.inner);
+  const evalAgent = executor.resolveAgentRef(evalAgentRef, buildSessionId);
   if (isRunResult(evalAgent)) {
     cx.stream = onStream;
     return finishCombinator(cx, executor, task, evalAgent);
   }
+  // The evaluate phase runs against `evalToolset` (a read-only/inspection
+  // catalogue) when set (#151); `undefined` ⇒ the empty handle (global-catalogue
+  // fallback), byte-identical to pre-override behavior.
+  const evalToolset: ToolsetRef = c.evalToolset ?? "";
 
   const maxIterations = verifier.maxIterations();
   const totalUsage: AggregateUsage = emptyAggregateUsage();
@@ -3260,8 +3300,67 @@ async function runSelfVerifyingConfig(
       }
     }
 
-    // ── Evaluate phase: a fresh evaluator run on `evalAgent`.
-    const evalResult = await executor.evaluatePhase(task, evalAgent, carried, totalUsage);
+    // ── Evaluate phase: a fresh evaluator run on `evalAgent`, scoped to
+    // `evalToolset` (#151).
+    const evalResult = await executor.evaluatePhase(
+      task,
+      evalAgent,
+      evalToolset,
+      carried,
+      totalUsage,
+    );
+
+    // #147: charge the evaluator's OWN turns against the SelfVerifying scope,
+    // mirroring the build charge above. `evaluatePhase` runs the evaluator in an
+    // isolated harness from a fresh `BudgetSnapshot`, so `evalResult.turns` is the
+    // evaluator's standalone turn count — and `foldUsageInto` folds it via
+    // `Math.max(...)` (NOT a sum), so it never reaches `carried.turns` once build
+    // turns dominate. Charging the build delta alone therefore missed the
+    // evaluate phase entirely; charge it explicitly here so both phases count.
+    const evalTurns =
+      evalResult.kind === "success" ||
+      evalResult.kind === "failure" ||
+      evalResult.kind === "escalate"
+        ? evalResult.turns
+        : 0;
+    const evalCharge = chargeCurrent(cx, evalTurns);
+    if (!evalCharge.ok) {
+      const resolution = resolveCurrent(cx);
+      // A granted `continue` resets the scope and re-runs the build↔evaluate
+      // iteration in-process (mirrors the build path).
+      if (resolution === "continue") {
+        continue;
+      }
+      // SC-5: AutoContinue auto-grants in-process at this Escalate point (scope
+      // still pushed) before surfacing/aborting.
+      if (resolution === "escalate" && tryAutoContinue(cx, executor.escalationMode())) {
+        continue;
+      }
+      const partial = selfVerifyingPartialJson(lastWorkerOutput, lastReason);
+      popBudget(cx);
+      cx.scratch.task = task;
+      cx.stream = onStream;
+      switch (resolution) {
+        case "fail":
+          return promoteBudgetExhausted(evalCharge.error, undefined);
+        case "escalate":
+          if (executor.escalationMode().kind === "surface_to_human") {
+            const waiting = promoteBudgetExhaustedToHuman(
+              evalCharge.error,
+              partial,
+              combinatorEscalationActions(evalCharge.error),
+              buildSessionId,
+              task,
+              { ...carried },
+              carried.turns,
+              sessionState,
+              workerToolsetOf(c.inner),
+            );
+            return recordTerminal(cx, waiting);
+          }
+          return promoteBudgetExhausted(evalCharge.error, partial);
+      }
+    }
 
     const input: VerifierInput = {
       build_result: buildResult,

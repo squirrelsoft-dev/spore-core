@@ -25,17 +25,22 @@ import { describe, expect, it } from "vitest";
 import {
   AgentId,
   EmptyResponse,
+  EmptyToolRegistry,
+  ExecutionRegistry,
+  MockAgent,
   ReadOnlySandbox,
   SessionId,
   StandardHarness,
+  loopStrategyFromJson,
+  loopStrategyToJson,
   newTask,
   type Agent,
   type Context,
   type HarnessConfig,
+  type HumanRequest,
   type LoopStrategy,
-  type SandboxProvider,
   type SandboxViolation,
-  type SessionState,
+  type SelfVerifyingConfig,
   type TokenUsage,
   type ToolCall,
   type TurnResult,
@@ -46,6 +51,7 @@ import {
   AllowAllSandbox,
   AlwaysContinuePolicy,
   NoopContextManager,
+  ScriptedMiddleware,
   ScriptedToolRegistry,
   registryWith,
 } from "../src/harness/testing.js";
@@ -398,5 +404,176 @@ describe("SelfVerifying loop strategy (issue #61)", () => {
     expect(planTurns).toBeGreaterThanOrEqual(1);
     // The verifier fired (the SelfVerifying loop ran its evaluate phase).
     expect(verifier.seen.length).toBe(1);
+  });
+
+  // ── eval-phase reviewer-context regression tests (#151) ──────────────────
+
+  // BLOCKER FIX (#151): the evaluate phase must NOT inherit the caller's approval
+  // middleware. A nested review run is non-interactive (the caller never sees its
+  // generated session id), so a `surface_to_human` before_tool decision would
+  // pause it with no human able to resume — the reviewer's first tool call would
+  // never dispatch and the review half would silently never run. With the caller
+  // middleware dropped for the read-only eval phase, the reviewer's read
+  // dispatches and the run reaches a verdict.
+  it("self_verifying_eval_phase_drops_caller_middleware", async () => {
+    // Build emits a tool-free final_response (so the BUILD phase, which DOES run
+    // the caller middleware, never trips it); the eval phase (same worker per
+    // Q1c) then issues a read — the call the middleware would have gated.
+    const worker = new ScriptedAgent(AgentId.of("worker"))
+      .push(fr("built")) // build: tool-free done
+      .push(tcr("read_file")) // evaluate: the gated read
+      .push(fr("reviewed: PASS")); // evaluate: verdict after dispatch
+    const verifier = new ScriptedVerifier([pass()], 3);
+    // The dispatch count is the discriminator: it only increments if the eval
+    // phase's tool call actually dispatched (i.e. was NOT paused at before_tool).
+    const reg = new ScriptedToolRegistry();
+    // The caller's approval middleware: surface_to_human at before_tool. Without
+    // the eval-phase drop, it pauses the reviewer's read and the run never
+    // dispatches the tool.
+    const request: HumanRequest = {
+      kind: "tool_approval",
+      calls: [{ id: "c1", name: "read_file", input: {} }],
+      risk_level: "medium",
+    };
+    const middleware = new ScriptedMiddleware().push("before_tool", {
+      kind: "surface_to_human",
+      request,
+    });
+    const h = new StandardHarness(configWith(worker, { verifier, toolRegistry: reg, middleware }));
+    const r = await h.run({ task: svTask() });
+    expect(r.kind).toBe("success");
+    // Load-bearing: the reviewer's read actually dispatched. With the caller
+    // middleware NOT dropped, the eval phase pauses at before_tool BEFORE
+    // dispatch and this count stays 0.
+    expect(reg.callCount).toBeGreaterThanOrEqual(1);
+  });
+
+  // The evaluate phase runs the configured `evalAgent` (a dedicated reviewer),
+  // not the inner worker's agent — so the model reviewing the work is not the one
+  // that wrote it (a builder reviewing itself tends to rubber-stamp).
+  it("eval_agent_override_runs_distinct_reviewer", async () => {
+    const build = new MockAgent(AgentId.of("builder")).push(fr("built"));
+    const reviewer = new MockAgent(AgentId.of("reviewer")).push(fr("reviewed"));
+    const verifier = new ScriptedVerifier([pass()], 3);
+    // A registry with BOTH the default worker (under "") and a separate "reviewer"
+    // agent; the SelfVerifying `evalAgent` handle resolves to the latter.
+    const registry = ExecutionRegistry.builder()
+      .agent("", build)
+      .agent("reviewer", reviewer)
+      .toolset("", new EmptyToolRegistry())
+      .schema("", {})
+      .verifier("", verifier)
+      .build();
+    const config: HarnessConfig = {
+      toolRegistry: new ScriptedToolRegistry(),
+      sandbox: new AllowAllSandbox(),
+      contextManager: new NoopContextManager(),
+      terminationPolicy: new AlwaysContinuePolicy(),
+      modelParams: { stop_sequences: [] },
+      registry,
+    };
+    const strategy: LoopStrategy = {
+      kind: "self_verifying",
+      inner: {
+        kind: "react",
+        budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+        agent: "",
+        toolset: "",
+        output: "",
+      },
+      evaluator: "",
+      evalAgent: "reviewer",
+    };
+    const h = new StandardHarness(config);
+    const r = await h.run({
+      task: newTask("implement the feature", SID, strategy, { max_turns: 10 }),
+    });
+    expect(r.kind).toBe("success");
+    // The reviewer ran the evaluate phase exactly once; the builder ran only the
+    // build phase. Without the override the worker would serve BOTH and the
+    // reviewer would never be called.
+    expect(reviewer.callCount).toBe(1);
+    expect(build.callCount).toBe(1);
+  });
+
+  // Wire-format contract (cross-language parity, #151): the two optional eval-phase
+  // overrides are OMITTED when unset (existing configs stay byte-identical) and
+  // serialize as bare string handles in declaration order (evaluator < evalAgent <
+  // evalToolset < behavior) when set, round-tripping intact.
+  it("config_eval_overrides_serde", () => {
+    // Unset ⇒ both override fields are OMITTED from the wire (existing configs +
+    // fixtures stay byte-identical).
+    const bare: LoopStrategy = {
+      kind: "self_verifying",
+      inner: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+      evaluator: "v",
+    };
+    const bareJson = loopStrategyToJson(bare);
+    expect("evalAgent" in bareJson).toBe(false);
+    expect("evalToolset" in bareJson).toBe(false);
+
+    // Set ⇒ both serialize as BARE STRING handles, in declaration order.
+    const withOverrides: SelfVerifyingConfig = {
+      kind: "self_verifying",
+      inner: {
+        kind: "react",
+        budget: { kind: "per_loop", value: 1 },
+        behavior: { kind: "escalate" },
+        agent: "",
+        toolset: "",
+      },
+      evaluator: "v",
+      evalAgent: "reviewer",
+      evalToolset: "ro-tools",
+      behavior: { kind: "escalate" },
+    };
+    const json = loopStrategyToJson(withOverrides);
+    expect(json.evalAgent).toBe("reviewer"); // bare string handle
+    expect(json.evalToolset).toBe("ro-tools"); // bare string handle
+
+    // Field order locked for parity: evaluator < evalAgent < evalToolset <
+    // behavior. `behavior` appears twice (inner ReAct + this config); the
+    // SelfVerifying one is LAST, so `lastIndexOf` targets it.
+    const s = JSON.stringify(json);
+    const ev = s.indexOf("evaluator");
+    const ea = s.indexOf("evalAgent");
+    const et = s.indexOf("evalToolset");
+    const bh = s.lastIndexOf("behavior");
+    expect(ev).toBeGreaterThanOrEqual(0);
+    expect(ev).toBeLessThan(ea);
+    expect(ea).toBeLessThan(et);
+    expect(et).toBeLessThan(bh);
+
+    // Round-trips intact.
+    const back = loopStrategyFromJson(JSON.parse(s));
+    expect(back).toEqual(withOverrides);
+  });
+
+  // #147: the SelfVerifying combinator must charge the EVALUATOR's turns against
+  // its budget scope, not just the build phase. A 2-iteration loop (build, eval,
+  // build, eval = 4 turns) succeeds at a cap of 4 (just fits all 4 turns) but is
+  // EXHAUSTED at a cap of 3 — the second iteration's evaluator turn overruns it.
+  // The two build turns alone are only 2, so without charging the evaluator the
+  // cap-3 run would wrongly succeed.
+  async function runSvTwoItersWithCap(cap: number): Promise<{ kind: string }> {
+    // One worker drives both phases (Q1c); each phase is a single turn.
+    const worker = new ScriptedAgent(AgentId.of("worker"))
+      .push(fr("build0"))
+      .push(fr("eval0"))
+      .push(fr("build1"))
+      .push(fr("eval1"));
+    // Iter 0 fails (loop continues), iter 1 passes.
+    const verifier = new ScriptedVerifier([fail("retry"), pass()], 3);
+    const h = new StandardHarness(configWith(worker, { verifier }));
+    return h.run({ task: newTask("implement the feature", SID, SV_STRATEGY, { max_turns: cap }) });
+  }
+
+  it("self_verifying_charges_evaluator_turns_against_scope", async () => {
+    const fits = await runSvTwoItersWithCap(4);
+    expect(fits.kind).toBe("success");
+    // cap=3 must be exhausted once evaluator turns are charged (without the #147
+    // charge it would wrongly succeed, since the two build turns alone are 2 <= 3).
+    const exhausted = await runSvTwoItersWithCap(3);
+    expect(exhausted.kind).not.toBe("success");
   });
 });

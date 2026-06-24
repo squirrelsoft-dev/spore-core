@@ -1372,10 +1372,11 @@ export class StandardHarness implements Harness, StrategyExecutor {
   evaluatePhase(
     task: Task,
     evalAgent: Agent,
+    evalToolset: ToolsetRef,
     carried: BudgetSnapshot,
     totalUsage: AggregateUsage,
   ): Promise<RunResult> {
-    return this.runEvaluatePhase(task, evalAgent, carried, totalUsage);
+    return this.runEvaluatePhase(task, evalAgent, evalToolset, carried, totalUsage);
   }
 
   /** {@inheritDoc StrategyExecutor.appendUserMessage} */
@@ -2563,6 +2564,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
   private async runEvaluatePhase(
     task: Task,
     evaluator: Agent,
+    evalToolset: ToolsetRef,
     carried: BudgetSnapshot,
     totalUsage: AggregateUsage,
   ): Promise<RunResult> {
@@ -2593,9 +2595,22 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // shares the same observability/storage seams so the evaluate run's spans
     // land in the SAME trace stream (distinguished by its distinct session id).
     // The evaluate agent (#124 — no `config.agent`) is passed to `runReact`.
+    //
+    // #151 (blocker): the evaluate phase is a NON-INTERACTIVE nested review run —
+    // the caller never sees its (freshly generated) session id, so an approval/
+    // HITL middleware that resolves `surface_to_human` would pause this run with
+    // no human able to resume it: the reviewer's first `read_file` would yield
+    // `waiting_for_human`, which the verifier reads as a misconfiguration, and the
+    // review half would silently never run. The read-only sandbox already enforces
+    // the only safety property a reviewer needs (no writes, no command execution),
+    // so the caller's approval middleware is both redundant and harmful here —
+    // drop it for the evaluate phase. (Pair with an `evalToolset` scoped to
+    // read-only tools so non-filesystem side-effecting tools the sandbox does not
+    // gate stay out of reach.)
     const evalConfig: HarnessConfig = {
       ...this.config,
       sandbox: readOnlySandbox,
+      middleware: undefined,
     };
     const evalHarness = new StandardHarness(evalConfig);
 
@@ -2610,6 +2625,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
       undefined,
       true,
       evaluator,
+      // #151: scope the reviewer to the read-only/inspection `evalToolset` when
+      // set. Empty handle ⇒ global-catalogue fallback (byte-identical to before).
+      evalToolset,
     );
 
     foldUsage(totalUsage, carried, evalResult);
@@ -2881,11 +2899,13 @@ export class StandardHarness implements Harness, StrategyExecutor {
     signal: AbortSignal | undefined,
     seedInstruction: boolean,
     agent: Agent,
+    // Issue 2 / #151: the RESOLVED per-node toolset handle. Most `runReact`
+    // wrappers (PlanExecute/DAG execute steps, single-shot run, resume) pass the
+    // empty handle ⇒ global-catalogue fallback, byte-for-byte with pre-Issue-2
+    // behaviour. The SelfVerifying evaluate phase passes its `evalToolset` so the
+    // reviewer is scoped to read-only tools.
+    toolset: ToolsetRef = "",
   ): Promise<RunResult> {
-    // Issue 2: the legacy `runReact` wrappers (PlanExecute/DAG execute steps,
-    // single-shot run, resume) carry no per-node toolset handle, so they keep
-    // the global-catalogue fallback (empty handle) — byte-for-byte with
-    // pre-Issue-2 behaviour.
     const result = await this.runReactInner(
       task,
       maxIterations,
@@ -2895,7 +2915,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
       signal,
       seedInstruction,
       agent,
-      "",
+      toolset,
       // Issue #139: the legacy `runReact` wrapper does NOT enforce output
       // schemas (the recursive `runReactConfig` is the single enforcement seam).
       // `undefined`/`0` ⇒ byte-for-byte pre-#139.

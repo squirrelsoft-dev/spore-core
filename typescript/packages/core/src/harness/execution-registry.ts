@@ -240,6 +240,17 @@ export class ExecutionRegistry {
         // #124 Q1: the evaluator's wire string (a `SchemaRef`) is the VERIFIER
         // registry key — resolved against the `verifiers` map.
         this.checkVerifier(ls.evaluator);
+        // #151: the optional dedicated reviewer agent / read-only toolset for the
+        // evaluate phase. Validated against the same `agents` / `toolsets` maps as
+        // a leaf's own handles when set (mirrors how Ralph validates its `agent`);
+        // unset ⇒ the worker-agent / global-catalogue defaults, nothing extra to
+        // resolve.
+        if (ls.evalAgent !== undefined) {
+          this.checkAgent(ls.evalAgent);
+        }
+        if (ls.evalToolset !== undefined) {
+          this.checkToolset(ls.evalToolset);
+        }
         return;
       case "ralph":
         this.walkStrategy(ls.inner);

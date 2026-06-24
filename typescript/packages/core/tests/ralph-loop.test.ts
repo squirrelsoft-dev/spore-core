@@ -37,8 +37,13 @@ import {
   type TurnResult,
 } from "../src/index.js";
 
-const { ProjectId, StorageProvider, InMemoryStorageProvider, RALPH_PROGRESS_KEY, RALPH_FEATURE_LIST_KEY } =
-  storage;
+const {
+  ProjectId,
+  StorageProvider,
+  InMemoryStorageProvider,
+  RALPH_PROGRESS_KEY,
+  RALPH_FEATURE_LIST_KEY,
+} = storage;
 import {
   AlwaysContinuePolicy,
   NoopContextManager,
@@ -358,13 +363,11 @@ describe("Ralph loop strategy (issue #58)", () => {
     const { storage: store, projectId } = ralphStore();
     await writeProgress(store, projectId, COMPLETE);
     await writeFeatureList(store, projectId, JSON.stringify([{ name: "login", passes: false }]));
-    expect(
-      await StandardHarness.ralphCompletionStatusFromStore(store.run(), projectId),
-    ).toContain("login");
+    expect(await StandardHarness.ralphCompletionStatusFromStore(store.run(), projectId)).toContain(
+      "login",
+    );
     await writeFeatureList(store, projectId, JSON.stringify([{ name: "login", passes: true }]));
-    expect(
-      await StandardHarness.ralphCompletionStatusFromStore(store.run(), projectId),
-    ).toBeNull();
+    expect(await StandardHarness.ralphCompletionStatusFromStore(store.run(), projectId)).toBeNull();
   });
 
   // R7: the registered Stop hook is INERT for a workspace without a progress
@@ -400,6 +403,14 @@ describe("Ralph loop strategy (issue #58)", () => {
     // window. Always-incomplete progress ⇒ Ralph resets until max_resets (2) is
     // exhausted; the verifier fires once per window (>=2). A hardcoded-ReAct
     // window would record ZERO verifier invocations.
+    //
+    // `maxStopBlocks: 1` (mirrors the Rust reference's `cfg.max_stop_blocks = 1`):
+    // the per-window build loop blocks ONCE on the ralph-stop hook then terminates,
+    // so the inner SelfVerifying reaches its evaluate phase + verifier WITHIN the
+    // per-window turn budget. This is load-bearing under #147 — the evaluate
+    // phase's turns are now charged against the SelfVerifying scope, so the build
+    // phase must not consume the whole `max_turns` window or the eval charge would
+    // exhaust the scope before the verifier runs.
     const dir = mkdtempSync(join(tmpdir(), "ralph-nonreact-"));
     const { storage: store, projectId } = ralphStore();
     await writeProgress(store, projectId, INCOMPLETE);
@@ -415,6 +426,7 @@ describe("Ralph loop strategy (issue #58)", () => {
       storage: store,
       projectId,
       maxResets: 2,
+      maxStopBlocks: 1,
     };
     const strategy: LoopStrategy = {
       kind: "ralph",
