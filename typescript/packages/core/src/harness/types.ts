@@ -1788,6 +1788,17 @@ async function finishCombinator(
   if (result.kind === "consult") {
     result = { ...result, state: { ...result.state, task: parentTask } };
   }
+  // SC-BUG-1: a HITL pause (`waiting_for_human`) propagated from a worker leaf
+  // ALSO carries the LEAF task (a leaf records its terminal via `recordTerminal`,
+  // which never rewrites it). Without the same rewrite, a host `resume` runs only
+  // that bare leaf and loses the surrounding frame — the SelfVerifying evaluate
+  // phase / PlanExecute walk never re-runs (so under an AlwaysAsk-style approval
+  // middleware the verify gate silently degrades to a plain executor). Rewrite it
+  // on the way up exactly like `consult`, so `resumeInner` re-drives the whole
+  // composed strategy from the approved/answered worker session.
+  if (result.kind === "waiting_for_human") {
+    result = { ...result, state: { ...result.state, task: parentTask } };
+  }
   cx.scratch.task = parentTask;
   if (result.kind === "success" || result.kind === "failure") {
     cx.scratch.runSession = result.session_state ?? emptySessionState();
@@ -3074,7 +3085,19 @@ async function runSelfVerifyingConfig(
     };
   }
   const buildSessionId = task.session_id;
-  let sessionState = cx.scratch.runSession;
+  // SC-BUG-1: a HITL resume re-drives the whole SelfVerifying strategy with the
+  // stalled build (worker) conversation carried in the phase-agnostic resume
+  // seed. Consume it as the FIRST build iteration's session so the build phase
+  // CONTINUES the approved/answered worker turn (which already carries the
+  // original instruction + the dispatched tool result) instead of restarting
+  // from an empty top-level session — then the evaluate phase + verifier run,
+  // reaching the looper's eval-frame reviewer. On a fresh run the seed is absent
+  // and this is the incoming `runSession`, byte-identical to before. When
+  // SelfVerifying is NESTED under a PlanExecute walk, that outer walk takes the
+  // seed BEFORE recursing, so this sees `undefined` and the nested behavior is
+  // unchanged.
+  let sessionState = cx.scratch.resumeSeed ?? cx.scratch.runSession;
+  cx.scratch.resumeSeed = undefined;
   cx.scratch.runSession = emptySessionState();
   const carried: BudgetSnapshot = { ...cx.scratch.runBudget };
   // Suppress the run's stream sink for the recursive child phases.

@@ -2050,6 +2050,26 @@ export class StandardHarness implements Harness, StrategyExecutor {
         const tr: ToolResultRecord = { call_id: call.id, output };
         await this.config.contextManager.appendToolResult(sessionState, tr);
       }
+      // SC-BUG-1: a clarification that surfaced from inside a composed tree
+      // carries the FULL strategy in `task.loop_strategy` (each combinator's
+      // `finish` rewrote the pause's task on the way up). Re-DRIVE that strategy
+      // from the answered worker session — exactly as the consult resume does —
+      // so the SelfVerifying evaluate phase / PlanExecute walk runs instead of
+      // only the bare worker leaf. A BARE ReAct leaf has no surrounding frame, so
+      // it keeps the leaf-only resume below (back-compat).
+      if (state.task.loop_strategy.kind !== "react") {
+        return this.driveStrategyWithResumeSeed(
+          state.task,
+          // Top-level session starts fresh; the answered worker conversation
+          // threads in as the resume seed.
+          emptySessionState(),
+          state.budget_used,
+          onStream,
+          signal,
+          undefined,
+          sessionState,
+        );
+      }
       const maxIter =
         state.task.loop_strategy.kind === "react"
           ? reactMaxIterations(state.task.loop_strategy)
@@ -2141,6 +2161,27 @@ export class StandardHarness implements Harness, StrategyExecutor {
         const _exhaustive: never = response;
         return _exhaustive;
       }
+    }
+
+    // SC-BUG-1: an Allow / Deny / Answer / Reject resume that surfaced from
+    // inside a composed tree carries the FULL strategy in `task.loop_strategy`
+    // (each combinator's `finish` rewrote the pause's task on the way up). The
+    // human response has already been applied to `sessionState` above (the
+    // approved calls dispatched, or the deny/answer message appended). Re-DRIVE
+    // the whole strategy from that mutated worker session — mirroring the consult
+    // resume — so the SelfVerifying evaluate phase (the looper's eval-frame
+    // reviewer) / PlanExecute walk re-runs instead of degrading to a plain
+    // executor. A BARE ReAct leaf keeps the leaf-only resume below.
+    if (state.task.loop_strategy.kind !== "react") {
+      return this.driveStrategyWithResumeSeed(
+        state.task,
+        emptySessionState(),
+        state.budget_used,
+        onStream,
+        signal,
+        undefined,
+        sessionState,
+      );
     }
 
     const max =
