@@ -88,6 +88,27 @@ pub fn estimate_tokens(messages: &[Message]) -> u32 {
     messages.iter().map(estimate_message_tokens).sum()
 }
 
+/// Render the structural context block from [`ContextSources`] (issue #115 /
+/// SC-26): the composed static prompt, then guides, then merged memory, joined by
+/// blank lines. Empty when there is nothing to inject, which keeps the no-source
+/// path byte-identical to the pre-#115 pass-through. The harness merges the
+/// configured system prompt INTO this block (system prompt first), so guides and
+/// memory land in a structural System slot rather than ad-hoc User messages.
+fn render_context_block(sources: &ContextSources) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let composed = sources.composed_prompt.rendered_str();
+    if !composed.is_empty() {
+        parts.push(composed.to_string());
+    }
+    for g in &sources.guides {
+        parts.push(format!("# {}\n{}", g.name, g.content));
+    }
+    for m in &sources.memory {
+        parts.push(m.memory.content.clone());
+    }
+    parts.join("\n\n")
+}
+
 /// Render a tool result into the flat text the adapter records as a `Role::Tool`
 /// message. Shared by `append_tool_result` (the normal path) and
 /// `replace_tool_result` (the AfterTool middleware in-place rewrite, SC-9) so the
@@ -145,14 +166,27 @@ impl<M: ModelInterface + 'static> HarnessContextManager for StandardCompactionAd
         &'a self,
         session: &'a HarnessState,
         _task: &'a Task,
-        _sources: &'a ContextSources,
+        sources: &'a ContextSources,
     ) -> BoxFut<'a, AgentContext> {
-        // NOT load-bearing for compaction. The rich `assemble` requires
-        // `ContextSources` the seam does not supply, so we produce a minimal
-        // context straight from the session messages (mirrors the loop's
-        // test-double managers).
-        let messages = session.messages.clone();
+        // The compaction adapter does not run the rich block-hash `assemble`
+        // (that stays #7's job — the #32 cache-halt machinery is deliberately
+        // dormant). It DOES place the #115 structural context block — guides,
+        // merged memory, the composed static prompt — as a leading System
+        // message so they reach the model through the seam instead of an ad-hoc
+        // User-message wrapper. An empty block adds nothing, so a harness with no
+        // sources stays byte-identical to the pre-#115 pass-through.
+        let mut messages = session.messages.clone();
+        let block = render_context_block(sources);
         Box::pin(async move {
+            if !block.is_empty() {
+                messages.insert(
+                    0,
+                    Message {
+                        role: Role::System,
+                        content: Content::Text { text: block },
+                    },
+                );
+            }
             AgentContext {
                 messages,
                 tools: Vec::new(),
@@ -484,6 +518,26 @@ mod tests {
         // Out-of-range index is a defensive no-op.
         adapter.replace_tool_result(&mut state, 99, &original).await;
         assert_eq!(state.messages.len(), 1);
+    }
+
+    // ---- render_context_block (SC-26/#115 structural injection) ----------
+
+    #[test]
+    fn render_context_block_formats_guides_and_is_empty_when_no_sources() {
+        // Empty sources → empty block → the adapter adds no System message, so
+        // the no-source path is byte-identical to the pre-#115 pass-through.
+        assert!(render_context_block(&ContextSources::default()).is_empty());
+
+        let sources = ContextSources {
+            guides: vec![
+                crate::guide_registry::Guide::skill("audit", "AUDIT BODY"),
+                crate::guide_registry::Guide::skill("style", "STYLE BODY"),
+            ],
+            ..Default::default()
+        };
+        let block = render_context_block(&sources);
+        // Both guides, name-headed, in registration order, joined by blank lines.
+        assert_eq!(block, "# audit\nAUDIT BODY\n\n# style\nSTYLE BODY");
     }
 
     // ---- should_compact threshold ---------------------------------------

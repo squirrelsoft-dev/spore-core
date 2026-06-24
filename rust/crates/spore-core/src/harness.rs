@@ -143,7 +143,7 @@ use crate::context::{
     SessionState as ContextSessionState,
 };
 use crate::execution_registry::{AutoGrantInfo, EscalationMode, ExecutionRegistry};
-use crate::guide_registry::SessionOutcome;
+use crate::guide_registry::{Guide, SessionOutcome};
 use crate::memory::Timestamp;
 // Issue #11 — the canonical (rich) middleware surface lives in `crate::middleware`.
 // The harness loop wires it directly (Q2 / Phase 3): the former harness-local
@@ -6368,6 +6368,14 @@ pub struct HarnessConfig {
     /// [`HarnessBuilder::system_prompt`]. `None` (the default) preserves
     /// today's behaviour byte-for-byte.
     pub system_prompt: Option<String>,
+    /// Guides (skills/playbooks/domain knowledge) injected structurally into
+    /// every turn's assembled context via the rich `ContextSources` seam (issue
+    /// #115 / SC-26 / #9). The harness clones these into
+    /// [`ContextSources::guides`] each turn; the production
+    /// [`StandardCompactionAdapter`] renders them into the leading System block,
+    /// not as ad-hoc User messages. Empty (the default) preserves today's
+    /// behaviour byte-for-byte. See [`HarnessBuilder::guide`].
+    pub guides: Vec<Guide>,
     /// Authoritative per-run model sampling/decoding parameters (issue #93).
     /// The harness replaces each turn's `Context.params` with this value
     /// UNCONDITIONALLY (builder params win) right before the request is built,
@@ -6457,6 +6465,7 @@ impl Clone for HarnessConfig {
             catalogue_registry: self.catalogue_registry.clone(),
             toolset_catalogues: self.toolset_catalogues.clone(),
             system_prompt: self.system_prompt.clone(),
+            guides: self.guides.clone(),
             model_params: self.model_params.clone(),
             auto_persist_sessions: self.auto_persist_sessions,
             prompt_tool_call_flag: self.prompt_tool_call_flag.clone(),
@@ -6561,6 +6570,10 @@ pub struct HarnessBuilder {
     /// context (issue #91) when the context manager renders none. `None` (the
     /// default) preserves today's behaviour. See [`system_prompt`](HarnessBuilder::system_prompt).
     system_prompt: Option<String>,
+    /// Guides injected structurally into every turn via `ContextSources` (issue
+    /// #115 / #9). Empty (the default) preserves today's behaviour. See
+    /// [`guide`](HarnessBuilder::guide).
+    guides: Vec<Guide>,
     /// Authoritative per-run model sampling/decoding parameters (issue #93).
     /// Defaults to [`ModelParams::default`]. See
     /// [`model_params`](HarnessBuilder::model_params).
@@ -6629,6 +6642,7 @@ impl HarnessBuilder {
             standard_tools: Vec::new(),
             toolset_tools: std::collections::HashMap::new(),
             system_prompt: None,
+            guides: Vec::new(),
             model_params: ModelParams::default(),
             auto_persist_sessions: false,
             prompt_tool_call_flag: None,
@@ -6967,6 +6981,24 @@ impl HarnessBuilder {
     /// default) preserves today's behaviour.
     pub fn system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
         self.system_prompt = Some(system_prompt.into());
+        self
+    }
+
+    /// Register a [`Guide`] (skill/playbook/domain knowledge) injected
+    /// structurally into every turn's assembled context via the rich
+    /// `ContextSources` seam (issue #115 / SC-26 / #9). Unlike an ad-hoc
+    /// User-message prepend, the guide is rendered into the leading System block
+    /// by the production context manager. Call repeatedly to register several;
+    /// order is preserved.
+    pub fn guide(mut self, guide: Guide) -> Self {
+        self.guides.push(guide);
+        self
+    }
+
+    /// Register several [`Guide`]s at once (issue #115 / SC-26). Appends to any
+    /// already registered via [`guide`](Self::guide).
+    pub fn guides(mut self, guides: impl IntoIterator<Item = Guide>) -> Self {
+        self.guides.extend(guides);
         self
     }
 
@@ -7463,6 +7495,7 @@ impl HarnessBuilder {
             catalogue_registry,
             toolset_catalogues,
             system_prompt: self.system_prompt,
+            guides: self.guides,
             model_params: self.model_params,
             auto_persist_sessions: self.auto_persist_sessions,
             prompt_tool_call_flag: self.prompt_tool_call_flag,
@@ -7545,7 +7578,13 @@ impl StandardHarness {
     /// renders to nothing, so a harness with no sources stays byte-identical.
     fn build_context_sources(&self, tool_schemas: Vec<ToolSchema>) -> ContextSources {
         ContextSources {
+            // #115 / SC-26 / #9: configured guides reach the model structurally
+            // through the assemble seam, not as an ad-hoc User-message prepend.
+            guides: self.config.guides.clone(),
             tool_schemas,
+            // Memory stays empty pending the MemoryProvider object-safety
+            // conversion (#8); the composed static prompt is empty until the
+            // chunk-provider path is wired.
             ..Default::default()
         }
     }
@@ -8250,26 +8289,41 @@ impl StandardHarness {
             if context.tools.is_empty() {
                 context.tools = tool_registry.schemas();
             }
-            // Prepend the configured operating system prompt (issue #91). The
-            // standard compaction adapter renders none, so without this the
-            // model gets only the task and no guidance. Guard against duplicates
-            // so a context manager that already leads with a System message (or
-            // a resumed/seeded session) isn't given two.
+            // Prepend the configured operating system prompt (issue #91), MERGING
+            // it with any structural #115 context block the manager already placed
+            // as a leading System message (guides/memory/composed prompt). The
+            // system prompt always leads. When the manager produced NO System
+            // message (the common case — empty sources, or a test double), this
+            // inserts a fresh System message exactly as before, so the
+            // no-structural-block path stays byte-identical. The `starts_with`
+            // guard keeps a resumed/seeded session that already leads with the
+            // system prompt from being given it twice.
             if let Some(system_prompt) = self.config.system_prompt.as_ref() {
-                let has_system = context
-                    .messages
-                    .first()
-                    .is_some_and(|m| matches!(m.role, Role::System));
-                if !has_system {
-                    context.messages.insert(
-                        0,
-                        Message {
-                            role: Role::System,
-                            content: Content::Text {
-                                text: system_prompt.clone(),
+                match context.messages.first_mut() {
+                    Some(Message {
+                        role: Role::System,
+                        content: Content::Text { text },
+                    }) if !text.starts_with(system_prompt.as_str()) => {
+                        *text = format!("{system_prompt}\n\n{text}");
+                    }
+                    Some(Message {
+                        role: Role::System,
+                        ..
+                    }) => {
+                        // Already leads with the system prompt (or a non-text
+                        // System block) — leave it.
+                    }
+                    _ => {
+                        context.messages.insert(
+                            0,
+                            Message {
+                                role: Role::System,
+                                content: Content::Text {
+                                    text: system_prompt.clone(),
+                                },
                             },
-                        },
-                    );
+                        );
+                    }
                 }
             }
             // Per-run model params win unconditionally (issue #93). The agent
@@ -13824,6 +13878,7 @@ mod tests {
             catalogue_registry: None,
             toolset_catalogues: std::collections::HashMap::new(),
             system_prompt: None,
+            guides: Vec::new(),
             model_params: ModelParams::default(),
             auto_persist_sessions: false,
             prompt_tool_call_flag: None,
@@ -15562,6 +15617,141 @@ mod tests {
             }
             other => panic!("expected Success, got {other:?}"),
         }
+    }
+
+    // ── SC-26 / #115: ContextSources reach the model structurally ─────────────
+
+    /// Agent double that records the [`Context`] it is handed each turn, so a
+    /// test can assert what actually reached the model.
+    struct RecordingAgent {
+        seen: Arc<std::sync::Mutex<Vec<Context>>>,
+    }
+    impl crate::agent::Agent for RecordingAgent {
+        fn turn<'a>(&'a self, context: Context) -> BoxFut<'a, TurnResult> {
+            self.seen.lock().unwrap().push(context);
+            Box::pin(async move {
+                TurnResult::FinalResponse {
+                    reasoning: None,
+                    content: "done".into(),
+                    usage: usage(),
+                }
+            })
+        }
+        fn id(&self) -> AgentId {
+            AgentId::new("recording")
+        }
+    }
+
+    /// Minimal context manager that renders `sources.guides` into a leading
+    /// System block — mirroring the production `StandardCompactionAdapter` so the
+    /// loop's sources-building + system-prompt merge can be asserted without the
+    /// adapter's model machinery. (The adapter's own rendering is unit-tested in
+    /// `compaction_adapter`.)
+    struct GuideRenderingCm;
+    impl ContextManager for GuideRenderingCm {
+        fn assemble<'a>(
+            &'a self,
+            session: &'a SessionState,
+            _task: &'a Task,
+            sources: &'a ContextSources,
+        ) -> BoxFut<'a, Context> {
+            let mut messages = session.messages.clone();
+            let block = sources
+                .guides
+                .iter()
+                .map(|g| format!("# {}\n{}", g.name, g.content))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            Box::pin(async move {
+                if !block.is_empty() {
+                    messages.insert(
+                        0,
+                        Message {
+                            role: Role::System,
+                            content: Content::Text { text: block },
+                        },
+                    );
+                }
+                Context {
+                    messages,
+                    tools: vec![],
+                    params: ModelParams::default(),
+                }
+            })
+        }
+        fn append_tool_result<'a>(
+            &'a self,
+            session: &'a mut SessionState,
+            result: &'a ToolResult,
+        ) -> BoxFut<'a, ()> {
+            let text = match &result.output {
+                ToolOutput::Success { content, .. } => content.clone(),
+                ToolOutput::Error { message, .. } => message.clone(),
+                _ => String::new(),
+            };
+            Box::pin(async move {
+                session.messages.push(Message {
+                    role: Role::Tool,
+                    content: Content::Text { text },
+                });
+            })
+        }
+        fn append_user_message<'a>(
+            &'a self,
+            session: &'a mut SessionState,
+            text: &'a str,
+        ) -> BoxFut<'a, ()> {
+            let text = text.to_string();
+            Box::pin(async move {
+                session.messages.push(Message {
+                    role: Role::User,
+                    content: Content::Text { text },
+                });
+            })
+        }
+    }
+
+    // SC-26/#115 acceptance (guide half): a guide registered on the harness
+    // reaches the model through the structural assemble seam — NOT as an ad-hoc
+    // User message — and the configured system prompt is merged in front of it in
+    // a single leading System message.
+    #[tokio::test]
+    async fn guide_reaches_model_via_assemble_seam() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent: Arc<dyn crate::agent::Agent> = Arc::new(RecordingAgent { seen: seen.clone() });
+        let mut cfg = standard_config(make_agent());
+        set_worker_agent(&mut cfg, agent);
+        cfg.context_manager = Arc::new(GuideRenderingCm);
+        cfg.system_prompt = Some("SYSTEM PROMPT".into());
+        cfg.guides = vec![Guide::skill("audit", "AUDIT PLAYBOOK BODY")];
+        let h = StandardHarness::new(cfg);
+        let _ = h.run(HarnessRunOptions::new(react(5))).await;
+
+        let contexts = seen.lock().unwrap();
+        assert!(!contexts.is_empty(), "the agent must have been called");
+        let first = &contexts[0];
+        match first.messages.first() {
+            Some(Message {
+                role: Role::System,
+                content: Content::Text { text },
+            }) => {
+                assert!(
+                    text.starts_with("SYSTEM PROMPT"),
+                    "system prompt must lead the merged System block: {text:?}"
+                );
+                assert!(
+                    text.contains("# audit") && text.contains("AUDIT PLAYBOOK BODY"),
+                    "the guide must reach the model structurally: {text:?}"
+                );
+            }
+            other => panic!("expected a leading System text message, got {other:?}"),
+        }
+        // The guide is NOT delivered as a stray User message.
+        let user_guide = first.messages.iter().any(|m| {
+            matches!((&m.role, &m.content),
+                (Role::User, Content::Text { text }) if text.contains("AUDIT PLAYBOOK BODY"))
+        });
+        assert!(!user_guide, "guide must not be injected as a User message");
     }
 
     // Rule: always_halt tool annotation halts the loop.
@@ -18992,6 +19182,7 @@ mod tests {
                 catalogue_registry: None,
                 toolset_catalogues: std::collections::HashMap::new(),
                 system_prompt: None,
+                guides: Vec::new(),
                 model_params: ModelParams::default(),
                 auto_persist_sessions: false,
                 prompt_tool_call_flag: None,

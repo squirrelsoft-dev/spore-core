@@ -84,6 +84,7 @@ async fn tool_error_loop_breaker_hard_stops_at_two_n() {
         vcs_provider: None,
         catalogue_registry: None,
         system_prompt: None,
+        guides: Vec::new(),
         model_params: spore_core::ModelParams::default(),
         auto_persist_sessions: false,
         prompt_tool_call_flag: None,
