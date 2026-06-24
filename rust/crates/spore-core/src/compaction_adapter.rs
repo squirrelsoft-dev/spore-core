@@ -88,6 +88,24 @@ pub fn estimate_tokens(messages: &[Message]) -> u32 {
     messages.iter().map(estimate_message_tokens).sum()
 }
 
+/// Render a tool result into the flat text the adapter records as a `Role::Tool`
+/// message. Shared by `append_tool_result` (the normal path) and
+/// `replace_tool_result` (the AfterTool middleware in-place rewrite, SC-9) so the
+/// two stay byte-identical.
+fn render_tool_result_text(output: &ToolOutput) -> String {
+    match output {
+        ToolOutput::Success { content, .. } => content.clone(),
+        ToolOutput::Error { message, .. } => message.clone(),
+        // Normally normalized into an `Error` by the harness before being
+        // appended; record the violation text defensively if it reaches here.
+        ToolOutput::SandboxViolation { violation } => format!("sandbox violation: {violation:?}"),
+        ToolOutput::WaitingForHuman { .. } => String::new(),
+        ToolOutput::Escalate { .. } => String::new(),
+        ToolOutput::AwaitingClarification { .. } => String::new(),
+        ToolOutput::Consult { .. } => String::new(),
+    }
+}
+
 /// Stateless bridge from the rich [`StandardContextManager`] onto the
 /// harness-loop compaction seam ([`harness::ContextManager`]).
 ///
@@ -147,22 +165,33 @@ impl<M: ModelInterface + 'static> HarnessContextManager for StandardCompactionAd
         session: &'a mut HarnessState,
         result: &'a ToolResult,
     ) -> BoxFut<'a, ()> {
-        let text = match &result.output {
-            ToolOutput::Success { content, .. } => content.clone(),
-            ToolOutput::Error { message, .. } => message.clone(),
-            // Normally normalized into an `Error` by the harness before being
-            // appended; record the violation text defensively if it reaches here.
-            ToolOutput::SandboxViolation { violation } => format!("sandbox violation: {violation:?}"),
-            ToolOutput::WaitingForHuman { .. } => String::new(),
-            ToolOutput::Escalate { .. } => String::new(),
-            ToolOutput::AwaitingClarification { .. } => String::new(),
-            ToolOutput::Consult { .. } => String::new(),
-        };
+        let text = render_tool_result_text(&result.output);
         Box::pin(async move {
             session.messages.push(Message {
                 role: Role::Tool,
                 content: Content::Text { text },
             });
+        })
+    }
+
+    // SC-9: an `AfterTool` middleware may rewrite a result in place. Re-render the
+    // already-appended `Role::Tool` message at `message_index` so the rewrite
+    // reaches the next model turn. Out-of-range indices are ignored defensively
+    // (the loop only passes indices it recorded right after `append_tool_result`).
+    fn replace_tool_result<'a>(
+        &'a self,
+        session: &'a mut HarnessState,
+        message_index: usize,
+        result: &'a ToolResult,
+    ) -> BoxFut<'a, ()> {
+        let text = render_tool_result_text(&result.output);
+        Box::pin(async move {
+            if let Some(msg) = session.messages.get_mut(message_index) {
+                *msg = Message {
+                    role: Role::Tool,
+                    content: Content::Text { text },
+                };
+            }
         })
     }
 
@@ -414,6 +443,46 @@ mod tests {
         let mut s = HarnessState::default();
         seed_rich_state(&mut s, rich);
         s
+    }
+
+    // ---- replace_tool_result (SC-9 in-place AfterTool rewrite) -----------
+
+    #[tokio::test]
+    async fn replace_tool_result_rerenders_the_recorded_message() {
+        let adapter = StandardCompactionAdapter::new(rich_manager());
+        let mut state = HarnessState::default();
+        let original = ToolResult {
+            call_id: "c1".into(),
+            output: ToolOutput::Success {
+                content: "ORIGINAL".into(),
+                truncated: false,
+            },
+        };
+        adapter.append_tool_result(&mut state, &original).await;
+        let idx = state.messages.len() - 1;
+        assert!(matches!(
+            &state.messages[idx].content,
+            Content::Text { text } if text == "ORIGINAL"
+        ));
+
+        // A middleware rewrote the result; re-render the recorded message.
+        let rewritten = ToolResult {
+            call_id: "c1".into(),
+            output: ToolOutput::Error {
+                message: "REWRITTEN".into(),
+                recoverable: true,
+            },
+        };
+        adapter.replace_tool_result(&mut state, idx, &rewritten).await;
+        assert_eq!(state.messages.len(), 1, "no message added on replace");
+        assert!(matches!(
+            (&state.messages[idx].role, &state.messages[idx].content),
+            (Role::Tool, Content::Text { text }) if text == "REWRITTEN"
+        ));
+
+        // Out-of-range index is a defensive no-op.
+        adapter.replace_tool_result(&mut state, 99, &original).await;
+        assert_eq!(state.messages.len(), 1);
     }
 
     // ---- should_compact threshold ---------------------------------------

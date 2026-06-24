@@ -145,6 +145,13 @@ use crate::context::{
 use crate::execution_registry::{AutoGrantInfo, EscalationMode, ExecutionRegistry};
 use crate::guide_registry::SessionOutcome;
 use crate::memory::Timestamp;
+// Issue #11 — the canonical (rich) middleware surface lives in `crate::middleware`.
+// The harness loop wires it directly (Q2 / Phase 3): the former harness-local
+// `MiddlewareChain` / `MiddlewareDecision` / `HookPoint` stubs were deleted in
+// favour of these. `HookContext` is intentionally NOT imported here — it would
+// collide with the harness's own (#69) `HookContext`, and the loop fires through
+// the chain's `fire_*` methods rather than constructing contexts itself.
+use crate::middleware::{HookPoint, MiddlewareChain, MiddlewareDecision};
 use crate::model::{
     Content, Message, ModelParams, Role, StopReason, TokenUsage, ToolCall, ToolSchema,
 };
@@ -4572,16 +4579,6 @@ pub enum SandboxViolationPolicy {
     Halt,
 }
 
-/// Where in the lifecycle a middleware hook fired. Full enum lives in #11.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HookPoint {
-    BeforeTurn,
-    BeforeTool,
-    AfterTool,
-    BeforeCompletion,
-}
-
 /// Termination-policy decision. Full enum lives in #13.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -5252,6 +5249,24 @@ pub trait ContextManager: Send + Sync {
         result: &'a ToolResult,
     ) -> BoxFut<'a, ()>;
 
+    /// Replace the tool-result message previously appended at `message_index`
+    /// with a fresh rendering of `result`. The harness loop calls this from the
+    /// `AfterTool` middleware hook (issue #11 / SC-9) when a middleware rewrote a
+    /// result in place, so the rewrite reaches the next model turn. `message_index`
+    /// is the position in `session.messages` recorded right after the original
+    /// `append_tool_result`. The default is a no-op — a manager that does not
+    /// store tool results as standalone messages need not act (the rewrite simply
+    /// does not propagate, which is the pre-#11 behaviour).
+    fn replace_tool_result<'a>(
+        &'a self,
+        session: &'a mut SessionState,
+        message_index: usize,
+        result: &'a ToolResult,
+    ) -> BoxFut<'a, ()> {
+        let _ = (session, message_index, result);
+        Box::pin(async {})
+    }
+
     /// Append the assistant's turn (model output: text and/or the tool calls it
     /// requested) to the conversation so the next assemble() reflects what the
     /// agent already did. Without this the model loses track of its own actions.
@@ -5348,24 +5363,10 @@ impl TerminationPolicy for CompleteOnFinalResponse {
     }
 }
 
-/// Issue #11 — Middleware chain. Full shape (BeforeTool modification,
-/// SurfaceToHuman payload) lives in #11; this stub covers what ReAct needs.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum MiddlewareDecision {
-    Continue,
-    ContinueWithModification { calls: Vec<ToolCall> },
-    Halt { reason: String },
-    SurfaceToHuman { request: HumanRequest },
-}
-
-pub trait MiddlewareChain: Send + Sync {
-    fn fire<'a>(
-        &'a self,
-        hook: HookPoint,
-        session: &'a SessionState,
-    ) -> BoxFut<'a, MiddlewareDecision>;
-}
+// Issue #11 — Middleware chain. The canonical `MiddlewareChain` trait,
+// `MiddlewareDecision`, and `HookPoint` live in [`crate::middleware`] (the rich,
+// fixtured surface). The harness loop wires that chain directly; the former
+// harness-local stubs were deleted in Phase 3 (Q2 anchor decision).
 
 // Issue #12 — `ObservabilityProvider` is no longer a no-op stub here. The
 // canonical trait lives in [`crate::observability`]; the harness loop emits
@@ -8146,11 +8147,13 @@ impl StandardHarness {
                 };
             }
 
-            // Middleware: BeforeTurn.
+            // Middleware: BeforeTurn (rich chain, issue #11). The chain may mutate
+            // `session_state` in place (priority-ordered fan-out); a
+            // `ContinueWithModification` is the modified-but-proceed signal.
             if let Some(mw) = self.config.middleware.as_ref() {
-                match mw.fire(HookPoint::BeforeTurn, &session_state).await {
-                    MiddlewareDecision::Continue => {}
-                    MiddlewareDecision::ContinueWithModification { .. } => {}
+                match mw.fire_before_turn(&mut session_state, budget_used.turns).await {
+                    MiddlewareDecision::Continue
+                    | MiddlewareDecision::ContinueWithModification => {}
                     MiddlewareDecision::Halt { reason } => {
                         return RunResult::Failure {
                             reason: HaltReason::MiddlewareHalt {
@@ -8182,6 +8185,23 @@ impl StandardHarness {
                         return RunResult::WaitingForHuman {
                             state: Box::new(state),
                             request,
+                        };
+                    }
+                    // `ForceAnotherTurn` is valid only at `BeforeCompletion`; the
+                    // StandardMiddlewareChain converts it to `Halt` here. Handle it
+                    // defensively as a halt for any custom chain that emits it.
+                    MiddlewareDecision::ForceAnotherTurn { inject } => {
+                        return RunResult::Failure {
+                            reason: HaltReason::MiddlewareHalt {
+                                hook: HookPoint::BeforeTurn,
+                                reason: format!(
+                                    "ForceAnotherTurn is not valid at BeforeTurn: {inject}"
+                                ),
+                            },
+                            session_id,
+                            usage,
+                            turns: budget_used.turns,
+                            session_state: session_state.clone(),
                         };
                     }
                 }
@@ -8447,9 +8467,36 @@ tool. Use the provided tool-call format to actually invoke the tool."
                     }
 
                     if let Some(mw) = self.config.middleware.as_ref() {
-                        match mw.fire(HookPoint::BeforeCompletion, &session_state).await {
-                            MiddlewareDecision::Continue => {}
-                            MiddlewareDecision::ContinueWithModification { .. } => {}
+                        match mw
+                            .fire_before_completion(&content, budget_used.turns, &session_state)
+                            .await
+                        {
+                            MiddlewareDecision::Continue
+                            | MiddlewareDecision::ContinueWithModification => {}
+                            // The chain concatenates every middleware's injection
+                            // into one `ForceAnotherTurn` (issue #11). Record the
+                            // model's final text, then the injection as a user
+                            // message, and force another turn instead of completing
+                            // — the same channel the Stop-block breaker uses, so the
+                            // conversation stays well-formed (assistant final text →
+                            // user injection).
+                            MiddlewareDecision::ForceAnotherTurn { inject } => {
+                                let assistant = Message {
+                                    role: Role::Assistant,
+                                    content: Content::Text {
+                                        text: content.clone(),
+                                    },
+                                };
+                                self.config
+                                    .context_manager
+                                    .append_assistant_message(&mut session_state, &assistant)
+                                    .await;
+                                self.config
+                                    .context_manager
+                                    .append_user_message(&mut session_state, &inject)
+                                    .await;
+                                continue;
+                            }
                             MiddlewareDecision::Halt { reason } => {
                                 return RunResult::Failure {
                                     reason: HaltReason::MiddlewareHalt {
@@ -8676,7 +8723,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                 }
 
                 TurnResult::ToolCallRequested {
-                    calls, usage: u, ..
+                    mut calls, usage: u, ..
                 } => {
                     usage.add_turn(&u);
                     budget_used.input_tokens += u.input_tokens as u64;
@@ -8716,14 +8763,15 @@ tool. Use the provided tool-call format to actually invoke the tool."
                             .await;
                     }
 
-                    // Middleware: BeforeTool.
-                    let calls = match self.config.middleware.as_ref() {
-                        None => calls,
-                        Some(mw) => match mw.fire(HookPoint::BeforeTool, &session_state).await {
-                            MiddlewareDecision::Continue => calls,
-                            MiddlewareDecision::ContinueWithModification { calls: modified } => {
-                                modified
-                            }
+                    // Middleware: BeforeTool (rich chain, issue #11 / SC-11). The
+                    // chain mutates `calls` IN PLACE via a priority-ordered
+                    // fan-out; `ContinueWithModification` is the modified-but-proceed
+                    // signal. The assistant turn recorded just above keeps the
+                    // model's ORIGINAL request — only what is dispatched changes.
+                    if let Some(mw) = self.config.middleware.as_ref() {
+                        match mw.fire_before_tool(&mut calls, budget_used.turns).await {
+                            MiddlewareDecision::Continue
+                            | MiddlewareDecision::ContinueWithModification => {}
                             MiddlewareDecision::Halt { reason } => {
                                 return RunResult::Failure {
                                     reason: HaltReason::MiddlewareHalt {
@@ -8757,10 +8805,32 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                     request,
                                 };
                             }
-                        },
-                    };
+                            // `ForceAnotherTurn` is valid only at `BeforeCompletion`;
+                            // the StandardMiddlewareChain converts it to `Halt` here.
+                            // Defensive for a custom chain that emits it.
+                            MiddlewareDecision::ForceAnotherTurn { inject } => {
+                                return RunResult::Failure {
+                                    reason: HaltReason::MiddlewareHalt {
+                                        hook: HookPoint::BeforeTool,
+                                        reason: format!(
+                                            "ForceAnotherTurn is not valid at BeforeTool: {inject}"
+                                        ),
+                                    },
+                                    session_id,
+                                    usage,
+                                    turns: budget_used.turns,
+                                    session_state: session_state.clone(),
+                                };
+                            }
+                        }
+                    }
 
                     let mut approved_results: Vec<ToolResult> = Vec::new();
+                    // SC-9: the `session_state.messages` index of each appended
+                    // tool result, recorded 1:1 with `approved_results`. The
+                    // AfterTool middleware hook uses these to re-render any result
+                    // it rewrites in place (via `ContextManager::replace_tool_result`).
+                    let mut result_msg_indices: Vec<usize> = Vec::new();
                     for (i, call) in calls.iter().enumerate() {
                         // Sandbox validation. The pre-dispatch `validate` seam
                         // honours the SAME policy as tool-surfaced violations
@@ -8798,6 +8868,8 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                 .context_manager
                                 .append_tool_result(&mut session_state, &tr)
                                 .await;
+                            result_msg_indices
+                                .push(session_state.messages.len().saturating_sub(1));
                             approved_results.push(tr);
                             continue;
                         }
@@ -9394,6 +9466,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                             .context_manager
                             .append_tool_result(&mut session_state, &tr)
                             .await;
+                        result_msg_indices.push(session_state.messages.len().saturating_sub(1));
                         approved_results.push(tr);
 
                         // #137 (AC2): inject the ONE corrective user message at
@@ -9408,21 +9481,54 @@ tool. Use the provided tool-call format to actually invoke the tool."
                         }
                     }
 
-                    // Middleware: AfterTool.
+                    // Middleware: AfterTool (rich chain, issue #11 / SC-9). The
+                    // chain receives the batch's results as `&mut` and may rewrite
+                    // any of them in place (priority-ordered, descending). On
+                    // `ContinueWithModification`, re-render the affected tool-result
+                    // messages so the rewrite reaches the next model turn — this is
+                    // what lets an after-tool middleware turn a landed write into a
+                    // model-visible error (or vice versa) without the tool itself
+                    // having to invert its output.
                     if let Some(mw) = self.config.middleware.as_ref() {
-                        if let MiddlewareDecision::Halt { reason } =
-                            mw.fire(HookPoint::AfterTool, &session_state).await
-                        {
-                            return RunResult::Failure {
-                                reason: HaltReason::MiddlewareHalt {
-                                    hook: HookPoint::AfterTool,
-                                    reason,
-                                },
-                                session_id,
-                                usage,
-                                turns: budget_used.turns,
-                                session_state: session_state.clone(),
-                            };
+                        match mw.fire_after_tool(&calls, &mut approved_results).await {
+                            MiddlewareDecision::Continue => {}
+                            MiddlewareDecision::ContinueWithModification => {
+                                for (res, &idx) in
+                                    approved_results.iter().zip(result_msg_indices.iter())
+                                {
+                                    self.config
+                                        .context_manager
+                                        .replace_tool_result(&mut session_state, idx, res)
+                                        .await;
+                                }
+                            }
+                            MiddlewareDecision::Halt { reason } => {
+                                return RunResult::Failure {
+                                    reason: HaltReason::MiddlewareHalt {
+                                        hook: HookPoint::AfterTool,
+                                        reason,
+                                    },
+                                    session_id,
+                                    usage,
+                                    turns: budget_used.turns,
+                                    session_state: session_state.clone(),
+                                };
+                            }
+                            // `SurfaceToHuman` / `ForceAnotherTurn` are not valid at
+                            // `AfterTool`; the StandardMiddlewareChain converts them
+                            // to `Halt`. Defensive for a custom chain that emits one.
+                            other => {
+                                return RunResult::Failure {
+                                    reason: HaltReason::MiddlewareHalt {
+                                        hook: HookPoint::AfterTool,
+                                        reason: format!("illegal AfterTool decision: {other:?}"),
+                                    },
+                                    session_id,
+                                    usage,
+                                    turns: budget_used.turns,
+                                    session_state: session_state.clone(),
+                                };
+                            }
                         }
                     }
 
@@ -12337,6 +12443,12 @@ pub mod testing {
         }
     }
 
+    /// Scripted [`MiddlewareChain`] test double (rich surface, issue #11). Decisions
+    /// are queued per hook via [`push`](ScriptedMiddleware::push); each `fire_*`
+    /// method pops the front entry if it targets that hook, else returns `Continue`.
+    /// Unlike the `StandardMiddlewareChain`, scripted decisions are returned RAW (no
+    /// `validate_decision`), so a test can exercise the harness's defensive handling
+    /// of an out-of-place decision.
     pub struct ScriptedMiddleware {
         decisions: Mutex<std::collections::VecDeque<(HookPoint, MiddlewareDecision)>>,
     }
@@ -12355,24 +12467,79 @@ pub mod testing {
             self.decisions.lock().unwrap().push_back((h, d));
             self
         }
+        /// Pop and return the scripted decision for `hook` if it is at the front of
+        /// the queue, else `Continue`.
+        fn next_for(&self, hook: HookPoint) -> MiddlewareDecision {
+            let mut q = self.decisions.lock().unwrap();
+            match q.front() {
+                Some(front) if front.0 == hook => q.pop_front().unwrap().1,
+                _ => MiddlewareDecision::Continue,
+            }
+        }
     }
     impl MiddlewareChain for ScriptedMiddleware {
-        fn fire<'a>(
+        fn register(
+            &self,
+            _middleware: Box<dyn crate::middleware::Middleware>,
+        ) -> Result<(), crate::middleware::MiddlewareError> {
+            // The double scripts decisions directly; registration is a no-op.
+            Ok(())
+        }
+
+        fn fire_before_session<'a>(
             &'a self,
-            hook: HookPoint,
-            _session: &'a SessionState,
+            _task: &'a Task,
+            _session_id: &'a SessionId,
         ) -> BoxFut<'a, MiddlewareDecision> {
-            let mut q = self.decisions.lock().unwrap();
-            let d = if let Some(front) = q.front() {
-                if front.0 == hook {
-                    q.pop_front().unwrap().1
-                } else {
-                    MiddlewareDecision::Continue
-                }
-            } else {
-                MiddlewareDecision::Continue
-            };
+            let d = self.next_for(HookPoint::BeforeSession);
             Box::pin(async move { d })
+        }
+
+        fn fire_before_turn<'a>(
+            &'a self,
+            _session: &'a mut SessionState,
+            _turn_number: u32,
+        ) -> BoxFut<'a, MiddlewareDecision> {
+            let d = self.next_for(HookPoint::BeforeTurn);
+            Box::pin(async move { d })
+        }
+
+        fn fire_before_tool<'a>(
+            &'a self,
+            _calls: &'a mut Vec<ToolCall>,
+            _turn_number: u32,
+        ) -> BoxFut<'a, MiddlewareDecision> {
+            let d = self.next_for(HookPoint::BeforeTool);
+            Box::pin(async move { d })
+        }
+
+        fn fire_after_tool<'a>(
+            &'a self,
+            _calls: &'a [ToolCall],
+            _results: &'a mut Vec<ToolResult>,
+        ) -> BoxFut<'a, MiddlewareDecision> {
+            let d = self.next_for(HookPoint::AfterTool);
+            Box::pin(async move { d })
+        }
+
+        fn fire_before_completion<'a>(
+            &'a self,
+            _response: &'a str,
+            _turn_number: u32,
+            _state: &'a SessionState,
+        ) -> BoxFut<'a, MiddlewareDecision> {
+            let d = self.next_for(HookPoint::BeforeCompletion);
+            Box::pin(async move { d })
+        }
+
+        fn fire_after_session<'a>(
+            &'a self,
+            _result: &'a RunResult,
+            _session_id: &'a SessionId,
+        ) -> BoxFut<'a, ()> {
+            // After hooks ignore the decision; drain a scripted AfterSession entry.
+            let _ = self.next_for(HookPoint::AfterSession);
+            Box::pin(async {})
         }
     }
 }
@@ -13338,6 +13505,7 @@ mod tests {
     use super::*;
     use crate::agent::{mock::MockAgent, AgentId};
     use crate::hooks::HookChain as _;
+    use crate::middleware::StandardMiddlewareChain;
     use crate::model::{ModelError, ToolCall};
 
     fn make_agent() -> Arc<MockAgent> {
@@ -14996,6 +15164,373 @@ mod tests {
                 assert!(state.child_state.is_none());
             }
             other => panic!("expected WaitingForHuman, got {other:?}"),
+        }
+    }
+
+    // ── Phase 3 / Q2: the rich `middleware.rs` chain is now canonical ──────────
+    // These exercise the wired `StandardMiddlewareChain` (not the `ScriptedMiddleware`
+    // double) end-to-end through the loop: SC-9 (AfterTool rewrites a result in
+    // place), SC-11 (BeforeTool mutates calls in place + priority fan-out), and the
+    // BeforeCompletion `ForceAnotherTurn` injection the former harness stub lacked.
+
+    /// Context manager that stores each tool result as a `Role::Tool` text message
+    /// AND honours `replace_tool_result` — so a SC-9 in-place rewrite is observable
+    /// in the post-run `session_state`.
+    struct ReplaceRecordingCm;
+    impl ReplaceRecordingCm {
+        fn render(output: &ToolOutput) -> String {
+            match output {
+                ToolOutput::Success { content, .. } => content.clone(),
+                ToolOutput::Error { message, .. } => message.clone(),
+                _ => String::new(),
+            }
+        }
+    }
+    impl ContextManager for ReplaceRecordingCm {
+        fn assemble<'a>(
+            &'a self,
+            session: &'a SessionState,
+            _task: &'a Task,
+        ) -> BoxFut<'a, Context> {
+            let messages = session.messages.clone();
+            Box::pin(async move {
+                Context {
+                    messages,
+                    tools: vec![],
+                    params: ModelParams::default(),
+                }
+            })
+        }
+        fn append_tool_result<'a>(
+            &'a self,
+            session: &'a mut SessionState,
+            result: &'a ToolResult,
+        ) -> BoxFut<'a, ()> {
+            let text = Self::render(&result.output);
+            Box::pin(async move {
+                session.messages.push(Message {
+                    role: Role::Tool,
+                    content: Content::Text { text },
+                });
+            })
+        }
+        fn replace_tool_result<'a>(
+            &'a self,
+            session: &'a mut SessionState,
+            message_index: usize,
+            result: &'a ToolResult,
+        ) -> BoxFut<'a, ()> {
+            let text = Self::render(&result.output);
+            Box::pin(async move {
+                if let Some(m) = session.messages.get_mut(message_index) {
+                    *m = Message {
+                        role: Role::Tool,
+                        content: Content::Text { text },
+                    };
+                }
+            })
+        }
+        fn append_assistant_message<'a>(
+            &'a self,
+            session: &'a mut SessionState,
+            message: &'a Message,
+        ) -> BoxFut<'a, ()> {
+            let message = message.clone();
+            Box::pin(async move {
+                session.messages.push(message);
+            })
+        }
+        fn append_user_message<'a>(
+            &'a self,
+            session: &'a mut SessionState,
+            text: &'a str,
+        ) -> BoxFut<'a, ()> {
+            let text = text.to_string();
+            Box::pin(async move {
+                session.messages.push(Message {
+                    role: Role::User,
+                    content: Content::Text { text },
+                });
+            })
+        }
+    }
+
+    /// AfterTool middleware that rewrites the first result's output in place.
+    struct RewriteFirstResultMw {
+        to: String,
+    }
+    impl crate::middleware::Middleware for RewriteFirstResultMw {
+        fn handle<'a>(
+            &'a self,
+            ctx: crate::middleware::HookContext<'a>,
+        ) -> BoxFut<'a, MiddlewareDecision> {
+            let to = self.to.clone();
+            Box::pin(async move {
+                if let crate::middleware::HookContext::AfterTool { results, .. } = ctx {
+                    if let Some(r) = results.first_mut() {
+                        r.output = ToolOutput::Error {
+                            message: to,
+                            recoverable: true,
+                        };
+                        return MiddlewareDecision::ContinueWithModification;
+                    }
+                }
+                MiddlewareDecision::Continue
+            })
+        }
+        fn hooks(&self) -> Vec<HookPoint> {
+            vec![HookPoint::AfterTool]
+        }
+        fn name(&self) -> &str {
+            "rewrite_first_result"
+        }
+    }
+
+    // SC-9: an AfterTool middleware rewrites a result; the rewrite reaches the
+    // conversation the next model turn sees (the cordyceps `build_check` inversion,
+    // done by the harness instead of the tool returning a fake error).
+    #[tokio::test]
+    async fn after_tool_middleware_rewrites_result_in_place() {
+        let a = make_agent();
+        a.push(TurnResult::ToolCallRequested {
+            reasoning: None,
+            calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+            }],
+            usage: usage(),
+        });
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: "done".into(),
+            usage: usage(),
+        });
+        let mut cfg = standard_config(a);
+        cfg.context_manager = Arc::new(ReplaceRecordingCm);
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::Success {
+            content: "ORIGINAL".into(),
+            truncated: false,
+        });
+        cfg.tool_registry = reg;
+        let chain = StandardMiddlewareChain::new();
+        chain
+            .register(Box::new(RewriteFirstResultMw {
+                to: "REWRITTEN".into(),
+            }))
+            .unwrap();
+        cfg.middleware = Some(Arc::new(chain));
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::Success { session_state, .. } => {
+                let tool_texts: Vec<String> = session_state
+                    .messages
+                    .iter()
+                    .filter_map(|m| match (&m.role, &m.content) {
+                        (Role::Tool, Content::Text { text }) => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(
+                    tool_texts.iter().any(|t| t == "REWRITTEN"),
+                    "rewritten result must reach the conversation, got {tool_texts:?}"
+                );
+                assert!(
+                    !tool_texts.iter().any(|t| t == "ORIGINAL"),
+                    "original result must not survive the rewrite, got {tool_texts:?}"
+                );
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    /// Tool registry that records every dispatched call and echoes success.
+    struct RecordingToolRegistry {
+        seen: Arc<std::sync::Mutex<Vec<ToolCall>>>,
+    }
+    impl ToolRegistry for RecordingToolRegistry {
+        fn dispatch<'a>(&'a self, call: ToolCall) -> BoxFut<'a, ToolOutput> {
+            self.seen.lock().unwrap().push(call);
+            Box::pin(async {
+                ToolOutput::Success {
+                    content: "ok".into(),
+                    truncated: false,
+                }
+            })
+        }
+    }
+
+    /// BeforeTool middleware that appends `tag` to `calls[0].input["trace"]` in
+    /// place, at the given priority.
+    struct TraceTagMw {
+        tag: String,
+        prio: i32,
+    }
+    impl crate::middleware::Middleware for TraceTagMw {
+        fn handle<'a>(
+            &'a self,
+            ctx: crate::middleware::HookContext<'a>,
+        ) -> BoxFut<'a, MiddlewareDecision> {
+            let tag = self.tag.clone();
+            Box::pin(async move {
+                if let crate::middleware::HookContext::BeforeTool { calls, .. } = ctx {
+                    if let Some(first) = calls.first_mut() {
+                        let obj = first.input.as_object_mut().expect("object input");
+                        let trace = obj
+                            .entry("trace")
+                            .or_insert_with(|| serde_json::json!([]));
+                        trace
+                            .as_array_mut()
+                            .expect("array")
+                            .push(serde_json::json!(tag));
+                        return MiddlewareDecision::ContinueWithModification;
+                    }
+                }
+                MiddlewareDecision::Continue
+            })
+        }
+        fn hooks(&self) -> Vec<HookPoint> {
+            vec![HookPoint::BeforeTool]
+        }
+        fn priority(&self) -> i32 {
+            self.prio
+        }
+        fn name(&self) -> &str {
+            // Distinct names so the chain accepts both registrations.
+            if self.prio <= 1 {
+                "trace_first"
+            } else {
+                "trace_second"
+            }
+        }
+    }
+
+    // SC-11: BeforeTool middleware mutates the dispatched calls IN PLACE, and the
+    // chain fans out in priority order (ascending for a before-hook). The lower
+    // priority runs first, so the dispatched call carries ["first","second"].
+    #[tokio::test]
+    async fn before_tool_middleware_mutates_calls_in_priority_order() {
+        let a = make_agent();
+        a.push(TurnResult::ToolCallRequested {
+            reasoning: None,
+            calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+            }],
+            usage: usage(),
+        });
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: "done".into(),
+            usage: usage(),
+        });
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut cfg = standard_config(a);
+        cfg.tool_registry = Arc::new(RecordingToolRegistry { seen: seen.clone() });
+        let chain = StandardMiddlewareChain::new();
+        // Register out of order to prove the chain sorts by priority, not insertion.
+        chain
+            .register(Box::new(TraceTagMw {
+                tag: "second".into(),
+                prio: 2,
+            }))
+            .unwrap();
+        chain
+            .register(Box::new(TraceTagMw {
+                tag: "first".into(),
+                prio: 1,
+            }))
+            .unwrap();
+        cfg.middleware = Some(Arc::new(chain));
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::Success { .. } => {}
+            other => panic!("expected Success, got {other:?}"),
+        }
+        let dispatched = seen.lock().unwrap();
+        assert_eq!(dispatched.len(), 1, "exactly one tool dispatched");
+        assert_eq!(
+            dispatched[0].input.get("trace"),
+            Some(&serde_json::json!(["first", "second"])),
+            "BeforeTool middleware must mutate the dispatched call in priority order"
+        );
+    }
+
+    /// BeforeCompletion middleware that forces ONE extra turn, then lets the run
+    /// complete.
+    struct ForceOnceMw {
+        fired: std::sync::atomic::AtomicBool,
+        inject: String,
+    }
+    impl crate::middleware::Middleware for ForceOnceMw {
+        fn handle<'a>(
+            &'a self,
+            ctx: crate::middleware::HookContext<'a>,
+        ) -> BoxFut<'a, MiddlewareDecision> {
+            let inject = self.inject.clone();
+            let first = !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if matches!(ctx, crate::middleware::HookContext::BeforeCompletion { .. }) && first {
+                    MiddlewareDecision::ForceAnotherTurn { inject }
+                } else {
+                    MiddlewareDecision::Continue
+                }
+            })
+        }
+        fn hooks(&self) -> Vec<HookPoint> {
+            vec![HookPoint::BeforeCompletion]
+        }
+        fn name(&self) -> &str {
+            "force_once"
+        }
+    }
+
+    // BeforeCompletion `ForceAnotherTurn`: the chain injects a follow-up and the
+    // loop runs another turn instead of completing — behaviour the former harness
+    // stub could not express. The injection lands as a user message and the run
+    // completes on the SECOND final response.
+    #[tokio::test]
+    async fn before_completion_force_another_turn_runs_extra_turn() {
+        let a = make_agent();
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: "first".into(),
+            usage: usage(),
+        });
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: "second".into(),
+            usage: usage(),
+        });
+        let mut cfg = standard_config(a);
+        cfg.context_manager = Arc::new(ReplaceRecordingCm);
+        let chain = StandardMiddlewareChain::new();
+        chain
+            .register(Box::new(ForceOnceMw {
+                fired: std::sync::atomic::AtomicBool::new(false),
+                inject: "keep going".into(),
+            }))
+            .unwrap();
+        cfg.middleware = Some(Arc::new(chain));
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::Success {
+                output,
+                turns,
+                session_state,
+                ..
+            } => {
+                assert_eq!(output, "second", "the forced second turn must win");
+                assert_eq!(turns, 2, "exactly one extra turn was forced");
+                let injected = session_state.messages.iter().any(|m| {
+                    matches!((&m.role, &m.content),
+                        (Role::User, Content::Text { text }) if text == "keep going")
+                });
+                assert!(injected, "the ForceAnotherTurn injection must be recorded");
+            }
+            other => panic!("expected Success, got {other:?}"),
         }
     }
 

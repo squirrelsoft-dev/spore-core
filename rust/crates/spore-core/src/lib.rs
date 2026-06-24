@@ -84,8 +84,8 @@ pub use harness::{
     ContextManager as HarnessContextManager, EmptyToolRegistry, EscalationAction, ExecutionContext,
     ExhaustionCause, FileRef, GitVcsProvider, HaltReason, Harness, HarnessBuilder, HarnessConfig,
     HarnessError, HarnessRunOptions, HarnessSignal, HillClimbingConfig, HillClimbingDirection,
-    HookPoint, HumanRequest, HumanResponse, IsolationMode, LoopStrategy, MiddlewareChain,
-    MiddlewareDecision, ModelConfig, NetworkPolicy, NodeAttr, NullSandbox, ObservabilityProvider,
+    HumanRequest, HumanResponse, IsolationMode, LoopStrategy,
+    ModelConfig, NetworkPolicy, NodeAttr, NullSandbox, ObservabilityProvider,
     Operation, PausedState, PlanExecuteConfig, RalphConfig, ReactConfig, ReadOnlySandbox,
     RiskLevel, RunResult, RunStrategy, SandboxProvider, SandboxViolation, SchemaRef,
     SelfVerifyingConfig, SessionId, SessionState, SpanStack, StandardHarness, StrategyOutcome,
@@ -108,9 +108,12 @@ pub use metric::{
     TestPassRateEvaluator,
 };
 pub use middleware::{
-    HookContext as MiddlewareHookContext, HookPoint as MiddlewareHookPoint,
-    LoopDetectionMiddleware, Middleware, MiddlewareChain as FullMiddlewareChain,
-    MiddlewareDecision as FullMiddlewareDecision, MiddlewareError, PatchToolCallsMiddleware,
+    // Issue #11 / Phase 3 (Q2): the rich middleware surface is now canonical —
+    // it is exported under the plain `MiddlewareChain` / `MiddlewareDecision` /
+    // `HookPoint` names (the former harness-local stubs were deleted). `HookContext`
+    // stays aliased to avoid colliding with the harness's own (#69) `HookContext`.
+    HookContext as MiddlewareHookContext, HookPoint, LoopDetectionMiddleware, Middleware,
+    MiddlewareChain, MiddlewareDecision, MiddlewareError, PatchToolCallsMiddleware,
     PreCompletionChecklistMiddleware, StandardMiddlewareChain, TokenBudgetMiddleware,
     TracingMiddleware,
 };
