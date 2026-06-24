@@ -60,6 +60,13 @@ export {
 } from "./control.js";
 export { StandardTools } from "./catalogue.js";
 export {
+  codingAgent,
+  hillClimber,
+  CODING_AGENT_SYSTEM_PROMPT,
+  PRESET_MAX_AUTO_GRANTS,
+  PRESET_STEPS_PER_GRANT,
+} from "./presets.js";
+export {
   GitCommitTool,
   GitDiffTool,
   GitLogTool,
