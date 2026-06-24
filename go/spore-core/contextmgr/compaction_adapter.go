@@ -172,18 +172,42 @@ func (a *StandardCompactionAdapter) Assemble(_ context.Context, session *sporeco
 	}
 }
 
+// renderToolResultText renders a tool result into the flat text the adapter
+// records as a RoleTool message. Shared by AppendToolResult (the normal path)
+// and ReplaceToolResult (the AfterTool middleware in-place rewrite, issue #158 /
+// SC-9) so the two stay byte-identical.
+func renderToolResultText(result *sporecore.HarnessToolResult) string {
+	switch result.Output.Kind {
+	case sporecore.ToolOutputSuccess:
+		return result.Output.Content
+	case sporecore.ToolOutputError:
+		return result.Output.Message
+	}
+	return ""
+}
+
 // AppendToolResult appends a tool message to the session, keeping the rich
 // state's message history in sync.
 func (a *StandardCompactionAdapter) AppendToolResult(_ context.Context, session *sporecore.SessionState, result *sporecore.HarnessToolResult) {
-	var text string
-	switch result.Output.Kind {
-	case sporecore.ToolOutputSuccess:
-		text = result.Output.Content
-	case sporecore.ToolOutputError:
-		text = result.Output.Message
-	}
+	text := renderToolResultText(result)
 	msg := sporecore.Message{Role: sporecore.RoleTool, Content: sporecore.NewTextContent(text)}
 	session.Messages = append(session.Messages, msg)
+	a.syncMessagesIntoRichState(session)
+}
+
+// ReplaceToolResult re-renders the already-appended RoleTool message at
+// messageIndex with a fresh rendering of result (issue #158 / SC-9). The harness
+// loop calls this from the AfterTool middleware hook when a middleware rewrote a
+// result in place, so the rewrite reaches the next model turn. An out-of-range
+// index is a defensive no-op (the loop only passes indices it recorded right
+// after AppendToolResult). The rich state's message history is kept in sync, the
+// same as the append path.
+func (a *StandardCompactionAdapter) ReplaceToolResult(_ context.Context, session *sporecore.SessionState, messageIndex int, result *sporecore.HarnessToolResult) {
+	if messageIndex < 0 || messageIndex >= len(session.Messages) {
+		return
+	}
+	text := renderToolResultText(result)
+	session.Messages[messageIndex] = sporecore.Message{Role: sporecore.RoleTool, Content: sporecore.NewTextContent(text)}
 	a.syncMessagesIntoRichState(session)
 }
 
@@ -371,4 +395,5 @@ var (
 	_ sporecore.ContextManager           = (*StandardCompactionAdapter)(nil)
 	_ sporecore.CompactingContextManager = (*StandardCompactionAdapter)(nil)
 	_ sporecore.AssistantMessageAppender = (*StandardCompactionAdapter)(nil)
+	_ sporecore.ToolResultReplacer       = (*StandardCompactionAdapter)(nil)
 )

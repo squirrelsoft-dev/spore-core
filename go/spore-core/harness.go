@@ -1156,14 +1156,46 @@ func (NetworkAllowlist) Kind() string { return "allowlist" }
 func (NetworkFull) Kind() string      { return "full" }
 
 // HookPoint indicates where in the lifecycle a middleware hook fired.
+//
+// Issue #158 / Phase 3 (Q2): the rich middleware surface in package middleware
+// is now canonical. HookPoint is the six-variant set it fans out over; the
+// former four-variant harness-local stub was widened to match. The middleware
+// package aliases its HookPoint to this type so *middleware.StandardMiddlewareChain
+// satisfies the MiddlewareChain interface below structurally.
 type HookPoint string
 
 const (
+	HookBeforeSession    HookPoint = "before_session"
 	HookBeforeTurn       HookPoint = "before_turn"
 	HookBeforeTool       HookPoint = "before_tool"
 	HookAfterTool        HookPoint = "after_tool"
 	HookBeforeCompletion HookPoint = "before_completion"
+	HookAfterSession     HookPoint = "after_session"
 )
+
+// IsBefore reports whether the hook is ordered ascending by priority.
+func (h HookPoint) IsBefore() bool {
+	switch h {
+	case HookBeforeSession, HookBeforeTurn, HookBeforeTool, HookBeforeCompletion:
+		return true
+	}
+	return false
+}
+
+// IsAfter reports whether the hook is ordered descending by priority.
+func (h HookPoint) IsAfter() bool {
+	return h == HookAfterTool || h == HookAfterSession
+}
+
+// AllowsSurfaceToHuman reports whether SurfaceToHuman is legal at this hook.
+func (h HookPoint) AllowsSurfaceToHuman() bool {
+	return h == HookBeforeTool || h == HookBeforeCompletion
+}
+
+// AllowsForceAnotherTurn reports whether ForceAnotherTurn is legal at this hook.
+func (h HookPoint) AllowsForceAnotherTurn() bool {
+	return h == HookBeforeCompletion
+}
 
 // TerminationDecisionKind discriminates TerminationDecision variants.
 type TerminationDecisionKind string
@@ -1356,6 +1388,80 @@ type AssistantMessageAppender interface {
 	AppendAssistantMessage(ctx context.Context, session *SessionState, message Message)
 }
 
+// ToolResultReplacer is the OPTIONAL seam (issue #158 / SC-9) a ContextManager
+// may also implement to re-render the tool-result message previously appended at
+// messageIndex with a fresh rendering of result. The harness loop calls this
+// from the AfterTool middleware hook when a middleware rewrote a result in place,
+// so the rewrite reaches the next model turn. messageIndex is the position in
+// session.Messages recorded right after the original AppendToolResult.
+//
+// The harness loop type-asserts its held ContextManager to this interface; a
+// manager that does NOT implement it simply skips the re-render (the rewrite
+// does not propagate, which is the pre-#158 behaviour) — Go's equivalent of the
+// Rust reference's default-no-op ContextManager::replace_tool_result trait
+// method. An out-of-range messageIndex must be a defensive no-op.
+type ToolResultReplacer interface {
+	ReplaceToolResult(ctx context.Context, session *SessionState, messageIndex int, result *HarnessToolResult)
+}
+
+// lastMessageIndex returns the index of the most-recently-appended message, or
+// -1 if the session has none. Mirrors the Rust reference's saturating_sub(1) at
+// the SC-9 index-recording sites (it is always called right after an append, so
+// the slice is non-empty in practice).
+func lastMessageIndex(session *SessionState) int {
+	return len(session.Messages) - 1
+}
+
+// harnessResultsToToolResults projects the harness-side []HarnessToolResult onto
+// the model-side []ToolResult the rich AfterTool middleware hook expects
+// (issue #158 / SC-9). A Success becomes a non-error result carrying its
+// content; an Error becomes an is_error result carrying its message; other
+// (non-terminal) outputs render as empty content. The Go middleware chain
+// operates on model.ToolResult (Content/IsError) rather than the harness's
+// discriminated HarnessToolResult, so this bridge is required (Rust has a single
+// ToolResult type and needs no conversion).
+func harnessResultsToToolResults(approved []HarnessToolResult) []ToolResult {
+	out := make([]ToolResult, len(approved))
+	for i, r := range approved {
+		tr := ToolResult{ToolUseID: r.CallID}
+		switch r.Output.Kind {
+		case ToolOutputSuccess:
+			tr.Content = r.Output.Content
+		case ToolOutputError:
+			tr.Content = r.Output.Message
+			tr.IsError = true
+		}
+		out[i] = tr
+	}
+	return out
+}
+
+// applyToolResultRewrites folds the (possibly middleware-rewritten) model-side
+// results back onto the harness-side approved slice in place (issue #158 / SC-9).
+// An is_error result becomes a recoverable ToolOutputError carrying the message;
+// otherwise a ToolOutputSuccess carrying the content. Indices align 1:1 (the
+// chain mutates the same slice it was handed); extra results are ignored.
+func applyToolResultRewrites(approved []HarnessToolResult, results []ToolResult) {
+	for i := range approved {
+		if i >= len(results) {
+			break
+		}
+		r := results[i]
+		if r.IsError {
+			approved[i].Output = ToolOutput{
+				Kind:        ToolOutputError,
+				Message:     r.Content,
+				Recoverable: true,
+			}
+		} else {
+			approved[i].Output = ToolOutput{
+				Kind:    ToolOutputSuccess,
+				Content: r.Content,
+			}
+		}
+	}
+}
+
 // TokenBudgetReader is the OPTIONAL seam (issue #57) a ContextManager may also
 // implement so the harness can stamp the real post-compaction token budget onto
 // the Compaction span. The loop type-asserts its held ContextManager to this
@@ -1391,26 +1497,145 @@ type TerminationPolicy interface {
 }
 
 // MiddlewareDecisionKind discriminates MiddlewareDecision variants.
+//
+// Issue #158: collapsed onto the rich (issue #11) five-kind shape. The dropped
+// stub field was Calls — BeforeTool now mutates the dispatched calls in place
+// (SC-11) rather than handing back a replacement slice. The middleware package
+// aliases its MiddlewareDecisionKind / MiddlewareDecision to these types.
 type MiddlewareDecisionKind string
 
 const (
 	MiddlewareContinue                 MiddlewareDecisionKind = "continue"
 	MiddlewareContinueWithModification MiddlewareDecisionKind = "continue_with_modification"
+	MiddlewareForceAnotherTurn         MiddlewareDecisionKind = "force_another_turn"
 	MiddlewareHalt                     MiddlewareDecisionKind = "halt"
 	MiddlewareSurfaceToHuman           MiddlewareDecisionKind = "surface_to_human"
 )
 
-// MiddlewareDecision is the output of MiddlewareChain.Fire.
+// MiddlewareDecision is the output of the rich MiddlewareChain fan-out (#11,
+// wired by #158). Per-variant fields (only the relevant one is populated):
+//   - force_another_turn: Inject (the concatenated injection text)
+//   - halt:               Reason
+//   - surface_to_human:   Request
 type MiddlewareDecision struct {
 	Kind    MiddlewareDecisionKind `json:"kind"`
-	Calls   []ToolCall             `json:"-"`
+	Inject  string                 `json:"-"`
 	Reason  string                 `json:"-"`
 	Request *HumanRequest          `json:"-"`
 }
 
-// MiddlewareChain (#11) fires lifecycle hooks. Stub surface.
+// MarshalJSON serialises as a flat tagged object matching the Rust shape.
+func (d MiddlewareDecision) MarshalJSON() ([]byte, error) {
+	switch d.Kind {
+	case MiddlewareContinue, MiddlewareContinueWithModification:
+		return json.Marshal(struct {
+			Kind MiddlewareDecisionKind `json:"kind"`
+		}{d.Kind})
+	case MiddlewareForceAnotherTurn:
+		return json.Marshal(struct {
+			Kind   MiddlewareDecisionKind `json:"kind"`
+			Inject string                 `json:"inject"`
+		}{d.Kind, d.Inject})
+	case MiddlewareHalt:
+		return json.Marshal(struct {
+			Kind   MiddlewareDecisionKind `json:"kind"`
+			Reason string                 `json:"reason"`
+		}{d.Kind, d.Reason})
+	case MiddlewareSurfaceToHuman:
+		return json.Marshal(struct {
+			Kind    MiddlewareDecisionKind `json:"kind"`
+			Request *HumanRequest          `json:"request"`
+		}{d.Kind, d.Request})
+	default:
+		return nil, fmt.Errorf("MiddlewareDecision: unknown kind %q", d.Kind)
+	}
+}
+
+// UnmarshalJSON decodes the flat tagged form.
+func (d *MiddlewareDecision) UnmarshalJSON(data []byte) error {
+	var probe struct {
+		Kind    MiddlewareDecisionKind `json:"kind"`
+		Inject  string                 `json:"inject"`
+		Reason  string                 `json:"reason"`
+		Request *HumanRequest          `json:"request"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	d.Kind = probe.Kind
+	d.Inject = probe.Inject
+	d.Reason = probe.Reason
+	d.Request = probe.Request
+	return nil
+}
+
+// MiddlewareChain (#11) is the canonical, priority-ordered, six-hook middleware
+// fan-out the ReAct loop wires directly (issue #158). The interface lives here
+// (consumer side, so the harness can name it) but the concrete implementation —
+// *middleware.StandardMiddlewareChain — lives in package middleware, which
+// imports this package; it satisfies this interface structurally (the same
+// pattern as CompactionVerifier / HarnessObserver). The harness loop fires only
+// BeforeTurn / BeforeTool / AfterTool / BeforeCompletion; BeforeSession /
+// AfterSession are part of the surface but not yet wired (deferred, matching
+// the Rust reference).
 type MiddlewareChain interface {
-	Fire(ctx context.Context, hook HookPoint, session *SessionState) MiddlewareDecision
+	Register(m Middleware) error
+	FireBeforeSession(ctx context.Context, task *Task, sid SessionID) (MiddlewareDecision, error)
+	FireBeforeTurn(ctx context.Context, session *SessionState, turn uint32) (MiddlewareDecision, error)
+	FireBeforeTool(ctx context.Context, calls *[]ToolCall, turn uint32) (MiddlewareDecision, error)
+	FireAfterTool(ctx context.Context, calls []ToolCall, results *[]ToolResult) (MiddlewareDecision, error)
+	FireBeforeCompletion(ctx context.Context, response string, turn uint32, state *SessionState) (MiddlewareDecision, error)
+	FireAfterSession(ctx context.Context, result *RunResult, sid SessionID) error
+}
+
+// MiddlewareHookContext is the per-firing payload handed to Middleware.Handle.
+//
+// Issue #158: moved here (from package middleware) so the harness-side
+// MiddlewareChain interface can name the Middleware contract without an import
+// cycle. The middleware package aliases HookContext to this type. It is a
+// tagged union — exactly one variant payload is meaningful per firing,
+// selected by Point. Mutable fields are passed by pointer where the spec allows
+// modification (BeforeTurn Session, BeforeTool Calls, AfterTool Results).
+type MiddlewareHookContext struct {
+	Point HookPoint
+
+	// BeforeSession
+	Task      *Task
+	SessionID *SessionID
+
+	// BeforeTurn
+	Session    *SessionState
+	TurnNumber uint32
+
+	// BeforeTool — Calls is mutable (in-place modification permitted).
+	Calls *[]ToolCall
+
+	// AfterTool — Results is mutable; CallsRO is a read-only snapshot.
+	CallsRO []ToolCall
+	Results *[]ToolResult
+
+	// BeforeCompletion
+	Response     string
+	SessionState *SessionState
+
+	// AfterSession
+	Result *RunResult
+}
+
+// Middleware is a single interceptor registrable on a MiddlewareChain.
+//
+// Issue #158: the interface lives here (consumer side) so the harness-side
+// MiddlewareChain.Register signature can name it without importing package
+// middleware (which would be a cycle — middleware imports this package). The
+// middleware package aliases Middleware / MiddlewareHookContext to these types,
+// so its concrete middleware and *StandardMiddlewareChain satisfy these
+// interfaces structurally. Register is unused by the loop (only the standard
+// chain constructor / tests register), but is part of the canonical surface.
+type Middleware interface {
+	Handle(ctx context.Context, hctx MiddlewareHookContext) (MiddlewareDecision, error)
+	Hooks() []HookPoint
+	Priority() int
+	Name() string
 }
 
 // HarnessObserver (#12) is the consumer-side observability seam the ReAct
@@ -4499,11 +4724,27 @@ func (h *StandardHarness) runReActInner(
 			}
 		}
 
-		// Middleware: BeforeTurn.
+		// Middleware: BeforeTurn (rich chain, issue #158). The chain may mutate
+		// `session` in place (priority-ordered fan-out); ContinueWithModification
+		// is the modified-but-proceed signal. A non-nil error is coerced to a
+		// defensive middleware_halt (the Rust/TS/Py chains have no error channel —
+		// this preserves parity).
 		if h.config.Middleware != nil {
-			d := h.config.Middleware.Fire(ctx, HookBeforeTurn, &session)
-			switch d.Kind {
-			case MiddlewareHalt:
+			d, err := h.config.Middleware.FireBeforeTurn(ctx, &session, budget.Turns)
+			switch {
+			case err != nil:
+				return RunResult{
+					Kind: RunFailure,
+					Reason: HaltReason{
+						Kind:   HaltMiddlewareHalt,
+						Hook:   HookBeforeTurn,
+						Reason: "middleware error: " + err.Error(),
+					},
+					SessionID: sessionID, Usage: usage, Turns: budget.Turns,
+				}
+			case d.Kind == MiddlewareContinue || d.Kind == MiddlewareContinueWithModification:
+				// proceed
+			case d.Kind == MiddlewareHalt:
 				return RunResult{
 					Kind: RunFailure,
 					Reason: HaltReason{
@@ -4513,7 +4754,7 @@ func (h *StandardHarness) runReActInner(
 					},
 					SessionID: sessionID, Usage: usage, Turns: budget.Turns,
 				}
-			case MiddlewareSurfaceToHuman:
+			case d.Kind == MiddlewareSurfaceToHuman:
 				req := HumanRequest{}
 				if d.Request != nil {
 					req = *d.Request
@@ -4527,6 +4768,19 @@ func (h *StandardHarness) runReActInner(
 					Toolset: toolset,
 				}
 				return RunResult{Kind: RunWaitingForHuman, State: state, Request: &req}
+			default:
+				// ForceAnotherTurn is valid only at BeforeCompletion; the standard
+				// chain converts it to Halt here. Handle any out-of-place decision
+				// defensively as a middleware_halt.
+				return RunResult{
+					Kind: RunFailure,
+					Reason: HaltReason{
+						Kind:   HaltMiddlewareHalt,
+						Hook:   HookBeforeTurn,
+						Reason: "illegal BeforeTurn decision: " + string(d.Kind),
+					},
+					SessionID: sessionID, Usage: usage, Turns: budget.Turns,
+				}
 			}
 		}
 
@@ -4654,9 +4908,33 @@ func (h *StandardHarness) runReActInner(
 			}
 
 			if h.config.Middleware != nil {
-				d := h.config.Middleware.Fire(ctx, HookBeforeCompletion, &session)
-				switch d.Kind {
-				case MiddlewareHalt:
+				d, err := h.config.Middleware.FireBeforeCompletion(ctx, result.Content, budget.Turns, &session)
+				switch {
+				case err != nil:
+					return RunResult{
+						Kind: RunFailure,
+						Reason: HaltReason{
+							Kind:   HaltMiddlewareHalt,
+							Hook:   HookBeforeCompletion,
+							Reason: "middleware error: " + err.Error(),
+						},
+						SessionID: sessionID, Usage: usage, Turns: budget.Turns,
+					}
+				case d.Kind == MiddlewareContinue || d.Kind == MiddlewareContinueWithModification:
+					// proceed to completion
+				case d.Kind == MiddlewareForceAnotherTurn:
+					// The chain concatenates every middleware's injection into one
+					// ForceAnotherTurn (issue #11 / #158). Record the model's final
+					// text, then the injection as a user message, and force another
+					// turn instead of completing — the same channel the Stop-block
+					// breaker uses, so the conversation stays well-formed (assistant
+					// final text → user injection).
+					if a, ok := h.config.ContextManager.(AssistantMessageAppender); ok {
+						a.AppendAssistantMessage(ctx, &session, Message{Role: RoleAssistant, Content: NewTextContent(result.Content)})
+					}
+					h.config.ContextManager.AppendUserMessage(ctx, &session, d.Inject)
+					continue
+				case d.Kind == MiddlewareHalt:
 					return RunResult{
 						Kind: RunFailure,
 						Reason: HaltReason{
@@ -4666,7 +4944,7 @@ func (h *StandardHarness) runReActInner(
 						},
 						SessionID: sessionID, Usage: usage, Turns: budget.Turns,
 					}
-				case MiddlewareSurfaceToHuman:
+				case d.Kind == MiddlewareSurfaceToHuman:
 					req := HumanRequest{}
 					if d.Request != nil {
 						req = *d.Request
@@ -4680,6 +4958,16 @@ func (h *StandardHarness) runReActInner(
 						Toolset: toolset,
 					}
 					return RunResult{Kind: RunWaitingForHuman, State: state, Request: &req}
+				default:
+					return RunResult{
+						Kind: RunFailure,
+						Reason: HaltReason{
+							Kind:   HaltMiddlewareHalt,
+							Hook:   HookBeforeCompletion,
+							Reason: "illegal BeforeCompletion decision: " + string(d.Kind),
+						},
+						SessionID: sessionID, Usage: usage, Turns: budget.Turns,
+					}
 				}
 			}
 
@@ -4808,13 +5096,29 @@ func (h *StandardHarness) runReActInner(
 				}
 			}
 
-			// Middleware: BeforeTool.
+			// Middleware: BeforeTool (rich chain, issue #158 / SC-11). The chain
+			// mutates the dispatched `calls` IN PLACE via a priority-ordered
+			// fan-out; ContinueWithModification is the modified-but-proceed signal.
+			// We pass a fresh copy of the calls so the assistant turn recorded just
+			// above (which value-copied each call) keeps the model's ORIGINAL
+			// request — only what is dispatched changes.
 			if h.config.Middleware != nil {
-				d := h.config.Middleware.Fire(ctx, HookBeforeTool, &session)
-				switch d.Kind {
-				case MiddlewareContinueWithModification:
-					calls = d.Calls
-				case MiddlewareHalt:
+				calls = append([]ToolCall(nil), calls...)
+				d, err := h.config.Middleware.FireBeforeTool(ctx, &calls, budget.Turns)
+				switch {
+				case err != nil:
+					return RunResult{
+						Kind: RunFailure,
+						Reason: HaltReason{
+							Kind:   HaltMiddlewareHalt,
+							Hook:   HookBeforeTool,
+							Reason: "middleware error: " + err.Error(),
+						},
+						SessionID: sessionID, Usage: usage, Turns: budget.Turns,
+					}
+				case d.Kind == MiddlewareContinue || d.Kind == MiddlewareContinueWithModification:
+					// `calls` was mutated in place by the chain; dispatch it as-is.
+				case d.Kind == MiddlewareHalt:
 					return RunResult{
 						Kind: RunFailure,
 						Reason: HaltReason{
@@ -4824,7 +5128,7 @@ func (h *StandardHarness) runReActInner(
 						},
 						SessionID: sessionID, Usage: usage, Turns: budget.Turns,
 					}
-				case MiddlewareSurfaceToHuman:
+				case d.Kind == MiddlewareSurfaceToHuman:
 					req := HumanRequest{}
 					if d.Request != nil {
 						req = *d.Request
@@ -4838,10 +5142,29 @@ func (h *StandardHarness) runReActInner(
 						Toolset: toolset,
 					}
 					return RunResult{Kind: RunWaitingForHuman, State: state, Request: &req}
+				default:
+					// ForceAnotherTurn is valid only at BeforeCompletion; the
+					// standard chain converts it to Halt here. Handle any
+					// out-of-place decision defensively as a middleware_halt.
+					return RunResult{
+						Kind: RunFailure,
+						Reason: HaltReason{
+							Kind:   HaltMiddlewareHalt,
+							Hook:   HookBeforeTool,
+							Reason: "illegal BeforeTool decision: " + string(d.Kind),
+						},
+						SessionID: sessionID, Usage: usage, Turns: budget.Turns,
+					}
 				}
 			}
 
 			var approved []HarnessToolResult
+			// SC-9: the session.Messages index of each appended tool result,
+			// recorded 1:1 with `approved`. The AfterTool middleware hook uses
+			// these to re-render any result it rewrites in place (via the optional
+			// ToolResultReplacer seam). Captured at append time, so the indices
+			// survive the #137 corrective-message interleaving.
+			var resultMsgIndices []int
 			toolPause := false
 			for i, call := range calls {
 				// Sandbox validation.
@@ -4871,6 +5194,7 @@ func (h *StandardHarness) runReActInner(
 						ResultContent: "sandbox: " + v.Error(),
 					})
 					h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
+					resultMsgIndices = append(resultMsgIndices, lastMessageIndex(&session))
 					approved = append(approved, tr)
 					continue
 				}
@@ -5181,6 +5505,7 @@ func (h *StandardHarness) runReActInner(
 					ResultContent: streamResultContent,
 				})
 				h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
+				resultMsgIndices = append(resultMsgIndices, lastMessageIndex(&session))
 				approved = append(approved, tr)
 
 				// #137 (AC2): inject the N-threshold corrective USER message AFTER
@@ -5192,16 +5517,64 @@ func (h *StandardHarness) runReActInner(
 				}
 			}
 
-			// Middleware: AfterTool.
+			// Middleware: AfterTool (rich chain, issue #158 / SC-9). The chain
+			// receives the batch's results as a mutable model-side []ToolResult and
+			// may rewrite any of them in place (priority-ordered, descending). On
+			// ContinueWithModification, map the rewrites back onto the harness-side
+			// `approved` results AND re-render the affected tool-result messages (via
+			// the optional ToolResultReplacer seam) so the rewrite reaches the next
+			// model turn — this is what lets an after-tool middleware turn a landed
+			// write into a model-visible error (or vice versa) without the tool
+			// itself having to invert its output.
 			if h.config.Middleware != nil {
-				d := h.config.Middleware.Fire(ctx, HookAfterTool, &session)
-				if d.Kind == MiddlewareHalt {
+				results := harnessResultsToToolResults(approved)
+				d, err := h.config.Middleware.FireAfterTool(ctx, calls, &results)
+				switch {
+				case err != nil:
+					return RunResult{
+						Kind: RunFailure,
+						Reason: HaltReason{
+							Kind:   HaltMiddlewareHalt,
+							Hook:   HookAfterTool,
+							Reason: "middleware error: " + err.Error(),
+						},
+						SessionID: sessionID, Usage: usage, Turns: budget.Turns,
+					}
+				case d.Kind == MiddlewareContinue:
+					// proceed
+				case d.Kind == MiddlewareContinueWithModification:
+					// Fold the (possibly rewritten) model-side results back into the
+					// harness-side `approved`, then re-render the recorded session
+					// messages 1:1 by the indices captured at append time.
+					applyToolResultRewrites(approved, results)
+					if replacer, ok := h.config.ContextManager.(ToolResultReplacer); ok {
+						for i := range approved {
+							if i >= len(resultMsgIndices) {
+								break
+							}
+							replacer.ReplaceToolResult(ctx, &session, resultMsgIndices[i], &approved[i])
+						}
+					}
+				case d.Kind == MiddlewareHalt:
 					return RunResult{
 						Kind: RunFailure,
 						Reason: HaltReason{
 							Kind:   HaltMiddlewareHalt,
 							Hook:   HookAfterTool,
 							Reason: d.Reason,
+						},
+						SessionID: sessionID, Usage: usage, Turns: budget.Turns,
+					}
+				default:
+					// SurfaceToHuman / ForceAnotherTurn are not valid at AfterTool;
+					// the standard chain converts them to Halt. Handle any
+					// out-of-place decision defensively as a middleware_halt.
+					return RunResult{
+						Kind: RunFailure,
+						Reason: HaltReason{
+							Kind:   HaltMiddlewareHalt,
+							Hook:   HookAfterTool,
+							Reason: "illegal AfterTool decision: " + string(d.Kind),
 						},
 						SessionID: sessionID, Usage: usage, Turns: budget.Turns,
 					}
@@ -6037,20 +6410,59 @@ func (s *ScriptedMiddleware) Push(h HookPoint, d MiddlewareDecision) *ScriptedMi
 	return s
 }
 
-// Fire returns the queued decision for hook, or Continue.
-func (s *ScriptedMiddleware) Fire(_ context.Context, hook HookPoint, _ *SessionState) MiddlewareDecision {
+// next pops and returns the scripted decision for hook if it is at the front of
+// the queue, else Continue. Decisions are returned RAW (no validateDecision), so
+// a test can exercise the harness's defensive handling of an out-of-place
+// decision — unlike the StandardMiddlewareChain.
+func (s *ScriptedMiddleware) next(hook HookPoint) MiddlewareDecision {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.decisions) == 0 {
-		return MiddlewareDecision{Kind: MiddlewareContinue}
-	}
-	if s.decisions[0].hook != hook {
+	if len(s.decisions) == 0 || s.decisions[0].hook != hook {
 		return MiddlewareDecision{Kind: MiddlewareContinue}
 	}
 	d := s.decisions[0].d
 	s.decisions = s.decisions[1:]
 	return d
 }
+
+// Register is a no-op — the double scripts decisions directly.
+func (s *ScriptedMiddleware) Register(_ Middleware) error { return nil }
+
+// FireBeforeSession implements MiddlewareChain.
+func (s *ScriptedMiddleware) FireBeforeSession(_ context.Context, _ *Task, _ SessionID) (MiddlewareDecision, error) {
+	return s.next(HookBeforeSession), nil
+}
+
+// FireBeforeTurn implements MiddlewareChain.
+func (s *ScriptedMiddleware) FireBeforeTurn(_ context.Context, _ *SessionState, _ uint32) (MiddlewareDecision, error) {
+	return s.next(HookBeforeTurn), nil
+}
+
+// FireBeforeTool implements MiddlewareChain.
+func (s *ScriptedMiddleware) FireBeforeTool(_ context.Context, _ *[]ToolCall, _ uint32) (MiddlewareDecision, error) {
+	return s.next(HookBeforeTool), nil
+}
+
+// FireAfterTool implements MiddlewareChain.
+func (s *ScriptedMiddleware) FireAfterTool(_ context.Context, _ []ToolCall, _ *[]ToolResult) (MiddlewareDecision, error) {
+	return s.next(HookAfterTool), nil
+}
+
+// FireBeforeCompletion implements MiddlewareChain.
+func (s *ScriptedMiddleware) FireBeforeCompletion(_ context.Context, _ string, _ uint32, _ *SessionState) (MiddlewareDecision, error) {
+	return s.next(HookBeforeCompletion), nil
+}
+
+// FireAfterSession implements MiddlewareChain.
+//
+// After hooks ignore the decision; drain a scripted AfterSession entry.
+func (s *ScriptedMiddleware) FireAfterSession(_ context.Context, _ *RunResult, _ SessionID) error {
+	_ = s.next(HookAfterSession)
+	return nil
+}
+
+// Compile-time interface check.
+var _ MiddlewareChain = (*ScriptedMiddleware)(nil)
 
 // MockAgent is a test Agent that yields queued TurnResults.
 type MockAgent struct {

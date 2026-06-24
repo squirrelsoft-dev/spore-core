@@ -55,119 +55,79 @@ import (
 // ============================================================================
 
 // HookPoint identifies one of the six hook points in the agent loop.
-type HookPoint string
+//
+// Issue #158: the canonical HookPoint now lives in package sporecore (so the
+// harness-side MiddlewareChain interface can name the rich types without an
+// import cycle). This is an alias — middleware.HookPoint and
+// sporecore.HookPoint are the same type, so *StandardMiddlewareChain satisfies
+// sporecore.MiddlewareChain structurally.
+type HookPoint = sporecore.HookPoint
 
 const (
 	// HookBeforeSession fires once at the start of a session.
-	HookBeforeSession HookPoint = "before_session"
+	HookBeforeSession = sporecore.HookBeforeSession
 	// HookBeforeTurn fires before each agent turn.
-	HookBeforeTurn HookPoint = "before_turn"
+	HookBeforeTurn = sporecore.HookBeforeTurn
 	// HookBeforeTool fires before tool calls dispatch.
-	HookBeforeTool HookPoint = "before_tool"
+	HookBeforeTool = sporecore.HookBeforeTool
 	// HookAfterTool fires after tool calls return.
-	HookAfterTool HookPoint = "after_tool"
+	HookAfterTool = sporecore.HookAfterTool
 	// HookBeforeCompletion fires before the agent emits a final response.
-	HookBeforeCompletion HookPoint = "before_completion"
+	HookBeforeCompletion = sporecore.HookBeforeCompletion
 	// HookAfterSession fires once at the end of a session.
-	HookAfterSession HookPoint = "after_session"
+	HookAfterSession = sporecore.HookAfterSession
 )
-
-// IsBefore reports whether the hook is ordered ascending by priority.
-func (h HookPoint) IsBefore() bool {
-	switch h {
-	case HookBeforeSession, HookBeforeTurn, HookBeforeTool, HookBeforeCompletion:
-		return true
-	}
-	return false
-}
-
-// IsAfter reports whether the hook is ordered descending by priority.
-func (h HookPoint) IsAfter() bool {
-	return h == HookAfterTool || h == HookAfterSession
-}
-
-// AllowsSurfaceToHuman reports whether SurfaceToHuman is legal at this hook.
-func (h HookPoint) AllowsSurfaceToHuman() bool {
-	return h == HookBeforeTool || h == HookBeforeCompletion
-}
-
-// AllowsForceAnotherTurn reports whether ForceAnotherTurn is legal at this hook.
-func (h HookPoint) AllowsForceAnotherTurn() bool {
-	return h == HookBeforeCompletion
-}
 
 // ============================================================================
 // HookContext (tagged union — exactly one variant payload is meaningful per
-// firing; see Point()).
+// firing; see Point).
 // ============================================================================
 
 // HookContext is the per-firing payload handed to Middleware.Handle.
 //
+// Issue #158: the canonical type lives in package sporecore (so the harness-side
+// MiddlewareChain interface can name the Middleware contract without an import
+// cycle). This is an alias; the field set is unchanged.
+//
 // Mutable fields are passed by pointer where the spec allows modification
-// (BeforeTurn session, BeforeTool calls, AfterTool results). The harness uses
-// MiddlewareDecisionContinueWithModification as the observability signal that
-// a mutation occurred.
-type HookContext struct {
-	Point HookPoint
-
-	// BeforeSession
-	Task      *sporecore.Task
-	SessionID *sporecore.SessionID
-
-	// BeforeTurn
-	Session    *sporecore.SessionState
-	TurnNumber uint32
-
-	// BeforeTool — Calls is mutable (in-place modification permitted).
-	Calls *[]sporecore.ToolCall
-
-	// AfterTool — Results is mutable; Calls is read-only snapshot.
-	CallsRO []sporecore.ToolCall
-	Results *[]sporecore.ToolResult
-
-	// BeforeCompletion
-	Response     string
-	SessionState *sporecore.SessionState
-
-	// AfterSession
-	Result *sporecore.RunResult
-}
+// (BeforeTurn Session, BeforeTool Calls, AfterTool Results). The harness uses
+// DecisionContinueWithModification as the observability signal that a mutation
+// occurred.
+type HookContext = sporecore.MiddlewareHookContext
 
 // ============================================================================
 // MiddlewareDecision
 // ============================================================================
 
 // MiddlewareDecisionKind discriminates MiddlewareDecision variants.
-type MiddlewareDecisionKind string
+//
+// Issue #158: the canonical type + the five kind constants live in package
+// sporecore; these are aliases so existing middleware code and tests keep
+// resolving middleware.DecisionContinue etc.
+type MiddlewareDecisionKind = sporecore.MiddlewareDecisionKind
 
 const (
 	// DecisionContinue — proceed with no observable change.
-	DecisionContinue MiddlewareDecisionKind = "continue"
+	DecisionContinue = sporecore.MiddlewareContinue
 	// DecisionContinueWithModification — proceed; this middleware mutated
 	// the borrowed context. Semantically equivalent to Continue for chain
 	// control flow.
-	DecisionContinueWithModification MiddlewareDecisionKind = "continue_with_modification"
+	DecisionContinueWithModification = sporecore.MiddlewareContinueWithModification
 	// DecisionForceAnotherTurn — valid only on BeforeCompletion. The chain
 	// concatenates injections from every middleware that returned this and
 	// surfaces one combined decision.
-	DecisionForceAnotherTurn MiddlewareDecisionKind = "force_another_turn"
+	DecisionForceAnotherTurn = sporecore.MiddlewareForceAnotherTurn
 	// DecisionHalt — stop the loop with reason.
-	DecisionHalt MiddlewareDecisionKind = "halt"
+	DecisionHalt = sporecore.MiddlewareHalt
 	// DecisionSurfaceToHuman — valid only on BeforeTool / BeforeCompletion.
 	// First occurrence wins; remaining middleware do not run.
-	DecisionSurfaceToHuman MiddlewareDecisionKind = "surface_to_human"
+	DecisionSurfaceToHuman = sporecore.MiddlewareSurfaceToHuman
 )
 
 // MiddlewareDecision is the tagged-union return value from Middleware.Handle.
-type MiddlewareDecision struct {
-	Kind MiddlewareDecisionKind `json:"kind"`
-	// force_another_turn
-	Inject string `json:"-"`
-	// halt
-	Reason string `json:"-"`
-	// surface_to_human
-	Request *sporecore.HumanRequest `json:"-"`
-}
+//
+// Issue #158: an alias for sporecore.MiddlewareDecision.
+type MiddlewareDecision = sporecore.MiddlewareDecision
 
 // DecisionContinueVal is the canonical Continue decision.
 func DecisionContinueVal() MiddlewareDecision {
@@ -195,50 +155,9 @@ func DecisionSurfaceToHumanVal(req sporecore.HumanRequest) MiddlewareDecision {
 	return MiddlewareDecision{Kind: DecisionSurfaceToHuman, Request: &req}
 }
 
-// MarshalJSON serialises as a flat tagged object matching the Rust shape.
-func (d MiddlewareDecision) MarshalJSON() ([]byte, error) {
-	switch d.Kind {
-	case DecisionContinue, DecisionContinueWithModification:
-		return json.Marshal(struct {
-			Kind MiddlewareDecisionKind `json:"kind"`
-		}{d.Kind})
-	case DecisionForceAnotherTurn:
-		return json.Marshal(struct {
-			Kind   MiddlewareDecisionKind `json:"kind"`
-			Inject string                 `json:"inject"`
-		}{d.Kind, d.Inject})
-	case DecisionHalt:
-		return json.Marshal(struct {
-			Kind   MiddlewareDecisionKind `json:"kind"`
-			Reason string                 `json:"reason"`
-		}{d.Kind, d.Reason})
-	case DecisionSurfaceToHuman:
-		return json.Marshal(struct {
-			Kind    MiddlewareDecisionKind  `json:"kind"`
-			Request *sporecore.HumanRequest `json:"request"`
-		}{d.Kind, d.Request})
-	default:
-		return nil, fmt.Errorf("MiddlewareDecision: unknown kind %q", d.Kind)
-	}
-}
-
-// UnmarshalJSON decodes the flat tagged form.
-func (d *MiddlewareDecision) UnmarshalJSON(data []byte) error {
-	var probe struct {
-		Kind    MiddlewareDecisionKind  `json:"kind"`
-		Inject  string                  `json:"inject"`
-		Reason  string                  `json:"reason"`
-		Request *sporecore.HumanRequest `json:"request"`
-	}
-	if err := json.Unmarshal(data, &probe); err != nil {
-		return err
-	}
-	d.Kind = probe.Kind
-	d.Inject = probe.Inject
-	d.Reason = probe.Reason
-	d.Request = probe.Request
-	return nil
-}
+// MarshalJSON / UnmarshalJSON for MiddlewareDecision now live on
+// sporecore.MiddlewareDecision (issue #158 collapsed the type there); the flat
+// tagged-object shape is unchanged.
 
 // ============================================================================
 // Errors
@@ -286,38 +205,20 @@ func (e *MiddlewareError) Error() string {
 
 // Middleware is a single interceptor registered with a MiddlewareChain.
 //
-// Implementations MUST be safe to call concurrently. They MUST NOT call
-// ModelInterface or ToolRegistry (design constraint — neither is in scope of
-// any HookContext). They MUST NOT hold per-session state on the receiver
-// keyed by SessionID — keep it in an external map and clear in
+// Issue #158: the interface lives in package sporecore so the harness-side
+// MiddlewareChain.Register signature can name it without an import cycle; this
+// is an alias. The contract is unchanged: implementations MUST be safe to call
+// concurrently, MUST NOT call ModelInterface or ToolRegistry (neither is in
+// scope of any HookContext), and MUST NOT hold per-session state on the
+// receiver keyed by SessionID — keep it in an external map and clear in
 // AfterSession.
-type Middleware interface {
-	// Handle inspects (and optionally mutates) the hot-path data in ctx,
-	// returning a decision.
-	Handle(ctx context.Context, hctx HookContext) (MiddlewareDecision, error)
-	// Hooks declares which HookPoints this middleware fires at. Must be
-	// non-empty.
-	Hooks() []HookPoint
-	// Priority controls ordering. Default 0. Lower runs first on before
-	// hooks; higher runs first on after hooks.
-	Priority() int
-	// Name is the unique registration identity.
-	Name() string
-}
+type Middleware = sporecore.Middleware
 
 // MiddlewareChain is the registry plus fan-out evaluator.
-type MiddlewareChain interface {
-	// Register validates and inserts a middleware. Duplicate names return
-	// AlreadyRegistered; empty Hooks() list returns NoHooks.
-	Register(m Middleware) error
-
-	FireBeforeSession(ctx context.Context, task *sporecore.Task, sid sporecore.SessionID) (MiddlewareDecision, error)
-	FireBeforeTurn(ctx context.Context, session *sporecore.SessionState, turn uint32) (MiddlewareDecision, error)
-	FireBeforeTool(ctx context.Context, calls *[]sporecore.ToolCall, turn uint32) (MiddlewareDecision, error)
-	FireAfterTool(ctx context.Context, calls []sporecore.ToolCall, results *[]sporecore.ToolResult) (MiddlewareDecision, error)
-	FireBeforeCompletion(ctx context.Context, response string, turn uint32, state *sporecore.SessionState) (MiddlewareDecision, error)
-	FireAfterSession(ctx context.Context, result *sporecore.RunResult, sid sporecore.SessionID) error
-}
+//
+// Issue #158: aliased to sporecore.MiddlewareChain (the canonical surface the
+// harness loop is wired to). *StandardMiddlewareChain satisfies it.
+type MiddlewareChain = sporecore.MiddlewareChain
 
 // ============================================================================
 // StandardMiddlewareChain

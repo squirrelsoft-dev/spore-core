@@ -250,6 +250,48 @@ func TestAppendKeepsRichStateInSync(t *testing.T) {
 }
 
 // ============================================================================
+// ReplaceToolResult (issue #158 / SC-9 in-place AfterTool rewrite)
+// ============================================================================
+
+func TestReplaceToolResultRerendersTheRecordedMessage(t *testing.T) {
+	a := contextmgr.NewStandardCompactionAdapter(richManager(t))
+	var s sporecore.SessionState
+
+	original := &sporecore.HarnessToolResult{
+		CallID: "c1",
+		Output: sporecore.ToolOutput{Kind: sporecore.ToolOutputSuccess, Content: "ORIGINAL"},
+	}
+	a.AppendToolResult(context.Background(), &s, original)
+	idx := len(s.Messages) - 1
+	if s.Messages[idx].Content.Text != "ORIGINAL" {
+		t.Fatalf("appended text = %q, want ORIGINAL", s.Messages[idx].Content.Text)
+	}
+
+	// A middleware rewrote the result; re-render the recorded message.
+	rewritten := &sporecore.HarnessToolResult{
+		CallID: "c1",
+		Output: sporecore.ToolOutput{Kind: sporecore.ToolOutputError, Message: "REWRITTEN", Recoverable: true},
+	}
+	a.ReplaceToolResult(context.Background(), &s, idx, rewritten)
+	if len(s.Messages) != 1 {
+		t.Fatalf("no message added on replace: len = %d, want 1", len(s.Messages))
+	}
+	if s.Messages[idx].Role != sporecore.RoleTool || s.Messages[idx].Content.Text != "REWRITTEN" {
+		t.Fatalf("replaced message = (%q, %q), want (tool, REWRITTEN)",
+			s.Messages[idx].Role, s.Messages[idx].Content.Text)
+	}
+
+	// Out-of-range index is a defensive no-op.
+	a.ReplaceToolResult(context.Background(), &s, 99, original)
+	if len(s.Messages) != 1 {
+		t.Fatalf("out-of-range replace must be a no-op: len = %d, want 1", len(s.Messages))
+	}
+	if s.Messages[idx].Content.Text != "REWRITTEN" {
+		t.Fatalf("out-of-range replace must not touch existing messages, got %q", s.Messages[idx].Content.Text)
+	}
+}
+
+// ============================================================================
 // End-to-end through the real harness compaction seam (mock model)
 // ============================================================================
 
