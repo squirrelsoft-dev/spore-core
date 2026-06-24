@@ -540,17 +540,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let observability: Arc<dyn ObservabilityProvider> = Arc::new(ReportingObservability::new());
 
-    // Build harness: conversational preset, workspace sandbox, the minimal file
-    // tool set (write_file + read_file), shared system prompt, the metric
-    // evaluator (required for HillClimbing), and the observability sink.
+    // Build the harness via the `hill_climber` PRESET (SC-8). The preset folds in
+    // the metric evaluator (HillClimbing requires one) AND
+    // `EscalationMode::AutoContinue` — so a build agent that spends its
+    // per-iteration step budget keeps working IN-PROCESS instead of pausing the
+    // climb for a human (no consumer drive loop; SC-5). The preset deliberately
+    // leaves the workspace-specific bits to us, because hill-climbing workspaces
+    // vary: this climb refines a file on disk, so we add a read-write sandbox, the
+    // minimal file tool set (write_file + read_file), the build system prompt, the
+    // propose-schema registry, and the observability sink that prints each
+    // keep/revert decision.
     let sandbox = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(workspace_root.clone()))?;
-    let harness = HarnessBuilder::conversational(build_model)
+    let harness = HarnessBuilder::hill_climber(build_model, evaluator)
         .sandbox(Arc::new(sandbox))
         .registry(build_registry())
         .tool(StandardTools::write_file())
         .tool(StandardTools::read_file())
         .system_prompt(SYSTEM_PROMPT)
-        .metric_evaluator(evaluator)
         .observability(observability)
         .build();
 

@@ -3,10 +3,12 @@
 A super-basic **plan→execute coding agent** in a REPL. It started as
 [`04-filesystem-agent`](../04-filesystem-agent/README.md) and grows it three ways:
 
-1. the workspace sandbox is **read-write**, rooted at the directory you launch
-   from (override with `--workspace`), and the agent gets the full
-   `StandardTools::coding_set()` (read / write / edit / list / grep / find +
-   `bash`), so it can actually change code in your project;
+1. it is built from the **`HarnessBuilder::coding_agent`** preset, which in one
+   call wires the things a coding agent always needs: a **read-write** workspace
+   sandbox rooted at the directory you launch from (override with `--workspace`),
+   the full `StandardTools::coding_set()` (read / write / edit / list / grep /
+   find + `bash`), a built-in coding system prompt, and `EscalationMode::AutoContinue`
+   — so it can change code, and a spent step budget keeps working in-process;
 2. the single `harness.run(...)` is wrapped in a **REPL** — build the harness
    once, then read a task per line, carrying the conversation forward across
    turns; and
@@ -14,26 +16,31 @@ A super-basic **plan→execute coding agent** in a REPL. It started as
    a plan phase turns your prompt into a task list, then an execute phase works
    that list to completion.
 
-Same `conversational(model)` builder and the same stream-printed `think` / `act`
-/ `obs` trace — the strategy is what changed.
+The preset builds on the same `conversational(model)` core and the same
+stream-printed `think` / `act` / `obs` trace — the strategy and the autonomous
+escalation are what changed. The example then layers its own extras (skills, a
+richer prompt, the plan-announcer hook) on top of the preset.
 
 ## The contrast with 04
 
 |            | 04 — filesystem-agent                       | 12 — coding agent                                 |
 | ---------- | ------------------------------------------- | ------------------------------------------------- |
-| Builder    | `conversational(model)`                     | `conversational(model)` *(same)*                  |
+| Builder    | `conversational(model)`                     | **`coding_agent(model, workspace)`** (preset)      |
 | Loop       | `ReAct`                                      | **`PlanExecute`** (plan → execute, ReAct per task) |
-| Tools      | `coding_set()`                               | `coding_set()` *(same)*                           |
-| Sandbox    | `WorkspaceScopedSandbox` (read-only effect) | `WorkspaceScopedSandbox` over the launch dir (read-write) |
+| Tools      | `coding_set()` *(wired by hand)*             | `coding_set()` *(wired by the preset)*            |
+| Sandbox    | `WorkspaceScopedSandbox` (read-only effect) | `WorkspaceScopedSandbox` over the launch dir (read-write, by the preset) |
+| Budget     | escalates / surfaces                         | **`AutoContinue`** — grants in-process, no drive loop |
 | Driver     | one `harness.run(...)`                       | a REPL: harness built once, conversation threaded |
 
 ```rust
-let harness = HarnessBuilder::conversational(model)
-    .sandbox(Arc::new(sandbox))                 // read-WRITE workspace
-    .tools(StandardTools::coding_set())         // read/write/edit/list/grep/find/bash
-    .system_prompt(SYSTEM_PROMPT)
-    .registry_schema("plan", json!({}))         // plan slot's output schema (resolved, not enforced)
+// One call wires the coding-agent essentials — a read-WRITE workspace sandbox,
+// coding_set() tools, a built-in coding system prompt, and AutoContinue (so a
+// spent step budget keeps working in-process instead of pausing). SC-8.
+let harness = HarnessBuilder::coding_agent(model, &workspace_root)?
+    .system_prompt(SYSTEM_PROMPT)               // richer: adds skills + the plan-JSON exception
     .hooks(plan_announcer())                     // print the plan on OnPlanCreated
+    // (this example also layers skills — a load_skill tool + a manifest-injecting
+    //  context manager — see "Skills" below)
     .build();
 
 let session_id = SessionId::generate();         // one conversation for the REPL
@@ -41,11 +48,16 @@ let mut history: Option<SessionState> = None;
 
 while let Some(prompt) = read_prompt() {        // ← the REPL
     let task = Task::new(prompt, session_id.clone(), plan_execute_strategy());
-    let mut opts = HarnessRunOptions::new(task).with_stream(...);
-    if let Some(state) = history.take() {       // carry prior turns forward
-        opts = opts.with_session_state(state);
+    let mut opts = HarnessRunOptions::new(task);
+    opts.on_stream = Some(sink.clone());
+    if let Some(state) = &history {             // carry prior turns forward
+        opts = opts.with_session_state(state.clone());
     }
-    if let RunResult::Success { session_state, .. } = harness.run(opts).await {
+    // One run carries the whole turn: AutoContinue grants more budget in-process,
+    // so there is no consumer-side drive/resume loop. Esc-abortable throughout.
+    if let Some(RunResult::Success { session_state, .. }) =
+        run_abortable(harness.run(opts)).await
+    {
         history = Some(session_state);          // remember for the next turn
     }
 }
@@ -53,15 +65,16 @@ while let Some(prompt) = read_prompt() {        // ← the REPL
 // each turn's strategy: plan → execute
 fn plan_execute_strategy() -> LoopStrategy {
     LoopStrategy::PlanExecute(PlanExecuteConfig {
-        // plan: a ReAct sub-loop that emits a JSON {"tasks":[…]} plan. The plan
-        // slot is STRUCTURED, so its leaf must declare an output schema or
-        // startup validation rejects the run (hence the registry_schema above).
+        // plan: a ReAct sub-loop that emits a JSON {"tasks":[…]} plan. SC-1 lets a
+        // structured slot omit its output schema (absent ⇒ accept-all), so no
+        // registry stamp is needed just to pass startup validation — the plan
+        // phase's own "respond with a single JSON plan" directive drives the format.
         plan: Box::new(LoopStrategy::ReAct(ReactConfig {
             budget: BudgetPolicy::PerLoop { value: 12 },
             behavior: BudgetExhaustedBehavior::Escalate,
             agent: AgentRef(String::new()),     // default agent
             toolset: ToolsetRef(String::new()), // default toolset (coding_set)
-            output: Some(SchemaRef("plan".into())),
+            output: None,
         })),
         // execute: each task runs its own ReAct loop, in dependency order.
         execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(25))),
@@ -78,12 +91,11 @@ fn plan_execute_strategy() -> LoopStrategy {
 - **Plan.** One ReAct sub-loop (≤ 12 steps here) that may look around the
   codebase with the read tools, then replies with a single JSON object —
   `{"tasks": [...], "rationale": "..."}`. The harness seeds the "respond with a
-  JSON plan" directive itself; the example only supplies the slot. Because the
-  `plan` slot is **structured** (it must yield a typed task graph), startup
-  validation rejects a bare `ReAct` there unless its leaf declares an `output`
-  schema — so we register an empty schema under `"plan"` and point the leaf at it.
-  With `enforce_output_schemas` off (the default) that schema is only *resolved*,
-  never delivered to or enforced on the model.
+  JSON plan" directive itself; the example only supplies the slot. The `plan` slot
+  is **structured**, but SC-1 lets a structured slot omit its `output` schema (an
+  absent schema is treated as accept-all), so the leaf carries `output: None` and
+  no registry stamp is needed just to pass startup validation — the plan phase's
+  own directive drives the format.
 - **Execute.** The harness parses the plan into a **task list** and walks it,
   running the `execute` child — a ReAct loop (≤ 25 steps per task) — once per
   ready task, in dependency order, until every task is `Completed`.
@@ -97,32 +109,34 @@ tasks to the same conversation.
 The plan is printed the moment it's captured, via an `OnPlanCreated` hook
 (`plan_announcer()`), so you see the task list before the execute phase starts.
 
-### Working the list to completion (budget auto-continue)
+### Working the list to completion (AutoContinue — in the harness, not the REPL)
 
 Every node runs under a finite step budget (the execute leaf is `PerLoop { 25 }`),
-so a meaty task can spend it mid-flight. When that happens the conversational
-harness PAUSES rather than failing — it returns
-`WaitingForHuman { BudgetExhausted }`, because its default escalation mode is
-`SurfaceToHuman`. Left unhandled, that pause is where the run stops (and a naive
-REPL would just print the giant paused-state blob).
+so a meaty task can spend it mid-flight. The `coding_agent` preset sets
+`EscalationMode::AutoContinue` (SC-5), so when that happens the **harness** grants
+more budget IN-PROCESS and keeps working — raising the exhausted scope's cap and
+re-seeding the stalled worker, so the in-flight task picks up exactly where it
+left off, no work lost. It does this up to `PRESET_MAX_AUTO_GRANTS` (10) grants of
+`PRESET_STEPS_PER_GRANT` (25) steps each.
 
-So the REPL answers the pause itself. `drive()` resumes the run with a
-`ContinueWithBudget` grant — which raises the exhausted scope's cap **and**
-re-seeds the stalled worker, so the in-flight task picks up exactly where it left
-off, no work lost — and repeats up to `MAX_AUTO_CONTINUES` (10) times:
+This is the part that used to be the consumer's job: earlier this example
+hand-rolled a `drive()` loop that watched for `WaitingForHuman { BudgetExhausted }`
+and resumed with a `ContinueWithBudget` grant. With the preset there is **no such
+loop** — `harness.run(..)` returns a terminal result directly, and the same stream
+sink narrates every in-process grant:
 
 ```
    act → write_file({"path":"greeting.txt", …})
    obs → wrote 13 bytes to greeting.txt
-   … step budget reached — granting 25 more (1/10)
    think · turn 2
    act → read_file({"path":"greeting.txt"})
    obs → Hello, spore
 answer (…): created greeting.txt and confirmed its contents.
 ```
 
-Each resume is still Esc-abortable. If the cap is hit the turn ends with a note
-(the plan isn't lost — it's durable; send another prompt to keep going).
+The run is still Esc-abortable throughout (`run_abortable`). Past the grant cap
+the run ends with `Failure`, but the plan isn't lost — it's durable, so a
+follow-up prompt resumes the remaining tasks.
 
 ### State lives in BOTH the session and on disk
 
@@ -135,10 +149,13 @@ Two things carry across REPL turns:
   into the next run, where your new prompt is appended on top. So the agent
   remembers what you both said earlier — ask it to "now add tests for that" and
   it knows what "that" is. The conversational `ContextManager` compacts the
-  history at 80% of the context window — which this example sizes to the model's
-  real window (256K for gemma4, so it compacts around 205K) rather than the
-  harness's 8K `gemma` fallback, so the conversation isn't summarized away
-  prematurely. Type `clear` to start fresh.
+  history at 80% of the context window — which this example sizes with ONE call,
+  `OllamaModelInterface::with_context_window` (SC-4): it sets Ollama's `num_ctx`
+  AND the window `provider()` reports, and the compaction budget auto-derives from
+  that provider window (so there's no separate `context_length` to keep in sync).
+  Sized to the model's real window (256K for gemma4, so it compacts around 205K)
+  rather than the harness's 8K `gemma` fallback, the conversation isn't summarized
+  away prematurely. Type `clear` to start fresh.
 - **The workspace.** Files the agent wrote on an earlier turn are still on disk,
   so it can read, edit, and build on them — independently of the conversation.
 

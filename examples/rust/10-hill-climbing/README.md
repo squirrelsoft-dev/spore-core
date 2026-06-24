@@ -75,6 +75,28 @@ single log:
   `kept` / `discarded`, the metric value, the delta, and whether the workspace
   was reverted. The harness emits exactly one such event per iteration.
 
+## How it's assembled
+
+The harness is built from the **`HarnessBuilder::hill_climber`** preset (SC-8),
+which folds in the two things every climb needs: the metric evaluator (the
+`HillClimbing` strategy requires one) and `EscalationMode::AutoContinue` — so a
+build agent that spends its per-iteration step budget keeps working in-process
+instead of pausing the climb. The preset deliberately leaves the
+workspace-specific bits to the caller (climbs vary), so this example adds the
+read-write sandbox, the `write_file` + `read_file` tools, the build system prompt,
+the propose-schema registry, and the observability sink:
+
+```rust
+let harness = HarnessBuilder::hill_climber(build_model, evaluator) // evaluator + AutoContinue
+    .sandbox(Arc::new(sandbox))                                    // read-WRITE workspace
+    .tool(StandardTools::write_file())
+    .tool(StandardTools::read_file())
+    .system_prompt(SYSTEM_PROMPT)
+    .registry(build_registry())                                    // propose-schema
+    .observability(observability)                                  // prints keep/revert
+    .build();
+```
+
 ## Constants (top of `src/main.rs`)
 
 | Constant | Value | Meaning |
@@ -96,12 +118,17 @@ baseline a revert would have nothing to reset to.
 
 ```sh
 ollama serve &
-ollama pull llama3.2
+ollama pull qwen2.5-coder:7b
 
-cargo run                       # default model llama3.2, 6-iteration budget
-cargo run -- --max-iterations 8 # widen the budget
+# A TOOL-CAPABLE model is required — the build agent must call write_file. A
+# narrate-only small model (e.g. llama3.2 3B) never acts, so the draft stays empty
+# and every iteration scores 0. Pass one with --model:
 cargo run -- --model qwen2.5-coder:7b
+cargo run -- --model qwen2.5-coder:7b --max-iterations 8   # widen the budget
 ```
+
+> The code default is still `llama3.2` (so `cargo run` with no flags starts), but
+> for a real climb pass a tool-capable model as above.
 
 Configuration mirrors example 09: `--model` / `SPORE_OLLAMA_MODEL`,
 `SPORE_OLLAMA_BASE_URL`, and `--max-iterations` / `SPORE_MAX_ITERATIONS`. See

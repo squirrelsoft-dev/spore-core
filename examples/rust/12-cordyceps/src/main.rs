@@ -3,17 +3,22 @@
 //! This started as [`04-filesystem-agent`](../../04-filesystem-agent) and grows it
 //! into a coding REPL. The differences from 04:
 //!
-//! 1. the workspace sandbox is **read-write** and the agent gets the full
-//!    [`StandardTools::coding_set`] (read/write/edit/list/grep/find + `bash`), so
-//!    it can actually change code — not just summarize files;
+//! 1. it is built from the [`HarnessBuilder::coding_agent`] PRESET (SC-8), which in
+//!    one call wires the things a coding agent always needs: a **read-write**
+//!    workspace sandbox, the full [`StandardTools::coding_set`]
+//!    (read/write/edit/list/grep/find + `bash`), a built-in coding system prompt,
+//!    and `EscalationMode::AutoContinue` — so it can actually change code, and a
+//!    spent step budget keeps working in-process rather than pausing;
 //! 2. the single `harness.run(...)` is wrapped in a **REPL**: build the harness
 //!    once, then read a task per line, threading the conversation across turns; and
 //! 3. each turn runs the **PlanExecute** strategy instead of a bare `ReAct` loop —
 //!    a plan phase turns your prompt into a task list, then an execute phase works
 //!    that list to completion (see [`plan_execute_strategy`]).
 //!
-//! Same `conversational(model)` builder and the same stream-printed
-//! `think · turn N` / `act` / `obs` trace — the strategy is what changed.
+//! The preset builds on the same `conversational(model)` core, with the same
+//! stream-printed `think · turn N` / `act` / `obs` trace — the strategy and the
+//! autonomous escalation are what changed. The example then layers its own extras
+//! (skills, a richer prompt, the plan-announcer hook) on top of the preset.
 //!
 //! ## What it shows
 //!
@@ -33,19 +38,21 @@
 //!   the new prompt is appended on top. So the agent remembers the dialogue, not
 //!   just what's on disk. (Type `clear` to reset the conversation; the
 //!   conversational `ContextManager` compacts it when the window fills.)
-//! - **Auto-continue on a budget pause.** A node's step budget is finite, so a
-//!   long task can spend it mid-flight. The conversational harness then PAUSES
-//!   (`WaitingForHuman { BudgetExhausted }` — its default
-//!   `EscalationMode::SurfaceToHuman`). The REPL answers that pause itself,
-//!   resuming with a `ContinueWithBudget` grant up to [`MAX_AUTO_CONTINUES`] times
-//!   so the plan gets worked to completion without you babysitting it. The resume
-//!   re-seeds the stalled worker, so no work is lost (see [`drive`]).
-//! - **A real coding sandbox.** Catalogue file tools go through a
-//!   [`WorkspaceScopedSandbox`] scoped to the workspace ROOT — by default the
-//!   directory you launched from, so running at your project root lets the agent
-//!   work on that project. Unlike 04 it is NOT read-only, so `write_file` /
-//!   `edit_file` / `bash` can change files there. Override the root with
-//!   `--workspace <path>` or `SPORE_WORKSPACE`.
+//! - **Auto-continue on a spent budget — in the harness, not the consumer.** A
+//!   node's step budget is finite, so a long task can spend it mid-flight. Because
+//!   the `coding_agent` preset sets `EscalationMode::AutoContinue` (SC-5), the
+//!   harness then grants more budget IN-PROCESS and keeps working — up to
+//!   [`HarnessBuilder::PRESET_MAX_AUTO_GRANTS`] grants of
+//!   [`HarnessBuilder::PRESET_STEPS_PER_GRANT`] steps — re-seeding the stalled
+//!   worker so no work is lost. There is no consumer-side drive/resume loop to
+//!   hand-roll: `harness.run(..)` returns a terminal result directly. (Past the
+//!   cap it ends with `Failure`; the durable task list still holds the rest, so a
+//!   follow-up prompt resumes it.)
+//! - **A real coding sandbox.** The preset's `WorkspaceScopedSandbox` is scoped
+//!   to the workspace ROOT — by default the directory you launched from, so running
+//!   at your project root lets the agent work on that project. Unlike 04 it is NOT
+//!   read-only, so `write_file` / `edit_file` / `bash` can change files there.
+//!   Override the root with `--workspace <path>` or `SPORE_WORKSPACE`.
 //! - **Live narration via `send_message`.** `coding_set()` includes the
 //!   `send_message` tool, which surfaces an out-of-band line to the user. The
 //!   system prompt tells the agent the user only sees these messages plus the
@@ -83,13 +90,11 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use spore_core::{
-    AgentRef, BudgetExhaustedBehavior, BudgetPolicy, CompactionConfig, Content, EscalationAction,
-    FunctionHook, Harness, HarnessBuilder, HarnessContextManagerExt, HarnessRunOptions,
-    HarnessStreamEvent, HookChain, HookContext, HookDecision, HookEvent, HumanRequest,
-    HumanResponse, LoopStrategy, Message, NullCacheProvider, OllamaModelInterface,
-    PlanExecuteConfig, ReactConfig, Role, RunResult, SessionId, SessionState,
-    StandardContextManager, StandardHookChain, StandardTools, Task, ToolCall, ToolResult,
-    ToolsetRef, WorkspaceConfig, WorkspaceScopedSandbox,
+    AgentRef, BudgetExhaustedBehavior, BudgetPolicy, CompactionConfig, Content, FunctionHook,
+    Harness, HarnessBuilder, HarnessContextManagerExt, HarnessRunOptions, HarnessStreamEvent,
+    HookChain, HookContext, HookDecision, HookEvent, LoopStrategy, Message, NullCacheProvider,
+    OllamaModelInterface, PlanExecuteConfig, ReactConfig, Role, RunResult, SessionId, SessionState,
+    StandardContextManager, StandardHookChain, Task, ToolCall, ToolResult, ToolsetRef,
 };
 
 mod skills;
@@ -122,35 +127,26 @@ const MAX_STEPS: u32 = 25;
 /// look around (read_file / grep / list_dir) before it emits its JSON plan.
 const PLAN_STEPS: u32 = 12;
 
-/// When a turn pauses because a step budget was spent, the REPL auto-grants more
-/// budget and resumes — up to this many times per turn — so the agent keeps
-/// working the task list without you babysitting it. The cap stops a stuck task
-/// from burning tokens forever; if it's hit, the turn ends with a note.
-const MAX_AUTO_CONTINUES: u32 = 10;
-
-/// Steps granted on each auto-continue. `ContinueWithBudget` raises the exhausted
-/// scope's cap past where it stopped, so the in-flight task gets this many more
-/// steps (and its stalled worker is re-seeded — no work is lost).
-const CONTINUE_STEPS: u32 = MAX_STEPS;
-
 /// Compaction window, in tokens — the size the harness believes the model's
 /// context is, and the budget it compacts against. gemma4's real window is 256K,
 /// but the harness's #141 resolver only falls back to a static table that maps
 /// every `gemma*` id to 8_192 (and Ollama's `/api/show` discovery is best-effort
-/// and timing-dependent). So we set it explicitly to use the model's real
+/// and timing-dependent). So we size it explicitly to use the model's real
 /// headroom instead of compacting ~30× too early. Override for a smaller model
 /// with `--context-window <tokens>` / `SPORE_CONTEXT_WINDOW` — the value is used
 /// as-is and is NOT clamped to the model's true window, so don't set it larger
-/// than the model can actually hold. This same value is also sent to Ollama as
-/// `num_ctx` (via [`OllamaModelInterface::with_num_ctx`]), so it sizes the KV
-/// cache Ollama allocates as well as the harness's compaction budget — a larger
-/// window therefore costs proportionally more memory at model-load time.
+/// than the model can actually hold. We apply it with ONE call —
+/// [`OllamaModelInterface::with_context_window`] (SC-4): that sets Ollama's
+/// `num_ctx` (sizing the KV cache, so longer prompts aren't silently truncated)
+/// AND the window reported by `provider()`, which the compaction budget
+/// auto-derives — so a larger window costs proportionally more memory at
+/// model-load time.
 const DEFAULT_CONTEXT_WINDOW: u32 = 256_000;
 
 /// Fraction of the window at which the harness compacts. `should_compact` fires
 /// when `tokens_used / window >= threshold`, so 0.80 means compact at 80% of the
 /// window (e.g. ~204_800 of 256_000), leaving headroom for the turn that trips
-/// it. This is `CompactionConfig`'s own default; we name it for clarity.
+/// it. This is `CompactionConfig`'s own default; we name it for the status line.
 const COMPACT_THRESHOLD: f32 = 0.80;
 
 // ANSI styling for the REPL trace. The `send_message` narration is the group
@@ -191,42 +187,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&workspace_root)?;
     let workspace_root = std::fs::canonicalize(&workspace_root)?;
 
-    // The SAME conversational ReAct harness as 04 — the differences are a
-    // read-WRITE sandbox, the full coding catalogue, and a context window sized
-    // for the model (below). Built once and reused for every REPL turn.
-    let sandbox = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(workspace_root.clone()))?;
-
-    // `conversational` installs a context manager whose compaction window
-    // resolves to the gemma static fallback (8K). Override it with one configured
-    // for the model's real window so the persisted conversation isn't compacted
-    // prematurely. The context manager needs its own model handle (it uses it
-    // only for compaction summarization), so build a second cheap instance —
-    // `OllamaModelInterface` is config-only and isn't `Clone`.
-    // `context_length` is the model's TOTAL window; compaction fires earlier, at
-    // `threshold × window` (should_compact: used/window >= threshold), leaving
-    // headroom for the turn that crosses the line. 0.80 is the default — set it
-    // explicitly here so the 80% trigger is visible, not buried in a default.
-    //
-    // `with_num_ctx(context_window)` is the OTHER half of sizing the window, and
-    // the half that's easy to forget: `context_length` only tells the HARNESS how
-    // much budget it has before compacting. Ollama itself defaults to a tiny
-    // context (~2-4K) and silently truncates the prompt unless we send `num_ctx`.
-    // Without this the harness would happily fill 200K of budget the model never
-    // actually sees. Both must agree, so both read `context_window`.
-    let base_adapter = Arc::new(StandardContextManager::new(
-        Arc::new(
-            OllamaModelInterface::with_base_url(&model_id, base_url.clone())
-                .with_num_ctx(context_window),
-        ),
-        Arc::new(NullCacheProvider),
-        CompactionConfig {
-            context_length: Some(context_window),
-            threshold: COMPACT_THRESHOLD,
-            ..Default::default()
-        },
-    ))
-    .into_harness_adapter();
-
     // --- Skills (the Agent Skills spec, wired example-side) -------------------
     // Discover `SKILL.md` files (bundled with the example + `.spore/skills` in the
     // workspace + `~/.spore/skills`). The manifest (name + description of every
@@ -237,23 +197,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let catalog = skills::SkillCatalog::bootstrap(&workspace_root);
     let known = catalog.names();
     let active = skills::new_active_set();
-    // Wrap the compaction adapter so the manifest + active bodies ride along every
-    // turn — the live loop bypasses the rich `assemble` (Known Deviation #8 / #115).
+
+    // The context manager. The live loop bypasses the rich `assemble` (Known
+    // Deviation #8 / #115), so we wrap the standard compaction adapter to make the
+    // skill manifest + active bodies ride along every turn. The adapter needs its
+    // own model handle (it uses it only for compaction summarization), so build a
+    // second cheap instance — `OllamaModelInterface` is config-only and not
+    // `Clone`. We size that instance's window with ONE call, `with_context_window`
+    // (SC-4): it sets Ollama's `num_ctx` AND the window `provider()` reports, and
+    // `CompactionConfig::default()` leaves `context_length` unset so the compaction
+    // budget AUTO-DERIVES from that provider window (#141) — no second knob to keep
+    // in sync. (`COMPACT_THRESHOLD` is that default's 0.80; named for the status
+    // line below.)
+    let base_adapter = Arc::new(StandardContextManager::new(
+        Arc::new(
+            OllamaModelInterface::with_base_url(&model_id, base_url.clone())
+                .with_context_window(context_window),
+        ),
+        Arc::new(NullCacheProvider),
+        CompactionConfig::default(),
+    ))
+    .into_harness_adapter();
     let context_manager = Arc::new(skills::SkillInjectingContextManager::new(
         base_adapter,
         active.clone(),
         catalog.manifest(),
     ));
 
-    // Same `num_ctx` as the compaction handle above — the agent's own model must
-    // see the full window the harness budgets against, or every long turn is
-    // truncated by Ollama before the model reads it.
-    let model = OllamaModelInterface::with_base_url(&model_id, base_url).with_num_ctx(context_window);
-    let harness = HarnessBuilder::conversational(model)
-        .sandbox(Arc::new(sandbox))
-        // The coding catalogue PLUS the architect-side `load_skill` tool, so the
-        // agent can pull a skill's full procedure into context on demand.
-        .tools(StandardTools::coding_set())
+    // Build the harness via the `coding_agent` PRESET (SC-8). The preset wires the
+    // bits a coding agent always needs — a read-WRITE `WorkspaceScopedSandbox`
+    // rooted at `workspace_root`, the full coding tool catalogue
+    // (`StandardTools::coding_set`), a built-in coding system prompt, and
+    // `EscalationMode::AutoContinue` so a spent step budget keeps working IN-PROCESS
+    // instead of pausing (no hand-rolled drive loop; SC-5). Sizing the model's
+    // window with `with_context_window` (as above) is the only window knob.
+    //
+    // On top of the preset we layer this example's extras: the `load_skill` tool,
+    // the skill-injecting context manager (overriding the preset's plain one until
+    // #115), a RICHER system prompt (it overrides the built-in to add the skills
+    // contract AND the plan-phase "reply with JSON only" exception PlanExecute
+    // needs), and the plan-announcer hook. Built once and reused for every turn.
+    let model = OllamaModelInterface::with_base_url(&model_id, base_url)
+        .with_context_window(context_window);
+    let harness = HarnessBuilder::coding_agent(model, workspace_root.clone())?
         .tool(skills::load_skill_tool(active.clone(), known.clone()))
         .system_prompt(SYSTEM_PROMPT)
         .context_manager(context_manager)
@@ -264,6 +250,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("spore-core — plan→execute coding agent");
     println!("model     : {model_id}");
     println!("strategy  : plan (≤{PLAN_STEPS} steps) → execute (≤{MAX_STEPS} steps/task)");
+    println!(
+        "auto-cont : up to {} grants × {} steps in-process when a step budget is spent (preset)",
+        HarnessBuilder::PRESET_MAX_AUTO_GRANTS,
+        HarnessBuilder::PRESET_STEPS_PER_GRANT,
+    );
     println!(
         "context   : {context_window} tokens (num_ctx sent to Ollama; compact at {:.0}% → {} tokens)",
         COMPACT_THRESHOLD * 100.0,
@@ -411,10 +402,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => {}
             });
         // Assign `on_stream` directly (it's a public `Option<StreamSink>`) rather
-        // than `with_stream`, which wants a bare `Fn` — our sink is already the
-        // shared `Arc` so we can hand the SAME one to `resume` inside `drive`.
+        // than `with_stream`, which wants a bare `Fn`. One run carries the whole
+        // turn now: `EscalationMode::AutoContinue` (from the `coding_agent` preset)
+        // grants more budget IN-PROCESS when a step budget is spent, so there are no
+        // consumer-side resumes to feed — the same sink streams every grant.
         let mut options = HarnessRunOptions::new(task);
-        options.on_stream = Some(sink.clone());
+        options.on_stream = Some(sink);
         // Carry the running conversation into this turn (no-op on the first).
         // CLONE rather than take: an aborted run never hands back a post-run
         // state, so keeping `history` intact lets us rebuild from it below.
@@ -422,10 +415,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             options = options.with_session_state(state.clone());
         }
 
-        // `drive` runs the turn to a terminal result — auto-granting more budget
-        // when it pauses on a spent budget so the plan gets worked to completion —
-        // and stays Esc-abortable throughout. `None` ⇒ the user aborted.
-        match drive(&harness, options, sink).await {
+        // Run the turn to a terminal result, Esc-abortable throughout. The preset's
+        // AutoContinue works a spent step budget to completion in-process (capped at
+        // PRESET_MAX_AUTO_GRANTS), so the old hand-rolled budget-grant drive loop is
+        // gone. `None` ⇒ the user aborted with Esc.
+        match run_abortable(harness.run(options)).await {
             None => {
                 // Reconstruct the aborted turn so "continue" still has context:
                 // prior history + this turn's user prompt + the tool calls/results
@@ -468,19 +462,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 session_state,
                 ..
             }) => {
-                // Keep the partial history so a follow-up turn can continue.
+                // A budget-exhausted Failure here means AutoContinue hit its grant
+                // cap (PRESET_MAX_AUTO_GRANTS) before the plan finished. Keep the
+                // partial history — the durable, project-scoped task list still holds
+                // the remaining work, so another prompt resumes it.
                 history = Some(session_state);
-                eprintln!("\nrun did not succeed: {reason:?}\n");
+                eprintln!(
+                    "\nrun did not finish: {reason:?}\n  send another prompt to keep going \
+                     (or `clear` to reset).\n"
+                );
             }
             Some(RunResult::WaitingForHuman { state, .. }) => {
-                // The auto-continue cap was hit (or an unexpected human request
-                // surfaced). Keep the conversation so a follow-up prompt can build
-                // on it; the durable task list still holds the remaining work.
+                // With AutoContinue a spent step budget no longer pauses here (the
+                // harness grants more in-process, then ends with Failure above), so a
+                // pause here is an unexpected human request. Keep the conversation so
+                // a follow-up prompt can continue; the durable task list survives.
                 history = Some(state.session_state.clone());
-                eprintln!(
-                    "\n⏸ still working after {MAX_AUTO_CONTINUES} budget grants — the plan \
-                     isn't finished. Send another prompt to keep going (or `clear` to reset).\n"
-                );
+                eprintln!("\n⏸ run paused awaiting input — send another prompt to continue.\n");
             }
             Some(RunResult::Consult { state, .. }) | Some(RunResult::Escalate { state, .. }) => {
                 // Not expected in this single-agent example, but handle it cleanly
@@ -550,50 +548,6 @@ fn plan_announcer() -> Arc<dyn HookChain> {
         },
     )));
     Arc::new(chain)
-}
-
-/// Drive a freshly-built run to a TERMINAL result, auto-granting more budget when
-/// it pauses on a spent step budget so the agent keeps working the task list
-/// without you babysitting it.
-///
-/// Each `harness.run` / `harness.resume` step runs under [`run_abortable`] (Esc
-/// cancels it). When a step returns `WaitingForHuman { BudgetExhausted }` — which
-/// the conversational harness does by default (`EscalationMode::SurfaceToHuman`)
-/// when a node's step budget is spent — we resume it with a `ContinueWithBudget`
-/// grant. That raises the exhausted scope's cap AND re-seeds the stalled worker,
-/// so the in-flight task continues mid-loop without losing work. We do this up to
-/// [`MAX_AUTO_CONTINUES`] times; beyond that (or for any non-budget pause) the
-/// pause is handed back to the caller verbatim.
-///
-/// Returns `None` if the user aborted with Esc at any point.
-async fn drive(
-    harness: &dyn Harness,
-    options: HarnessRunOptions,
-    sink: Arc<dyn Fn(HarnessStreamEvent) + Send + Sync>,
-) -> Option<RunResult> {
-    let mut result = run_abortable(harness.run(options)).await?;
-    let mut granted = 0u32;
-    while let RunResult::WaitingForHuman { state, request } = result {
-        // Only auto-resume a BUDGET pause, and only up to the cap. Anything else
-        // goes back to the caller untouched.
-        if granted >= MAX_AUTO_CONTINUES || !matches!(request, HumanRequest::BudgetExhausted { .. })
-        {
-            return Some(RunResult::WaitingForHuman { state, request });
-        }
-        granted += 1;
-        // Printed between runs, so raw mode is off here — a plain `\n` is correct.
-        println!(
-            "{MUTED}   … step budget reached — granting {CONTINUE_STEPS} more \
-             ({granted}/{MAX_AUTO_CONTINUES}){RESET}"
-        );
-        let response = HumanResponse::Escalate {
-            action: EscalationAction::ContinueWithBudget {
-                steps: CONTINUE_STEPS,
-            },
-        };
-        result = run_abortable(harness.resume(*state, response, Some(sink.clone()))).await?;
-    }
-    Some(result)
 }
 
 /// Run one terminal-producing future (`harness.run` or `harness.resume`) with
