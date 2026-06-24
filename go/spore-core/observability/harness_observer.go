@@ -507,6 +507,9 @@ type HarnessBuilder struct {
 	// which also registers the load_skill tool. nil (the default) means no
 	// skills. See Skills.
 	skills *sporecore.SkillCatalog
+	// memory is the optional memory source (issue #163 / SC-26 follow-up). Set via
+	// Memory. nil (the default) leaves memory empty. See Memory.
+	memory *sporecore.MemoryConfig
 	// modelParams are the authoritative per-run model sampling/decoding
 	// parameters (issue #93). Builder params win: the harness replaces each
 	// tool-requesting turn's Context.Params with this value unconditionally
@@ -761,6 +764,22 @@ func (b *HarnessBuilder) Skills(catalog *sporecore.SkillCatalog) *HarnessBuilder
 	return b
 }
 
+// Memory wires a memory source (issue #163 / SC-26 follow-up). The harness
+// queries the provider each turn and injects the relevant memories into the
+// structural System block — alongside guides + skills via the rich
+// ContextSources seam — with no consumer-side context-manager shim.
+//
+// Build the config with memory.NewMemoryConfig(provider, opts...) to control the
+// query policy, e.g. NewMemoryConfig(provider, memory.WithMinRelevance(0.6),
+// memory.WithMaxItems(5)). Without an explicit query text the current task
+// instruction is used, so retrieved memory tracks what the agent is working on.
+// Not set (the default) leaves memory empty, byte-identical to the pre-#163 path.
+// Returns the receiver for fluent chaining.
+func (b *HarnessBuilder) Memory(cfg sporecore.MemoryConfig) *HarnessBuilder {
+	b.memory = &cfg
+	return b
+}
+
 // WithModelParams sets the authoritative model sampling/decoding parameters for
 // the whole run (issue #93).
 //
@@ -913,6 +932,7 @@ func (b *HarnessBuilder) BuildConfig() sporecore.HarnessConfig {
 		SystemPrompt:          b.systemPrompt,
 		Guides:                b.guides,
 		Skills:                b.skills,
+		Memory:                b.memory,
 		ModelParams:           b.modelParams,
 		SessionStore:          b.sessionStore,
 		AutoPersistSessions:   b.autoPersistSessions,

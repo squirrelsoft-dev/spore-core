@@ -1344,9 +1344,10 @@ type Guide struct {
 }
 
 // MemoryItem is the harness-loop mirror of contextmgr.MemoryItem (issue #115 /
-// SC-26 / #8). Memory stays empty pending the MemoryProvider object-safety
-// conversion (#163); the render path already accepts it so wiring it later is
-// additive.
+// SC-26 / #8). #163 wired the MemoryProvider into the live loop: when a
+// MemoryConfig is set, the harness queries the provider each turn and populates
+// ContextSources.Memory with these items (Key = source memory id, Content =
+// memory body), rendered into the structural System block after guides.
 type MemoryItem struct {
 	Key     string `json:"key"`
 	Content string `json:"content"`
@@ -3245,6 +3246,14 @@ type HarnessConfig struct {
 	// means no skills. See HarnessBuilder.Skills.
 	Skills *SkillCatalog // optional
 
+	// Memory is the optional memory source (issue #163 / SC-26 follow-up). When
+	// set, the harness queries the provider each turn (via buildContextSources)
+	// and injects the returned items into ContextSources.Memory, rendered into the
+	// structural System block alongside guides + skills. nil (the default) leaves
+	// memory empty, byte-identical to the pre-#163 path. See HarnessBuilder.Memory
+	// and MemoryConfig.
+	Memory *MemoryConfig // optional
+
 	// ModelParams are the authoritative per-run model sampling/decoding
 	// parameters (issue #93). The harness replaces each tool-requesting turn's
 	// Context.Params with this value UNCONDITIONALLY (builder params win) right
@@ -4326,16 +4335,40 @@ func (h *StandardHarness) effectiveToolRegistry(sessionID SessionID, toolset Too
 // User-message prepend. Skills (the manifest + active bodies, progressive
 // disclosure) are appended as guides from the shared catalog, so loading a skill
 // via load_skill makes its body sticky in the System block on the next turn.
-// Memory stays empty pending the MemoryProvider conversion (#163); the composed
-// static prompt is empty until the chunk-provider path is wired. An empty result
-// renders to nothing, so a harness with no sources stays byte-identical.
-func (h *StandardHarness) buildContextSources(toolSchemas []ToolSchema) ContextSources {
+//
+// #163 / SC-26 follow-up: when a memory source is configured, the harness queries
+// the provider each turn and injects the relevant items structurally (rendered
+// into the same System block as guides). The query text defaults to the task
+// instruction, so retrieved memory tracks the current work; a configured
+// MemoryConfig.QueryText overrides it. A query error
+// is swallowed here (empty memory) — memory is best-effort context, never a halt;
+// the Assemble seam is synchronous and error-free, so the swallow lives here. No
+// memory config leaves memory empty (byte-identical pre-#163 path).
+//
+// The composed static prompt is empty until the chunk-provider path is wired. An
+// empty result renders to nothing, so a harness with no sources stays
+// byte-identical.
+func (h *StandardHarness) buildContextSources(ctx context.Context, toolSchemas []ToolSchema, taskInstruction string) ContextSources {
 	guides := append([]Guide(nil), h.config.Guides...)
 	if h.config.Skills != nil {
 		guides = append(guides, h.config.Skills.ActiveGuides()...)
 	}
+	var memory []MemoryItem
+	if mem := h.config.Memory; mem != nil && mem.Query != nil {
+		// A configured query text overrides the task instruction, so retrieved
+		// memory can track a fixed concern instead of the current task.
+		queryText := taskInstruction
+		if mem.QueryText != nil {
+			queryText = *mem.QueryText
+		}
+		items, err := mem.Query(ctx, queryText, mem.Domain, mem.MinRelevance, mem.MaxItems)
+		if err == nil {
+			memory = items
+		}
+	}
 	return ContextSources{
 		Guides:      guides,
+		Memory:      memory,
 		ToolSchemas: toolSchemas,
 	}
 }
@@ -4909,10 +4942,10 @@ func (h *StandardHarness) runReActInner(
 
 		// Assemble + invoke agent for one turn. sources (issue #115 / SC-26)
 		// carries the rich ContextSources into the structural assemble seam:
-		// configured guides + active skills + tool schemas (memory/composed
-		// prompt empty for now). An empty sources renders to nothing, so the
-		// no-source path stays byte-identical.
-		sources := h.buildContextSources(registrySchemas(toolRegistry))
+		// configured guides + active skills + merged memory (#163) + tool schemas
+		// (composed prompt empty for now). An empty sources renders to nothing, so
+		// the no-source path stays byte-identical.
+		sources := h.buildContextSources(ctx, registrySchemas(toolRegistry), task.Instruction)
 		c := h.config.ContextManager.Assemble(ctx, &session, &task, sources)
 		// Deliver the registry's tool schemas to the model. Tool schemas are
 		// owned by the ToolRegistry; the harness wires them into the assembled

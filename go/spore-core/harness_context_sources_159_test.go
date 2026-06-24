@@ -6,11 +6,11 @@ import (
 	"testing"
 )
 
-// guideRenderingCM is a minimal ContextManager that renders sources.Guides into
-// a leading System block — mirroring the production StandardCompactionAdapter so
-// the loop's sources-building + system-prompt merge can be asserted without the
-// adapter's model machinery (the adapter's own rendering is unit-tested in
-// contextmgr).
+// guideRenderingCM is a minimal ContextManager that renders sources.Guides then
+// sources.Memory into a leading System block — mirroring the production
+// StandardCompactionAdapter's renderContextBlock so the loop's sources-building +
+// system-prompt merge can be asserted without the adapter's model machinery (the
+// adapter's own rendering is unit-tested in contextmgr).
 type guideRenderingCM struct{}
 
 func (guideRenderingCM) Assemble(_ context.Context, session *SessionState, _ *Task, sources ContextSources) Context {
@@ -18,6 +18,9 @@ func (guideRenderingCM) Assemble(_ context.Context, session *SessionState, _ *Ta
 	var parts []string
 	for _, g := range sources.Guides {
 		parts = append(parts, "# "+g.ID+"\n"+g.Content)
+	}
+	for _, m := range sources.Memory {
+		parts = append(parts, m.Content)
 	}
 	if block := strings.Join(parts, "\n\n"); block != "" {
 		messages = append([]Message{{Role: RoleSystem, Content: NewTextContent(block)}}, messages...)
@@ -86,7 +89,7 @@ func TestBuildContextSourcesAppendsActiveGuides(t *testing.T) {
 	cfg.Skills = cat
 	h := NewStandardHarness(cfg)
 
-	sources := h.buildContextSources(nil)
+	sources := h.buildContextSources(context.Background(), nil, "")
 	if len(sources.Guides) != 3 {
 		t.Fatalf("expected config guide + manifest + active body = 3; got %d: %+v", len(sources.Guides), sources.Guides)
 	}
@@ -105,7 +108,7 @@ func TestBuildContextSourcesAppendsActiveGuides(t *testing.T) {
 // carry no guides (the byte-identical no-source path).
 func TestBuildContextSourcesEmptyByDefault(t *testing.T) {
 	h := NewStandardHarness(standardCfg(&capturingAgent{id: AgentID("cap")}))
-	sources := h.buildContextSources(nil)
+	sources := h.buildContextSources(context.Background(), nil, "")
 	if len(sources.Guides) != 0 {
 		t.Fatalf("expected no guides by default; got %+v", sources.Guides)
 	}

@@ -610,3 +610,25 @@ func TestAssembleFormatsGuidesAsLeadingSystemBlock(t *testing.T) {
 		t.Fatalf("the original user message must follow the System block")
 	}
 }
+
+// TestRenderContextBlockAppendsMemoryAfterGuides: #163 — memory items render
+// into the SAME structural System block, after the guides, as plain content
+// joined by blank lines (mirrors Rust render_context_block_appends_memory_after_guides).
+func TestRenderContextBlockAppendsMemoryAfterGuides(t *testing.T) {
+	a := contextmgr.NewStandardCompactionAdapter(richManager(t))
+	session := sporecore.SessionState{Messages: []sporecore.Message{
+		{Role: sporecore.RoleUser, Content: sporecore.NewTextContent("hi")},
+	}}
+	task := sporecore.NewTask("t", sporecore.NewSessionID(), sporecore.ReActStrategy(4))
+	sources := sporecore.ContextSources{
+		Guides: []sporecore.Guide{{ID: "audit", Content: "AUDIT BODY"}},
+		Memory: []sporecore.MemoryItem{{Key: "m1", Content: "MEMORY CONTENT"}},
+	}
+	c := a.Assemble(context.Background(), &session, &task, sources)
+	if len(c.Messages) != 2 || c.Messages[0].Role != sporecore.RoleSystem {
+		t.Fatalf("expected a leading System block + the user message; got %+v", c.Messages)
+	}
+	if got, want := c.Messages[0].Content.Text, "# audit\nAUDIT BODY\n\nMEMORY CONTENT"; got != want {
+		t.Fatalf("memory must render after guides in the same block:\n got %q\nwant %q", got, want)
+	}
+}
