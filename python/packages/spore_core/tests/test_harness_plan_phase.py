@@ -17,7 +17,6 @@ from spore_core import (
     FinalResponse,
     HaltReasonAgentError,
     HaltReasonBudgetExceeded,
-    HaltReasonPlanPhaseFailed,
     HarnessConfig,
     HarnessRunOptions,
     InMemoryStorageProvider,
@@ -177,34 +176,90 @@ async def test_artifact_captured_and_stored_in_run_store() -> None:
 
 
 # ---------------------------------------------------------------------------
-# R3 (unparseable): a bad response surfaces PlanPhaseFailed/unparseable and
-# stores no artifact.
+# SC-28 acceptance (1): a free-text / markdown plan no longer fails the plan
+# phase. The strict JSON grammar (+ prose repair) misses, so the driver captures
+# it as a prose artifact instead of aborting: ``rationale`` holds the verbatim
+# prose and ``tasks`` is sourced from the ``task_list`` tool store (empty here —
+# the planner authored none). The artifact IS stored (R4 still applies) and
+# round-trips (acceptance 3). Mirrors Rust's
+# ``plan_phase_freetext_response_captures_as_prose`` (was
+# ``plan_phase_unparseable_response_fails``).
 # ---------------------------------------------------------------------------
 
 
-async def test_unparseable_plan_fails_and_stores_nothing() -> None:
-    from spore_core import SessionState
+async def test_plan_phase_freetext_response_captures_as_prose() -> None:
+    from spore_core import BudgetSnapshot, SessionState
+    from spore_core.harness import _PlanPhaseOutcome
 
+    prose = "This is a markdown plan.\n\n1. do the thing\n2. do the other"
     a = _agent()
-    a.push(FinalResponse(content="not json", usage=_usage()))
+    a.push(FinalResponse(content=prose, usage=_usage()))
     h = StandardHarness(_config(a))
     state = SessionState()
     task = _plan_task()
-    r = await h.run(HarnessRunOptions(task, session_state=state))
-    assert isinstance(r, RunResultFailure)
-    assert isinstance(r.reason, HaltReasonPlanPhaseFailed)
-    assert r.reason.error.kind == "unparseable_plan"
-    assert await _stored_artifact(h, task.session_id) is None
+    outcome = await h._run_plan_phase(task, state, BudgetSnapshot(), None)
+    # A free-text plan captures rather than failing.
+    assert isinstance(outcome, _PlanPhaseOutcome)
+    # Prose preserved verbatim; no JSON tasks parsed and no task_list authored.
+    assert outcome.artifact.rationale == prose
+    assert outcome.artifact.tasks == []
+    # R4: the artifact IS stored now (was absent pre-SC-28) and round-trips.
+    stored = await _stored_artifact(h, task.session_id)
+    assert stored == {"tasks": [], "rationale": prose}
+    # #76: not mirrored into SessionState.extras.
     assert PLAN_EXECUTE_EXTRAS_KEY not in state.extras
-    # Wire shape: the error is NESTED under `error` (parity with Rust's
-    # HaltReason::PlanPhaseFailed { error } and Go's HaltPlanPhaseFailed), not
-    # flattened as top-level error_kind/message fields.
-    dumped = r.reason.model_dump(mode="json")
-    assert dumped["kind"] == "plan_phase_failed"
-    assert set(dumped) == {"kind", "error"}
-    assert dumped["error"]["kind"] == "unparseable_plan"
-    assert "message" in dumped["error"]
-    assert "error_kind" not in dumped
+
+
+# ---------------------------------------------------------------------------
+# SC-28 acceptance (2): a markdown plan captures without parse failure AND the
+# OnPlanCreated payload's ``tasks`` are sourced from the ``task_list`` tool store
+# (the ONE authoring path) — so panel consumers (looper ``plan_tracker``,
+# cordyceps ``plan_announcer``) still get task texts even though the plan prose is
+# free-text rather than the JSON ``PlanArtifact``. Mirrors Rust's
+# ``plan_phase_freetext_sources_tasks_from_task_list``.
+#
+# NOTE: a REAL in-memory RunStore is wired (``_config`` uses
+# ``InMemoryStorageProvider``), NOT the default no-op store — otherwise the
+# seeded ``task_list`` would silently vanish and the test would assert the empty
+# path while passing.
+# ---------------------------------------------------------------------------
+
+
+async def test_plan_phase_freetext_sources_tasks_from_task_list() -> None:
+    from spore_core import BudgetSnapshot, SessionState
+    from spore_core.harness import _PlanPhaseOutcome
+    from spore_core.tasklist import TASK_LIST_EXTRAS_KEY, TaskList
+
+    prose = "Here's my plan in prose, no JSON object at all."
+    a = _agent()
+    a.push(FinalResponse(content=prose, usage=_usage()))
+    h = StandardHarness(_config(a))
+    task = _plan_task()
+
+    # Seed the durable task_list store as if the plan leaf had authored it via the
+    # ``task_list`` tool during the plan turn (keyed by the project namespace).
+    seeded = TaskList()
+    seeded.add("build it", [])
+    seeded.add("test it", [])
+    await (
+        h.storage()
+        .run()
+        .put(
+            project_namespace(h.project_id()),
+            TASK_LIST_EXTRAS_KEY,
+            seeded.to_dict(),
+        )
+    )
+
+    state = SessionState()
+    outcome = await h._run_plan_phase(task, state, BudgetSnapshot(), None)
+    assert isinstance(outcome, _PlanPhaseOutcome)
+    # ``tasks`` pulled from the seeded task_list; prose preserved as rationale.
+    assert outcome.artifact.tasks == ["build it", "test it"]
+    assert outcome.artifact.rationale == prose
+    # Stored artifact round-trips (acceptance 3).
+    stored = await _stored_artifact(h, task.session_id)
+    assert stored == {"tasks": ["build it", "test it"], "rationale": prose}
 
 
 # ---------------------------------------------------------------------------

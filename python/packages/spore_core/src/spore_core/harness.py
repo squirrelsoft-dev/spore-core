@@ -8480,25 +8480,46 @@ class StandardHarness:
         turns that produced ``plan_output`` ran elsewhere — the recursive
         ``self.plan`` child — so this carries no agent call. Returns the captured
         outcome + accounting or a terminal failure to propagate. Mirrors Rust's
-        ``capture_and_persist_plan``."""
+        ``capture_and_persist_plan``.
+
+        SC-28 — a free-text / markdown plan is NOT a hard failure
+        --------------------------------------------------------
+        The strict canonical grammar (+ prose repair) runs first, so a JSON plan
+        captures exactly as before — ``tasks``/``rationale`` come straight from
+        the object. When BOTH fail the planner emitted prose rather than the JSON
+        object; rather than aborting the whole run we capture it as a free-text
+        artifact: the verbatim prose is preserved in ``rationale``, and the
+        runnable ``tasks`` are sourced from the durable ``task_list`` tool store —
+        the ONE authoring path (#126 decision C) that the execute phase already
+        prefers over the artifact, so JSON was never the only source of executable
+        steps. Mirroring it here keeps the ``OnPlanCreated`` payload's ``tasks``
+        populated for panel consumers (looper ``plan_tracker``, cordyceps
+        ``plan_announcer``). A prose plan that authored no ``task_list`` yields
+        empty ``tasks`` — the execute phase then halts with ``EmptyPlan``, exactly
+        as a JSON ``{"tasks": []}`` would. The pure
+        :func:`~spore_core.plan.capture_plan_artifact` grammar stays strict and
+        byte-identical across languages; only this harness driver is tolerant."""
         from .plan import (
             PLAN_EXECUTE_EXTRAS_KEY,
             PlanPhaseError,
             capture_plan_artifact_with_repair,
         )
 
-        # R3: capture the artifact from the response text.
+        # R3: capture the artifact from the response text (the strict canonical
+        # grammar runs first; repair only rescues a failure).
         try:
             artifact = capture_plan_artifact_with_repair(plan_output)
-        except PlanPhaseError as e:
-            return self._fail(
-                HaltReasonPlanPhaseFailed(
-                    error=PlanPhaseErrorPayload(kind=e.kind, message=e.message),
-                ),
-                session_id,
-                usage,
-                turns,
+        except PlanPhaseError:
+            # SC-28: not JSON → capture as free-text. ``tasks`` from the task_list
+            # tool store (load_task_list reads the durable, project-scoped list the
+            # plan leaf authored via the tool); prose preserved verbatim.
+            from .tasklist import TaskList
+
+            task_list = await self.load_task_list(session_id)
+            tasks = (
+                [t.description for t in task_list.tasks] if isinstance(task_list, TaskList) else []
             )
+            artifact = PlanArtifact(tasks=tasks, rationale=plan_output)
 
         # R11: fire OnPlanCreated synchronously; the hook may rewrite the
         # artifact. The stored artifact reflects any mutation. Errors are
