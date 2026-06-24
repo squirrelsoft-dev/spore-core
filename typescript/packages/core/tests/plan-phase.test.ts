@@ -30,6 +30,7 @@ import {
   StandardHarness,
   capturePlanArtifact,
   capturePlanArtifactWithRepair,
+  emptyAggregateUsage,
   extractEmbeddedJsonObject,
   emptySessionState,
   newTask,
@@ -45,7 +46,12 @@ import type { Hook, HookChain, HookContext, HookDecision, HookEvent } from "../s
 import { StandardHookChain } from "../src/hooks/standard.js";
 import { InMemoryObservabilityProvider } from "../src/observability/in-memory.js";
 import { InMemoryStorageProvider, StorageProvider } from "../src/storage/index.js";
-import { TASK_LIST_EXTRAS_KEY } from "../src/tasklist/index.js";
+import {
+  TASK_LIST_EXTRAS_KEY,
+  addTask,
+  defaultTaskList,
+  serializeTaskList,
+} from "../src/tasklist/index.js";
 import {
   AllowAllSandbox,
   AlwaysContinuePolicy,
@@ -364,7 +370,9 @@ describe("PlanExecute plan phase", () => {
     // The plan child never emitted a JSON plan, so the run halts terminally.
     expect(r.kind).toBe("failure");
     // Nothing captured/stored: no artifact reached the RunStore.
-    expect(await storage.run().get(h.projectId().namespace(), PLAN_EXECUTE_EXTRAS_KEY)).toBeUndefined();
+    expect(
+      await storage.run().get(h.projectId().namespace(), PLAN_EXECUTE_EXTRAS_KEY),
+    ).toBeUndefined();
     expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
   });
 
@@ -380,18 +388,78 @@ describe("PlanExecute plan phase", () => {
     expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
   });
 
-  it("R3: an unparseable plan surfaces plan_phase_failed / unparseable_plan, no artifact", async () => {
-    const a = new RecordingAgent(AgentId.of("default")).push(fr("not json"));
-    const state: SessionState = emptySessionState();
+  // SC-28 acceptance (1) (was `R3: an unparseable plan surfaces
+  // plan_phase_failed`): a free-text / markdown plan no longer fails the plan
+  // phase. The strict JSON grammar (+ prose repair) misses, so the driver
+  // (`capturePlanArtifact`, the harness seam both the plan-phase combinator and
+  // the recursive PlanExecute path call) captures it as a prose artifact instead
+  // of aborting: `rationale` holds the verbatim prose and `tasks` is sourced from
+  // the `task_list` tool store (empty here — the planner authored none). The
+  // artifact IS stored (R4, was absent pre-SC-28) and round-trips. Drives the
+  // capture seam directly (mirrors Rust's `run_plan_phase`) so the plan phase is
+  // asserted in isolation from the execute phase.
+  it("plan_phase_freetext_response_captures_as_prose", async () => {
+    const prose = "This is a markdown plan.\n\n1. do the thing\n2. do the other";
+    const a = new RecordingAgent(AgentId.of("default"));
     const storage = inMemoryStorage();
     const h = new StandardHarness(configWith(a, { storage }));
-    const r = await h.run({ task: planTask(), session_state: state });
-    expect(r.kind).toBe("failure");
-    if (r.kind === "failure" && r.reason.kind === "plan_phase_failed") {
-      expect(r.reason.error.kind).toBe("unparseable_plan");
-    }
-    expect(await storage.run().get(h.projectId().namespace(), PLAN_EXECUTE_EXTRAS_KEY)).toBeUndefined();
-    expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
+    const outcome = await h.capturePlanArtifact(
+      PLAN_SID,
+      prose,
+      emptyAggregateUsage(),
+      1,
+      undefined,
+    );
+    // A free-text plan captures rather than failing.
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    // Prose preserved verbatim; no JSON tasks parsed and no task_list authored.
+    expect(outcome.artifact.rationale).toBe(prose);
+    expect(outcome.artifact.tasks).toEqual([]);
+    // R4: the artifact IS stored now and round-trips (stored extras deserialize).
+    expect(await storage.run().get(h.projectId().namespace(), PLAN_EXECUTE_EXTRAS_KEY)).toEqual(
+      outcome.artifact,
+    );
+  });
+
+  // SC-28 acceptance (2): a markdown plan captures without parse failure AND the
+  // on_plan_created payload's `tasks` are sourced from the `task_list` tool store
+  // (the ONE authoring path) — so panel consumers (looper `plan_tracker`,
+  // cordyceps `plan_announcer`) still get task texts even though the plan prose is
+  // free-text rather than the JSON `PlanArtifact`. Seeds a REAL in-memory RunStore
+  // (NOT the default no-op store) so the durable task_list survives the read; then
+  // drives the capture seam directly (mirrors Rust's `run_plan_phase`).
+  it("plan_phase_freetext_sources_tasks_from_task_list", async () => {
+    const prose = "Here's my plan in prose, no JSON object at all.";
+    const a = new RecordingAgent(AgentId.of("default"));
+    const storage = inMemoryStorage();
+    const h = new StandardHarness(configWith(a, { storage }));
+
+    // Seed the durable task_list store as if the plan leaf had authored it via the
+    // `task_list` tool during the plan turn (keyed by the project namespace).
+    const seeded = defaultTaskList();
+    expect(addTask(seeded, "build it").ok).toBe(true);
+    expect(addTask(seeded, "test it").ok).toBe(true);
+    await storage
+      .run()
+      .put(h.projectId().namespace(), TASK_LIST_EXTRAS_KEY, JSON.parse(serializeTaskList(seeded)));
+
+    const outcome = await h.capturePlanArtifact(
+      PLAN_SID,
+      prose,
+      emptyAggregateUsage(),
+      1,
+      undefined,
+    );
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    // `tasks` pulled from the seeded task_list; prose preserved as `rationale`.
+    expect(outcome.artifact.tasks).toEqual(["build it", "test it"]);
+    expect(outcome.artifact.rationale).toBe(prose);
+    // Stored artifact round-trips.
+    expect(await storage.run().get(h.projectId().namespace(), PLAN_EXECUTE_EXTRAS_KEY)).toEqual(
+      outcome.artifact,
+    );
   });
 
   it("R5 (#124 Q1): the plan child's leaf agent runs the plan turn; the default worker runs the steps", async () => {
@@ -479,7 +547,9 @@ describe("PlanExecute plan phase", () => {
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") expect(r.reason.kind).toBe("budget_exceeded");
     expect(a.ran).toBe(0); // never ran the plan turn.
-    expect(await storage.run().get(h.projectId().namespace(), PLAN_EXECUTE_EXTRAS_KEY)).toBeUndefined();
+    expect(
+      await storage.run().get(h.projectId().namespace(), PLAN_EXECUTE_EXTRAS_KEY),
+    ).toBeUndefined();
     expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
   });
 
@@ -523,8 +593,12 @@ describe("PlanExecute plan phase", () => {
     expect(r.kind).toBe("success");
 
     // Both keys are durable in the RunStore.
-    expect(await storage.run().get(h.projectId().namespace(), PLAN_EXECUTE_EXTRAS_KEY)).not.toBeUndefined();
-    expect(await storage.run().get(h.projectId().namespace(), TASK_LIST_EXTRAS_KEY)).not.toBeUndefined();
+    expect(
+      await storage.run().get(h.projectId().namespace(), PLAN_EXECUTE_EXTRAS_KEY),
+    ).not.toBeUndefined();
+    expect(
+      await storage.run().get(h.projectId().namespace(), TASK_LIST_EXTRAS_KEY),
+    ).not.toBeUndefined();
 
     // Neither key is mirrored into SessionState.extras anymore.
     expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();

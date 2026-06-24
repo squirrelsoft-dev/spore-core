@@ -2306,6 +2306,22 @@ export class StandardHarness implements Harness, StrategyExecutor {
    * `planOutput` ran elsewhere — the recursive `plan.run(cx)` child — so this
    * carries no agent call. Returns the captured artifact + accounting on success,
    * or a terminal `failure` `RunResult` to propagate.
+   *
+   * # SC-28 — a free-text / markdown plan is NOT a hard failure
+   * The strict canonical grammar (+ prose repair) runs first, so a JSON plan
+   * captures exactly as before — `tasks`/`rationale` come straight from the
+   * object. When BOTH fail the planner emitted prose rather than the JSON object;
+   * rather than aborting the whole run we capture it as a free-text artifact: the
+   * verbatim prose is preserved in `rationale`, and the runnable `tasks` are
+   * sourced from the durable `task_list` tool store — the ONE authoring path
+   * (#126 decision C) that the execute phase already prefers over the artifact, so
+   * JSON was never the only source of executable steps. Mirroring it here keeps
+   * the `on_plan_created` payload's `tasks` populated for panel consumers (looper
+   * `plan_tracker`, cordyceps `plan_announcer`). A prose plan that authored no
+   * `task_list` yields empty `tasks` — the execute phase then halts with
+   * `empty_plan`, exactly as a JSON `{"tasks": []}` would. The pure
+   * {@link capturePlanArtifact} grammar stays strict and byte-identical across
+   * languages; only this harness driver is tolerant.
    */
   private async captureAndPersistPlan(
     sessionId: SessionId,
@@ -2318,16 +2334,17 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // fallback: a planner that wraps its plan JSON in prose still captures (the
     // strict canonical grammar runs first; repair only rescues a failure).
     const captured = capturePlanArtifactWithRepair(planOutput);
-    if (!captured.ok) {
-      return {
-        ok: false,
-        failure: failure(
-          { kind: "plan_phase_failed", error: captured.error.detail },
-          sessionId,
-          usage,
-          turns,
-        ),
-      };
+    // SC-28: not JSON → capture as free-text instead of hard-failing. `tasks`
+    // come from the `task_list` tool store (loadTaskList reads the durable,
+    // project-scoped list the plan leaf authored via the tool), empty if none;
+    // the prose is preserved verbatim in `rationale`.
+    let initialArtifact: PlanArtifact;
+    if (captured.ok) {
+      initialArtifact = captured.artifact;
+    } else {
+      const taskList = await this.loadTaskList(sessionId);
+      const tasks = taskList ? taskList.tasks.map((t) => t.description) : [];
+      initialArtifact = { tasks, rationale: planOutput };
     }
 
     // R11: fire on_plan_created synchronously; the hook may rewrite the artifact
@@ -2337,7 +2354,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
     const ctx: HookContext = {
       event: "on_plan_created",
       session_id: sessionId,
-      plan: captured.artifact,
+      plan: initialArtifact,
     };
     if (this.config.hooks) {
       try {
