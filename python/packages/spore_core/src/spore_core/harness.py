@@ -1197,6 +1197,19 @@ class ExecutionContext:
             new_state = result.state.model_copy()
             new_state.task = parent_task
             result = result.model_copy(update={"state": new_state})
+        # SC-BUG-1: a HITL pause (``RunResultWaitingForHuman``) propagated from a
+        # worker leaf ALSO carries the LEAF task (a leaf records its terminal via
+        # ``_record_terminal``, which never rewrites it). Without the same rewrite,
+        # a host ``resume`` runs only that bare leaf and loses the surrounding
+        # frame — the SelfVerifying evaluate phase / PlanExecute walk never re-runs
+        # (so under ``AlwaysAsk`` the verify gate silently degrades to a plain
+        # executor). Rewrite it on the way up exactly like ``Consult``, so
+        # ``_resume_inner`` re-drives the whole composed strategy from the approved
+        # worker session.
+        elif isinstance(result, RunResultWaitingForHuman):
+            new_state = result.state.model_copy()
+            new_state.task = parent_task
+            result = result.model_copy(update={"state": new_state})
         self.scratch.task = parent_task
         if isinstance(result, RunResultSuccess | RunResultFailure):
             self.scratch.run_session = result.session_state
@@ -2722,7 +2735,19 @@ async def _run_self_verifying_config(
         return executor
     task = cx._current_task()
     build_session_id = task.session_id
-    session_state = cx.scratch.run_session
+    # SC-BUG-1: a HITL resume re-drives the whole SelfVerifying strategy with the
+    # stalled build (worker) conversation carried in the phase-agnostic resume
+    # seed. Consume it as the FIRST build iteration's session so the build phase
+    # CONTINUES the approved/answered worker turn (which already carries the
+    # original instruction + the dispatched tool result) instead of restarting
+    # from an empty top-level session — then the evaluate phase + verifier run,
+    # reaching the looper's eval-frame reviewer. On a fresh run the seed is
+    # ``None`` and this is the incoming ``run_session``, byte-identical to before.
+    # When SelfVerifying is NESTED under a PlanExecute walk, that outer walk takes
+    # the seed BEFORE recursing, so this sees ``None`` and the nested behavior is
+    # unchanged.
+    session_state = cx.scratch.resume_seed or cx.scratch.run_session
+    cx.scratch.resume_seed = None
     carried = cx.scratch.run_budget.model_copy(deep=True)
     # Suppress the run's stream sink for the recursive child phases.
     on_stream = cx.stream
@@ -7416,6 +7441,25 @@ class StandardHarness:
                     output = await tool_registry.dispatch(call)
                     tr = HarnessToolResult(call_id=call.id, output=output)
                     await self._config.context_manager.append_tool_result(session_state, tr)
+            # SC-BUG-1: a clarification that surfaced from inside a composed tree
+            # carries the FULL strategy in ``task.loop_strategy`` (each
+            # combinator's ``_finish`` rewrote the pause's task on the way up).
+            # Re-DRIVE that strategy from the answered worker session — exactly as
+            # the consult resume does — so the SelfVerifying evaluate phase /
+            # PlanExecute walk runs instead of only the bare worker leaf. A BARE
+            # ReAct leaf has no surrounding frame, so it keeps the leaf-only resume
+            # below (back-compat).
+            if not isinstance(task.loop_strategy, ReactConfig):
+                return await self._drive_strategy(
+                    task,
+                    # Top-level session starts fresh; the answered worker
+                    # conversation threads in as the resume seed.
+                    SessionState(),
+                    budget_used,
+                    on_stream,
+                    None,
+                    session_state,
+                )
             max_iterations = (
                 task.loop_strategy.max_iterations()
                 if isinstance(task.loop_strategy, ReactConfig)
@@ -7563,6 +7607,26 @@ class StandardHarness:
                 output = await tool_registry.dispatch(call)
                 tr = HarnessToolResult(call_id=call.id, output=output)
                 await self._config.context_manager.append_tool_result(session_state, tr)
+
+        # SC-BUG-1: an Allow / Deny / Answer / Reject resume that surfaced from
+        # inside a composed tree carries the FULL strategy in
+        # ``task.loop_strategy`` (each combinator's ``_finish`` rewrote the pause's
+        # task on the way up). The human response has already been applied to
+        # ``session_state`` above (the approved calls dispatched, or the
+        # deny/answer message appended). Re-DRIVE the whole strategy from that
+        # mutated worker session — mirroring the consult resume — so the
+        # SelfVerifying evaluate phase (the looper's eval-frame reviewer) /
+        # PlanExecute walk re-runs instead of degrading to a plain executor. A BARE
+        # ReAct leaf keeps the leaf-only resume below.
+        if not isinstance(task.loop_strategy, ReactConfig):
+            return await self._drive_strategy(
+                task,
+                SessionState(),
+                budget_used,
+                on_stream,
+                None,
+                session_state,
+            )
 
         # Resume the ReAct loop from where we paused.
         max_iterations = (
