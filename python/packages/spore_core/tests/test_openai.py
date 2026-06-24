@@ -26,6 +26,7 @@ from spore_core.model import (
     ProviderError,
     ProviderInfo,
     RateLimited,
+    ReasoningEffort,
     ReplayMode,
     ReplayModelInterface,
     Role,
@@ -44,6 +45,7 @@ from spore_core.model import (
     ToolUseStart,
 )
 from spore_core.openai import (
+    OpenAICompat,
     OpenAIModelInterface,
     _backoff_delay,
     build_request_body,
@@ -114,6 +116,111 @@ def test_is_reasoning_model_detection() -> None:
     assert is_reasoning_model("o3")
     assert is_reasoning_model("o1-pro")
     assert not is_reasoning_model("gpt-4o")
+
+
+def test_build_request_o_series_drops_top_p_and_stop() -> None:
+    # SC-27: reasoning models reject temperature/top_p/stop — all three dropped.
+    params = ModelParams(max_tokens=512, temperature=0.7, top_p=0.9, stop_sequences=["STOP"])
+    reasoning = build_request_body("o3", _req([_user("hi")], params=params), stream=False)
+    assert "top_p" not in reasoning
+    assert "stop" not in reasoning
+    assert "temperature" not in reasoning
+    # Chat model: all three are preserved.
+    chat = build_request_body("gpt-4o", _req([_user("hi")], params=params), stream=False)
+    assert chat["top_p"] == 0.9
+    assert chat["stop"] == ["STOP"]
+    assert chat["temperature"] == 0.7
+
+
+# ---------------------------------------------------------------------------
+# SC-27: with_compat BEATS the id heuristic
+# ---------------------------------------------------------------------------
+
+
+def test_compat_reasoning_model_beats_id_heuristic() -> None:
+    # An unrecognized id is NOT reasoning by the heuristic, so by default it gets
+    # chat shaping (max_tokens, temperature kept).
+    params = ModelParams(max_tokens=512, temperature=0.7)
+    chat = build_request_body("local-reasoner", _req([_user("hi")], params=params), stream=False)
+    assert chat["max_tokens"] == 512
+    assert "max_completion_tokens" not in chat
+    assert chat["temperature"] == 0.7
+    # Declaring it reasoning flips the shaping even though the id is unknown.
+    reasoning = build_request_body(
+        "local-reasoner",
+        _req([_user("hi")], params=params),
+        stream=False,
+        compat=OpenAICompat(reasoning_model=True),
+    )
+    assert "max_tokens" not in reasoning
+    assert reasoning["max_completion_tokens"] == 512
+    assert "temperature" not in reasoning
+
+
+def test_compat_developer_role_routes_system_message() -> None:
+    msgs = [_sys("be terse"), _user("hi")]
+    # Default: system stays ``system``.
+    plain = build_request_body("local-reasoner", _req(msgs), stream=False)
+    assert plain["messages"][0]["role"] == "system"
+    # developer_role: the system message routes to ``developer``.
+    dev = build_request_body(
+        "local-reasoner", _req(msgs), stream=False, compat=OpenAICompat(developer_role=True)
+    )
+    assert dev["messages"][0]["role"] == "developer"
+    # User messages are untouched.
+    assert dev["messages"][1]["role"] == "user"
+
+
+def test_compat_emits_reasoning_effort_for_reasoning_model() -> None:
+    req = _req([_sys("x"), _user("hi")], params=ModelParams(reasoning_effort=ReasoningEffort.HIGH))
+    # SC-27 acceptance: an unrecognized model with reasoning + effort support
+    # carries reasoning_effort AND the developer role on the wire.
+    body = build_request_body(
+        "local-reasoner",
+        req,
+        stream=False,
+        compat=OpenAICompat(
+            reasoning_model=True, developer_role=True, supports_reasoning_effort=True
+        ),
+    )
+    assert body["reasoning_effort"] == "high"
+    assert body["messages"][0]["role"] == "developer"
+    # Opt-in is required: without supports_reasoning_effort, the field is absent.
+    no_effort = build_request_body(
+        "local-reasoner", req, stream=False, compat=OpenAICompat(reasoning_model=True)
+    )
+    assert "reasoning_effort" not in no_effort
+    # And it's gated on the model being reasoning at all (effort alone on a chat
+    # model does nothing).
+    effort_only = build_request_body(
+        "gpt-4o", req, stream=False, compat=OpenAICompat(supports_reasoning_effort=True)
+    )
+    assert "reasoning_effort" not in effort_only
+
+
+def test_compat_reasoning_effort_serialized_on_wire() -> None:
+    req = _req([_user("hi")], params=ModelParams(reasoning_effort=ReasoningEffort.MEDIUM))
+    body = build_request_body(
+        "local-reasoner",
+        req,
+        stream=False,
+        compat=OpenAICompat(reasoning_model=True, supports_reasoning_effort=True),
+    )
+    s = json.dumps(body)
+    assert '"reasoning_effort": "medium"' in s or '"reasoning_effort":"medium"' in s
+    # A bare (default-compat) request must NOT carry the field.
+    bare = build_request_body("gpt-4o", req, stream=False)
+    assert "reasoning_effort" not in json.dumps(bare)
+
+
+def test_with_compat_setter_threads_into_call_body() -> None:
+    # The instance-level setter feeds ``self._compat`` into ``build_request_body``
+    # (exercised here directly by reading the stored compat).
+    iface = OpenAIModelInterface("k", "local-reasoner").with_compat(
+        OpenAICompat(reasoning_model=True, developer_role=True)
+    )
+    assert iface._compat.reasoning_model is True
+    assert iface._compat.developer_role is True
 
 
 def test_build_request_maps_tool_call_to_assistant_tool_calls() -> None:
@@ -283,6 +390,17 @@ def test_context_window_known_and_unknown() -> None:
     assert context_window("o4-mini") == 200_000
     assert context_window("o1-pro") == 128_000
     assert context_window("claude-x") == 0
+
+
+def test_with_context_window_overrides_reported_window() -> None:
+    # SC-6: an unrecognized id reports 0; the override pins it.
+    bare = OpenAIModelInterface("k", "local-llama")
+    assert bare.provider().context_window == 0
+    pinned = OpenAIModelInterface("k", "local-llama").with_context_window(32_768)
+    assert pinned.provider().context_window == 32_768
+    # And the constructor kwarg pins it too.
+    via_kwarg = OpenAIModelInterface("k", "local-llama", context_window_override=65_536)
+    assert via_kwarg.provider().context_window == 65_536
 
 
 def test_backoff_grows_then_caps() -> None:

@@ -446,6 +446,7 @@ class AnthropicModelInterface:
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        context_window_override: int | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._api_key = api_key
@@ -453,6 +454,10 @@ class AnthropicModelInterface:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._max_retries = max_retries
+        #: Explicit override for the window reported by :meth:`provider` (SC-6).
+        #: ``None`` defers to the static :func:`context_window` table; a value
+        #: pins it (e.g. a newer model the table predates).
+        self._context_window_override = context_window_override
         self._http_client = http_client
         self._owns_client = http_client is None
 
@@ -494,6 +499,18 @@ class AnthropicModelInterface:
     @property
     def max_retries(self) -> int:
         return self._max_retries
+
+    def with_context_window(self, n: int) -> AnthropicModelInterface:
+        """Override the window reported by :meth:`provider` (SC-6 / SC-4): the
+        value the harness's compaction budget sizes itself to (via the context
+        manager's ``resolve_context_length``, issue #141). Use it to pin the
+        window for a model the static table predates. Anthropic has no
+        ``num_ctx``-style knob — the API always serves the model's full window —
+        so this affects reporting (and thus the compaction budget) only.
+        """
+
+        self._context_window_override = n
+        return self
 
     def _client(self) -> httpx.AsyncClient:
         if self._http_client is None:
@@ -603,10 +620,16 @@ class AnthropicModelInterface:
             raise ProviderError(code=0, message=f"count_tokens missing input_tokens: {e}") from e
 
     def provider(self) -> ProviderInfo:
+        # SC-6: an explicit override wins over the static table.
+        window = (
+            self._context_window_override
+            if self._context_window_override is not None
+            else context_window(self._model_id)
+        )
         return ProviderInfo(
             name="anthropic",
             model_id=self._model_id,
-            context_window=context_window(self._model_id),
+            context_window=window,
         )
 
 

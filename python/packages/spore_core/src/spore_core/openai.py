@@ -36,6 +36,7 @@ import asyncio
 import json
 import os
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -49,6 +50,7 @@ from .model import (
     ProviderError,
     ProviderInfo,
     RateLimited,
+    ReasoningEffort,
     Role,
     StopReason,
     StreamEvent,
@@ -99,6 +101,40 @@ _RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 
 # ============================================================================
+# Compat declarations (SC-27)
+# ============================================================================
+
+
+@dataclass
+class OpenAICompat:
+    """Capability declarations that BEAT OpenAI's id-prefix heuristics (SC-27).
+
+    The built-in :func:`is_reasoning_model` check only recognizes the
+    ``o1``/``o3``/``o4`` families. A model served behind an OpenAI-compatible
+    endpoint (a local server, a renamed deployment, a newer family the
+    heuristic predates) gets no way to declare that it wants reasoning-model
+    request shaping. ``OpenAICompat``, supplied via
+    :meth:`OpenAIModelInterface.with_compat`, is that vehicle: every field is
+    OR'd over the id heuristic, never subtracted from it, so the default (all
+    ``False``) leaves the recognized o-series behavior byte-identical.
+    """
+
+    #: Treat this model as a reasoning model regardless of its id (beats the
+    #: ``o1``/``o3``/``o4`` heuristic): send ``max_completion_tokens`` instead
+    #: of ``max_tokens`` and drop ``temperature``/``top_p``/``stop``, which
+    #: reasoning models reject.
+    reasoning_model: bool = False
+    #: Route the system message to the ``developer`` role instead of
+    #: ``system`` — OpenAI's reasoning-model convention, which some compatible
+    #: servers require.
+    developer_role: bool = False
+    #: Emit a ``reasoning_effort`` field carrying
+    #: :attr:`ModelParams.reasoning_effort` (``"low"|"medium"|"high"|"max"``)
+    #: when it is set. No-op when the caller leaves ``reasoning_effort`` unset.
+    supports_reasoning_effort: bool = False
+
+
+# ============================================================================
 # Helpers
 # ============================================================================
 
@@ -138,9 +174,18 @@ def _backoff_delay(attempt: int) -> float:
     return min(base, 30.0)
 
 
-def _role_to_openai(role: Role) -> str:
+def _reasoning_effort_str(effort: ReasoningEffort) -> str:
+    """SC-27: the OpenAI ``reasoning_effort`` wire string. Mirrors Ollama's
+    ``think`` level mapping so the two providers agree on the level vocabulary.
+    """
+
+    return effort.value
+
+
+def _role_to_openai(role: Role, compat: OpenAICompat) -> str:
     if role is Role.SYSTEM:
-        return "system"
+        # SC-27: reasoning models use the ``developer`` role for system content.
+        return "developer" if compat.developer_role else "system"
     if role is Role.USER:
         return "user"
     if role is Role.ASSISTANT:
@@ -150,8 +195,8 @@ def _role_to_openai(role: Role) -> str:
     raise ValueError(f"unexpected role: {role}")
 
 
-def _message_to_openai(m: Message) -> dict[str, Any]:
-    role = _role_to_openai(m.role)
+def _message_to_openai(m: Message, compat: OpenAICompat) -> dict[str, Any]:
+    role = _role_to_openai(m.role, compat)
     content = m.content
     if isinstance(content, TextContent):
         return {"role": role, "content": content.text}
@@ -186,13 +231,28 @@ def _message_to_openai(m: Message) -> dict[str, Any]:
     raise TypeError(f"unsupported Content variant: {type(content).__name__}")
 
 
-def build_request_body(model_id: str, request: ModelRequest, stream: bool) -> dict[str, Any]:
+def build_request_body(
+    model_id: str,
+    request: ModelRequest,
+    stream: bool,
+    compat: OpenAICompat | None = None,
+) -> dict[str, Any]:
     """Translate a Spore :class:`ModelRequest` to the OpenAI Chat
-    Completions API request body."""
+    Completions API request body.
 
-    messages = [_message_to_openai(m) for m in request.messages]
+    ``compat`` (SC-27) is OR'd over the id-prefix heuristics: a default
+    (all-``False``) compat leaves recognized o-series requests byte-identical.
+    """
 
-    reasoning = is_reasoning_model(model_id)
+    if compat is None:
+        compat = OpenAICompat()
+
+    messages = [_message_to_openai(m, compat) for m in request.messages]
+
+    # SC-27: ``OpenAICompat.reasoning_model`` is OR'd OVER the id heuristic, so
+    # a model the ``o1``/``o3``/``o4`` prefix check misses still gets reasoning
+    # shaping.
+    reasoning = is_reasoning_model(model_id) or compat.reasoning_model
     body: dict[str, Any] = {
         "model": model_id,
         "messages": messages,
@@ -200,16 +260,25 @@ def build_request_body(model_id: str, request: ModelRequest, stream: bool) -> di
     if reasoning:
         if request.params.max_tokens is not None:
             body["max_completion_tokens"] = request.params.max_tokens
-        # temperature omitted for reasoning models
+        # SC-27: reasoning models reject temperature/top_p/stop — drop all three.
     else:
         if request.params.max_tokens is not None:
             body["max_tokens"] = request.params.max_tokens
         if request.params.temperature is not None:
             body["temperature"] = request.params.temperature
-    if request.params.top_p is not None:
-        body["top_p"] = request.params.top_p
-    if request.params.stop_sequences:
-        body["stop"] = list(request.params.stop_sequences)
+        if request.params.top_p is not None:
+            body["top_p"] = request.params.top_p
+        if request.params.stop_sequences:
+            body["stop"] = list(request.params.stop_sequences)
+    # SC-27: emit ``reasoning_effort`` only for a reasoning model whose compat
+    # opted in AND whose caller set an effort level. Absent otherwise so
+    # non-reasoning requests stay byte-identical.
+    if (
+        reasoning
+        and compat.supports_reasoning_effort
+        and request.params.reasoning_effort is not None
+    ):
+        body["reasoning_effort"] = _reasoning_effort_str(request.params.reasoning_effort)
     if request.tools:
         body["tools"] = [
             {
@@ -507,6 +576,8 @@ class OpenAIModelInterface:
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        context_window_override: int | None = None,
+        compat: OpenAICompat | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._api_key = api_key
@@ -514,6 +585,12 @@ class OpenAIModelInterface:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._max_retries = max_retries
+        #: Explicit override for the window reported by :meth:`provider` (SC-6).
+        #: ``None`` defers to the static :func:`context_window` table; a value
+        #: pins it.
+        self._context_window_override = context_window_override
+        #: Capability declarations that override the id heuristics (SC-27).
+        self._compat = compat if compat is not None else OpenAICompat()
         self._http_client = http_client
         self._owns_client = http_client is None
 
@@ -555,6 +632,33 @@ class OpenAIModelInterface:
     @property
     def max_retries(self) -> int:
         return self._max_retries
+
+    def with_context_window(self, n: int) -> OpenAIModelInterface:
+        """Override the window reported by :meth:`provider` (SC-6 / SC-4): the
+        value the harness's compaction budget sizes itself to (via the context
+        manager's ``resolve_context_length``, issue #141). Use it to pin the
+        window for a model the static table predates, or for a local
+        OpenAI-compatible deployment whose id the table does not recognize.
+        OpenAI has no ``num_ctx``-style knob, so this affects reporting (and
+        thus the compaction budget) only.
+        """
+
+        self._context_window_override = n
+        return self
+
+    def with_compat(self, compat: OpenAICompat) -> OpenAIModelInterface:
+        """Declare model capabilities that BEAT the id-prefix heuristics
+        (SC-27).
+
+        See :class:`OpenAICompat`. Use it for a reasoning model the
+        ``o1``/``o3``/``o4`` :func:`is_reasoning_model` check does not recognize
+        — e.g. a local server or a renamed deployment — so the request still
+        carries the developer role, ``max_completion_tokens``, and
+        ``reasoning_effort``.
+        """
+
+        self._compat = compat
+        return self
 
     def _client(self) -> httpx.AsyncClient:
         if self._http_client is None:
@@ -612,7 +716,7 @@ class OpenAIModelInterface:
 
     async def call(self, request: ModelRequest) -> ModelResponse:
         url = f"{self._base_url}/chat/completions"
-        body = build_request_body(self._model_id, request, stream=False)
+        body = build_request_body(self._model_id, request, stream=False, compat=self._compat)
         resp = await self._send_with_retry(url, body)
         try:
             data = resp.json()
@@ -624,7 +728,7 @@ class OpenAIModelInterface:
 
     async def call_streaming(self, request: ModelRequest) -> AsyncIterator[StreamEvent]:
         url = f"{self._base_url}/chat/completions"
-        body = build_request_body(self._model_id, request, stream=True)
+        body = build_request_body(self._model_id, request, stream=True, compat=self._compat)
         payload = json.dumps(body).encode("utf-8")
         headers = {**self._headers(), "accept": "text/event-stream"}
         client = self._client()
@@ -670,10 +774,16 @@ class OpenAIModelInterface:
         return total // 4
 
     def provider(self) -> ProviderInfo:
+        # SC-6: an explicit override wins over the static table.
+        window = (
+            self._context_window_override
+            if self._context_window_override is not None
+            else context_window(self._model_id)
+        )
         return ProviderInfo(
             name="openai",
             model_id=self._model_id,
-            context_window=context_window(self._model_id),
+            context_window=window,
         )
 
 
@@ -681,6 +791,7 @@ __all__ = [
     "DEFAULT_BASE_URL",
     "DEFAULT_MAX_RETRIES",
     "DEFAULT_TIMEOUT_SECONDS",
+    "OpenAICompat",
     "OpenAIModelInterface",
     "build_request_body",
     "context_window",

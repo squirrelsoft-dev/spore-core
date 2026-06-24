@@ -38,10 +38,9 @@ Rules enforced (pinned in #120 — do not re-litigate)
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Literal
-
-from pydantic import Field
+from typing import Any, Literal
 
 from .agent import Agent
 from .harness import (
@@ -71,14 +70,36 @@ from .verifier import Verifier
 # ── EscalationMode ───────────────────────────────────────────────────────────
 #
 # HITL-vs-AFK escalation knob (PRD goal #7: local vs. prod differ only by
-# config). Selects whether budget escalation surfaces to a human or proceeds
-# autonomously. Tagged on ``kind`` (snake_case), matching Rust's serde shape:
-#   {"kind": "surface_to_human"} / {"kind": "autonomous"}
+# config). Selects what budget escalation does: surface to a human, fail
+# autonomously, or keep working under an auto-granted cap (SC-5). Tagged on
+# ``kind`` (snake_case), matching Rust's serde shape:
+#   {"kind": "surface_to_human"} / {"kind": "autonomous"} / {"kind": "auto_continue"}
 #
 # NO default is baked into the type (mirrors the budget-types discipline); the
-# ``HarnessBuilder`` picks an explicit default (``SurfaceToHuman``). Has serde
-# derives for symmetry with the other harness enums, but it is NOT placed on
-# the serialized ``Task`` (no fixture).
+# ``HarnessBuilder`` picks an explicit default (``SurfaceToHuman``). It is NOT
+# placed on the serialized ``Task`` (no fixture) — the mode is never serialized,
+# so the ``AutoContinue.on_grant`` runtime callback has no wire impact.
+
+
+@dataclass
+class AutoGrantInfo:
+    """Details handed to an :class:`EscalationModeAutoContinue` ``on_grant``
+    callback each time the harness auto-grants more budget at an escalation
+    point (SC-5).
+    """
+
+    #: 1-based index of this grant within the exhausted scope (``1..=max_grants``).
+    grant_number: int
+    #: Steps granted this round (the mode's ``steps_per_grant``).
+    steps_granted: int
+    #: The budget scope phase that exhausted (e.g. ``"react"``, ``"plan_execute"``).
+    phase: str
+
+
+#: Callback fired once per :class:`EscalationModeAutoContinue` grant (SC-5).
+#: Runtime only — never serialized. Lets a consumer (e.g. looper's governor)
+#: observe each auto-grant without owning the keep-working loop itself.
+GrantCallback = Callable[[AutoGrantInfo], None]
 
 
 class EscalationModeSurfaceToHuman(_Model):
@@ -88,15 +109,45 @@ class EscalationModeSurfaceToHuman(_Model):
 
 
 class EscalationModeAutonomous(_Model):
-    """Budget escalation proceeds autonomously (AFK / prod)."""
+    """Budget escalation fails the run autonomously (AFK / prod): the partial
+    is propagated and the run stops."""
 
     kind: Literal["autonomous"] = "autonomous"
 
 
-EscalationMode = Annotated[
-    EscalationModeSurfaceToHuman | EscalationModeAutonomous,
-    Field(discriminator="kind"),
-]
+@dataclass
+class EscalationModeAutoContinue:
+    """ "Autonomous but capped" (SC-5): at an escalation point, auto-grant
+    ``steps_per_grant`` more steps and KEEP WORKING in-process, up to
+    ``max_grants`` times, firing ``on_grant`` per grant. Once the grants are
+    spent it falls through to the same terminal as
+    :class:`EscalationModeAutonomous`. This is the
+    keep-working-to-completion-but-cap-at-N policy consumers otherwise hand-roll
+    around the harness.
+
+    A PLAIN dataclass (not a pydantic ``_Model``): it carries a runtime-only
+    :data:`GrantCallback`, which a strict ``extra="forbid"`` model with no
+    arbitrary types cannot hold. The mode is never serialized, so ``on_grant``
+    has no wire impact.
+    """
+
+    #: Maximum number of auto-grants per exhausted scope before falling through
+    #: to the autonomous terminal. ``0`` behaves like
+    #: :class:`EscalationModeAutonomous` (no grants).
+    max_grants: int
+    #: Steps granted each time. A grant raises the exhausted scope's cap to
+    #: ``steps_taken + steps_per_grant`` so the loop gets exactly this many more
+    #: steps after the exhaustion point.
+    steps_per_grant: int
+    #: Optional per-grant observer (runtime only; never serialized).
+    on_grant: GrantCallback | None = None
+    #: Discriminator literal, for symmetry with the pydantic variants.
+    kind: Literal["auto_continue"] = "auto_continue"
+
+
+EscalationMode = (
+    EscalationModeSurfaceToHuman | EscalationModeAutonomous | EscalationModeAutoContinue
+)
 
 
 # ── StrategyResolution ───────────────────────────────────────────────────────
@@ -403,9 +454,12 @@ class ExecutionRegistryBuilder:
 
 
 __all__ = [
+    "AutoGrantInfo",
     "EscalationMode",
+    "EscalationModeAutoContinue",
     "EscalationModeAutonomous",
     "EscalationModeSurfaceToHuman",
+    "GrantCallback",
     "ExecutionRegistry",
     "ExecutionRegistryBuilder",
     "StrategyResolution",

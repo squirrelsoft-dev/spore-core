@@ -30,6 +30,7 @@ from spore_core import (
     ProviderError,
     ProviderInfo,
     RateLimited,
+    ReasoningEffort,
     RecordedExchange,
     RecordingMode,
     RecordingModelInterface,
@@ -67,6 +68,43 @@ def _text_response(text: str, in_tok: int, out_tok: int) -> ModelResponse:
         usage=TokenUsage(input_tokens=in_tok, output_tokens=out_tok),
         stop_reason=StopReason.END_TURN,
     )
+
+
+# ---------------------------------------------------------------------------
+# SC-27 prerequisite: ReasoningEffort + ModelParams.reasoning_effort
+# ---------------------------------------------------------------------------
+
+
+def test_reasoning_effort_omitted_when_unset() -> None:
+    # Default ``None`` is dropped so existing fixtures + request hashes stay
+    # byte-identical (Rust ``skip_serializing_if = "Option::is_none"``).
+    data = ModelParams().model_dump(mode="json")
+    assert "reasoning_effort" not in data
+
+
+def test_reasoning_effort_serializes_as_snake_case_level() -> None:
+    data = ModelParams(reasoning_effort=ReasoningEffort.HIGH).model_dump(mode="json")
+    assert data["reasoning_effort"] == "high"
+    for level, wire in (
+        (ReasoningEffort.LOW, "low"),
+        (ReasoningEffort.MEDIUM, "medium"),
+        (ReasoningEffort.HIGH, "high"),
+        (ReasoningEffort.MAX, "max"),
+    ):
+        assert (
+            ModelParams(reasoning_effort=level).model_dump(mode="json")["reasoning_effort"] == wire
+        )
+
+
+def test_reasoning_effort_does_not_change_request_hash_when_unset() -> None:
+    # Adding the field must not perturb the cross-language request hash for
+    # requests that leave it unset (additive — no fixture re-baseline).
+    a = ModelRequest(messages=[Message(role=Role.USER, content=TextContent(text="hi"))])
+    b = ModelRequest(
+        messages=[Message(role=Role.USER, content=TextContent(text="hi"))],
+        params=ModelParams(),
+    )
+    assert request_hash(a) == request_hash(b)
 
 
 # ---------------------------------------------------------------------------

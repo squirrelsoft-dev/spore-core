@@ -30,7 +30,11 @@ from spore_core import (
     AgentId,
     AllowAllSandbox,
     AlwaysContinuePolicy,
+    AutoGrantInfo,
     BudgetLimits,
+    EscalationModeAutoContinue,
+    EscalationModeAutonomous,
+    EscalationModeSurfaceToHuman,
     ExecutionContext,
     ExecutionRegistry,
     HaltReasonBudgetExceeded,
@@ -437,3 +441,67 @@ async def test_react_leaf_cap_binding_propagates_partial() -> None:
     parsed = json.loads(text)
     assert parsed["node"] == "react"
     assert parsed["last_final_response"] == ""
+
+
+# ---------------------------------------------------------------------------
+# SC-5: AutoContinue grant mechanics (BudgetContext + ExecutionContext)
+# ---------------------------------------------------------------------------
+
+
+def test_grant_auto_continue_is_additive_and_counted() -> None:
+    # The grant raises the scope cap to ``steps_taken + steps_per_grant``
+    # (additive, NO ``steps_taken`` rewind), so the loop gets exactly
+    # ``steps_per_grant`` more steps — distinct from ``consume_continue``.
+    scope = BudgetContext(
+        policy=BudgetPolicyPerLoop(value=2),
+        behavior=BudgetExhaustedEscalate(),
+        phase="react",
+    )
+    scope.charge(2)
+    with pytest.raises(BudgetExhausted):
+        scope.charge(1)  # exhausts at the cap
+    assert scope.auto_grants_remaining(3) == 3
+    scope.grant_auto_continue(2)  # cap → steps_taken(2) + 2 = 4
+    assert scope.auto_grants_used == 1
+    assert scope.auto_grants_remaining(3) == 2
+    scope.charge(2)  # two more steps fit after the grant
+    with pytest.raises(BudgetExhausted):
+        scope.charge(1)  # and it exhausts again at the raised cap
+
+
+def test_try_auto_continue_grants_until_capped_then_false() -> None:
+    cx = ExecutionContext(registry=ExecutionRegistry.empty())
+    cx.push_budget(BudgetPolicyPerLoop(value=2), BudgetExhaustedEscalate(), "react")
+
+    count = 0
+
+    def on_grant(info: AutoGrantInfo) -> None:
+        nonlocal count
+        assert info.steps_granted == 2
+        assert info.phase == "react"
+        count += 1
+
+    mode = EscalationModeAutoContinue(max_grants=2, steps_per_grant=2, on_grant=on_grant)
+
+    assert cx.charge_current(2) is None
+    assert cx.charge_current(1) is not None
+    assert cx.try_auto_continue(mode), "grant 1"
+    assert cx.charge_current(2) is None, "two more steps after grant 1"
+    assert cx.charge_current(1) is not None
+    assert cx.try_auto_continue(mode), "grant 2"
+    assert not cx.try_auto_continue(mode), "grants spent (max_grants = 2) → falls through"
+    assert count == 2
+
+    # Other modes never auto-continue.
+    assert not cx.try_auto_continue(EscalationModeAutonomous())
+    assert not cx.try_auto_continue(EscalationModeSurfaceToHuman())
+    # max_grants = 0 behaves like Autonomous (no grant).
+    assert not cx.try_auto_continue(
+        EscalationModeAutoContinue(max_grants=0, steps_per_grant=5, on_grant=None)
+    )
+
+
+def test_try_auto_continue_false_when_no_scope() -> None:
+    cx = ExecutionContext(registry=ExecutionRegistry.empty())
+    # No pushed scope → no grant possible.
+    assert not cx.try_auto_continue(EscalationModeAutoContinue(max_grants=3, steps_per_grant=2))

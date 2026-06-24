@@ -126,10 +126,34 @@ class ToolSchema(_Model):
 # ============================================================================
 
 
+class ReasoningEffort(str, Enum):
+    """Categorical reasoning effort for providers that expose discrete levels
+    (e.g. Ollama's ``think: "low"|"medium"|"high"|"max"`` for gpt-oss-style
+    models, and OpenAI's ``reasoning_effort`` request field). Distinct from
+    :attr:`ModelParams.reasoning_budget`, which is a token count; when both are
+    set, providers prefer this categorical effort.
+    """
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    MAX = "max"
+
+
 class ModelParams(_Model):
     temperature: float | None = None
     max_tokens: int | None = None
     reasoning_budget: int | None = None
+    #: Opt-in categorical reasoning effort for providers that expose discrete
+    #: levels. When set it takes precedence over :attr:`reasoning_budget`
+    #: (which only yields the boolean ``think: true``); ``None`` (the default)
+    #: keeps serialized params byte-identical. Providers without level support
+    #: ignore it.
+    #:
+    #: Mirrors Rust's ``#[serde(skip_serializing_if = "Option::is_none")]``:
+    #: ``None`` is OMITTED from the serialized form (see :meth:`_serialize`) so
+    #: every existing fixture stays byte-identical.
+    reasoning_effort: ReasoningEffort | None = None
     top_p: float | None = None
     stop_sequences: list[str] = Field(default_factory=list)
     #: Opt-in hint for providers that support constrained decoding (Ollama via
@@ -169,6 +193,11 @@ class ModelParams(_Model):
         # ``skip_serializing_if = "Option::is_none"``).
         if self.output_schema is None:
             data.pop("output_schema", None)
+        # ``reasoning_effort`` is also drop-when-None so existing fixtures and
+        # the cross-language request hash stay byte-identical (Rust uses
+        # ``skip_serializing_if = "Option::is_none"``).
+        if self.reasoning_effort is None:
+            data.pop("reasoning_effort", None)
         return data
 
 
@@ -811,6 +840,7 @@ __all__ = [
     "ProviderError",
     "ProviderInfo",
     "RateLimited",
+    "ReasoningEffort",
     "RecordedExchange",
     "RecordingMode",
     "RecordingModelInterface",

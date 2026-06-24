@@ -36,10 +36,12 @@ from spore_core import (
     AgentId,
     AllowAllSandbox,
     AlwaysContinuePolicy,
+    AutoGrantInfo,
     BudgetLimits,
     BudgetSnapshot,
     EscalationActionContinueWithBudget,
     EscalationActionFail,
+    EscalationModeAutoContinue,
     EscalationModeAutonomous,
     EscalationModeSurfaceToHuman,
     FinalResponse,
@@ -491,3 +493,97 @@ async def test_in_process_continue_does_no_serialization() -> None:
     assert isinstance(r, RunResultSuccess), r
     assert r.output == "done"
     assert not isinstance(r, RunResultWaitingForHuman)
+
+
+# ===========================================================================
+# SC-5 — EscalationMode AutoContinue: keep-working-but-capped at the bare leaf.
+# ===========================================================================
+
+
+async def test_auto_continue_grants_in_process_then_completes() -> None:
+    """SC-5 acceptance: ``EscalationModeAutoContinue`` keeps a budget-exhausted
+    bare ReAct leaf working IN-PROCESS — no consumer drive loop — by
+    auto-granting ``steps_per_grant`` more steps at the Escalate fall-through,
+    firing ``on_grant`` per grant, until the worker completes. Same shape as the
+    live-Continue test above, but the grant comes from the *escalation mode*, not
+    the leaf's ``behavior`` (which is ``Escalate``)."""
+    a = MockAgent(AgentId("test"))
+    # First window: 2 tool turns exhaust the PerLoop{2} cap → Escalate.
+    a.push(ToolCallRequested(calls=[ToolCall(id="c0", name="x", input={})], usage=_usage()))
+    a.push(ToolCallRequested(calls=[ToolCall(id="c1", name="x", input={})], usage=_usage()))
+    # After one auto-grant refreshes the cap, the worker completes.
+    a.push(FinalResponse(content="done after auto-continue", usage=_usage()))
+
+    grants = 0
+
+    def on_grant(info: AutoGrantInfo) -> None:
+        nonlocal grants
+        assert info.steps_granted == 2
+        grants += 1
+
+    h = StandardHarness(
+        _config(
+            a,
+            _tool_reg(3),
+            escalation_mode=EscalationModeAutoContinue(
+                max_grants=3, steps_per_grant=2, on_grant=on_grant
+            ),
+        )
+    )
+    task = Task.new(
+        "iterate",
+        SessionId("auto-s1"),
+        ReactConfig(
+            budget=BudgetPolicyPerLoop(value=2),
+            behavior=BudgetExhaustedEscalate(),
+            agent="",
+            toolset="",
+        ),
+        budget=BudgetLimits(max_turns=None),
+    )
+    r = await h.run(HarnessRunOptions(task))
+    assert isinstance(r, RunResultSuccess), r
+    assert r.output == "done after auto-continue"
+    assert grants == 1, "exactly one auto-grant was needed to finish"
+
+
+async def test_auto_continue_caps_at_max_grants_then_fails() -> None:
+    """SC-5: AutoContinue is CAPPED — once ``max_grants`` grants are spent it
+    falls through to the autonomous terminal (Failure), firing ``on_grant``
+    exactly ``max_grants`` times. The agent never emits a final response, so every
+    window exhausts."""
+    a = MockAgent(AgentId("test"))
+    # Plenty of tool turns (far more than any window can consume) so the run only
+    # ends when the grant cap is reached — never on an empty queue.
+    for i in range(40):
+        a.push(ToolCallRequested(calls=[ToolCall(id=f"c{i}", name="x", input={})], usage=_usage()))
+
+    grants = 0
+
+    def on_grant(info: AutoGrantInfo) -> None:
+        nonlocal grants
+        grants += 1
+
+    h = StandardHarness(
+        _config(
+            a,
+            _tool_reg(80),
+            escalation_mode=EscalationModeAutoContinue(
+                max_grants=2, steps_per_grant=2, on_grant=on_grant
+            ),
+        )
+    )
+    task = Task.new(
+        "do work",
+        SessionId("auto-s2"),
+        ReactConfig(
+            budget=BudgetPolicyPerLoop(value=2),
+            behavior=BudgetExhaustedEscalate(),
+            agent="",
+            toolset="",
+        ),
+        budget=BudgetLimits(max_turns=None),
+    )
+    r = await h.run(HarnessRunOptions(task))
+    assert isinstance(r, RunResultFailure), r
+    assert grants == 2, "exactly max_grants auto-grants fired before falling through to Failure"

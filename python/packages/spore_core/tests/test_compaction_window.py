@@ -145,6 +145,28 @@ def test_seed_session_honors_config_override() -> None:
 
 
 # ---------------------------------------------------------------------------
+# SC-4: Ollama with_context_window fans out into the compaction budget
+# ---------------------------------------------------------------------------
+
+
+def test_with_context_window_fans_out_to_compaction_budget() -> None:
+    # SC-4 acceptance: the reported window flows through the context manager's
+    # #141 resolve chain into the seeded ``window_limit`` — the compaction
+    # budget — with no separate CompactionConfig setting.
+    from spore_core.ollama import OllamaModelInterface
+
+    model = OllamaModelInterface("gemma3:4b").with_context_window(256_000)
+    mgr = StandardContextManager(
+        model=model,
+        compaction=CompactionConfig(),  # context_length: None → falls to provider window
+    )
+    assert mgr.resolve_context_length() == 256_000
+    state = mgr.seed_session(SessionId("s"), TaskId("t"), "do the thing")
+    # A 200K conversation won't compact prematurely at 80% of 256K.
+    assert state.window_limit == 256_000
+
+
+# ---------------------------------------------------------------------------
 # Rule: trigger math respects the (often small) configured window
 # ---------------------------------------------------------------------------
 

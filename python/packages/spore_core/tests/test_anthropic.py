@@ -239,6 +239,20 @@ def test_context_window_known_and_unknown() -> None:
     assert context_window("gpt-4o") == 0
 
 
+def test_with_context_window_overrides_reported_window() -> None:
+    # SC-6: a ``claude-*`` id reports 200K by default; an explicit override pins
+    # it, so the harness's compaction budget sizes correctly.
+    bare = AnthropicModelInterface("test-key", "claude-imaginary-9")
+    assert bare.provider().context_window == 200_000
+    pinned = AnthropicModelInterface("test-key", "some-proxy-model").with_context_window(500_000)
+    assert pinned.provider().context_window == 500_000
+    # A bare foreign id still reports 0 (callers can detect "unknown").
+    assert AnthropicModelInterface("k", "some-proxy-model").provider().context_window == 0
+    # And the constructor kwarg pins it too.
+    via_kwarg = AnthropicModelInterface("k", "some-proxy-model", context_window_override=64_000)
+    assert via_kwarg.provider().context_window == 64_000
+
+
 def test_backoff_grows_then_caps() -> None:
     d0 = _backoff_delay(0)
     d3 = _backoff_delay(3)

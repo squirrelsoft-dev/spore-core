@@ -44,7 +44,7 @@ from .agent import (
 )
 from .anthropic import AnthropicModelInterface
 from .ollama import OllamaModelInterface
-from .openai import OpenAIModelInterface
+from .openai import OpenAICompat, OpenAIModelInterface
 from .errors import AlwaysHaltError, SporeError
 from .harness import (
     AggregateUsage,
@@ -257,11 +257,14 @@ from .harness import (
     sandbox_violation_is_always_halt,
 )
 from .execution_registry import (
+    AutoGrantInfo,
     EscalationMode,
+    EscalationModeAutoContinue,
     EscalationModeAutonomous,
     EscalationModeSurfaceToHuman,
     ExecutionRegistry,
     ExecutionRegistryBuilder,
+    GrantCallback,
     StrategyResolution,
     StrategyResolutionBuiltIn,
     StrategyResolutionCustom,
@@ -721,6 +724,7 @@ from .model import (
     ProviderError,
     ProviderInfo,
     RateLimited,
+    ReasoningEffort,
     RecordedExchange,
     RecordingMode,
     RecordingModelInterface,
@@ -819,6 +823,7 @@ __all__ = [
     "Agent",
     "AnthropicModelInterface",
     "OllamaModelInterface",
+    "OpenAICompat",
     "OpenAIModelInterface",
     "AgentError",
     "AgentErrorEmpty",
@@ -859,6 +864,7 @@ __all__ = [
     "ProviderError",
     "ProviderInfo",
     "RateLimited",
+    "ReasoningEffort",
     "RecordedExchange",
     "RecordingMode",
     "RecordingModelInterface",
@@ -1037,9 +1043,12 @@ __all__ = [
     "HarnessErrorInvalidConfiguration",
     "HarnessErrorStrategyNotFound",
     "HarnessErrorUnresolvedHandle",
+    "AutoGrantInfo",
     "EscalationMode",
+    "EscalationModeAutoContinue",
     "EscalationModeAutonomous",
     "EscalationModeSurfaceToHuman",
+    "GrantCallback",
     "ExecutionRegistry",
     "ExecutionRegistryBuilder",
     "StrategyResolution",

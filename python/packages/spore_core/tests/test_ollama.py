@@ -100,6 +100,44 @@ def test_with_base_url_forwards_num_ctx() -> None:
     assert c.num_ctx == 256_000
 
 
+# ---------------------------------------------------------------------------
+# SC-4 / SC-6: with_context_window — one-call window sizing + reported override
+# ---------------------------------------------------------------------------
+
+
+def test_with_context_window_sets_both_num_ctx_and_reported_window() -> None:
+    # SC-4: ONE call fans out to the model-loading knob (``num_ctx``) AND the
+    # window REPORTED to the harness's compaction budget (``provider()``).
+    c = OllamaModelInterface("gemma3:4b").with_context_window(256_000)
+    assert c.num_ctx == 256_000, "num_ctx: what Ollama loads"
+    assert c.provider().context_window == 256_000, "reported window: what compaction sizes to"
+
+
+def test_context_window_override_beats_static_table() -> None:
+    # SC-6: ``gemma*`` statically reports 8_192; the explicit override wins.
+    assert context_window("gemma3:4b") == 8_192
+    c = OllamaModelInterface("gemma3:4b").with_context_window(128_000)
+    assert c.provider().context_window == 128_000
+    # No override → the static table still governs.
+    bare = OllamaModelInterface("gemma3:4b")
+    assert bare.provider().context_window == 8_192
+
+
+def test_with_context_window_carries_num_ctx_onto_request_body() -> None:
+    # SC-4: the reported override AND ``options.num_ctx`` come from one setter,
+    # so the chat request carries ``num_ctx: 256000``.
+    c = OllamaModelInterface("gemma3:4b").with_context_window(256_000)
+    body = build_request_body(
+        c.model_id, c.keep_alive, c.num_ctx, _req([_user("hi")]), stream=False
+    )
+    assert body["options"]["num_ctx"] == 256_000
+
+
+def test_context_window_override_via_constructor_kwarg() -> None:
+    c = OllamaModelInterface("some-proxy-model", context_window_override=500_000)
+    assert c.provider().context_window == 500_000
+
+
 def test_with_base_url_overrides() -> None:
     c = OllamaModelInterface.with_base_url("mistral", "http://remote:9999")
     assert c.base_url == "http://remote:9999"

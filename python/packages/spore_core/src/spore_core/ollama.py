@@ -679,6 +679,7 @@ class OllamaModelInterface:
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         keep_alive: str | None = DEFAULT_KEEP_ALIVE,
         num_ctx: int | None = None,
+        context_window_override: int | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._model_id = model_id
@@ -691,6 +692,15 @@ class OllamaModelInterface:
         # Like ``keep_alive``, this is a model-loading setting, not a per-turn
         # sampling param.
         self._num_ctx = num_ctx
+        #: Explicit override for the window REPORTED by :meth:`provider` (SC-6).
+        #: ``None`` (the default) defers to the ``/api/show``-discovered length,
+        #: then the static :func:`context_window` table. When set it is the
+        #: highest authority — a caller that knows the real window can pin it
+        #: without waiting on (or contradicting) discovery.
+        #: :meth:`with_context_window` sets this AND ``num_ctx`` together so the
+        #: harness's compaction budget and the window Ollama actually loads
+        #: agree (SC-4).
+        self._context_window_override = context_window_override
         self._http_client = http_client
         self._owns_client = http_client is None
         self._model_checked = False
@@ -730,6 +740,34 @@ class OllamaModelInterface:
     @property
     def num_ctx(self) -> int | None:
         return self._num_ctx
+
+    def with_context_window(self, n: int) -> OllamaModelInterface:
+        """Set the model's context window in ONE call (SC-4) — the friendly
+        setter that resolves the discovery/enforcement split this module
+        documents.
+
+        It does two things at once:
+
+        1. sets ``num_ctx`` (so Ollama loads the model at window ``n`` instead
+           of its small server default and stops silently truncating longer
+           prompts), and
+        2. sets the window REPORTED by :meth:`provider` to ``n`` (so the
+           harness's compaction budget — which reads
+           ``provider().context_window`` via the context manager's
+           ``resolve_context_length``, issue #141 — sizes itself to the SAME
+           window the model actually sees).
+
+        Without this, a caller had to set ``num_ctx`` AND separately keep the
+        harness's compaction window in sync, or the harness would manage a
+        large budget while Ollama truncated at its default (looper's
+        ``num_ctx`` drift). ``num_ctx`` sizes Ollama's KV-cache allocation at
+        load time, so pass the window you actually want — not an arbitrary
+        maximum.
+        """
+
+        self._num_ctx = n
+        self._context_window_override = n
+        return self
 
     def _client(self) -> httpx.AsyncClient:
         if self._http_client is None:
@@ -977,12 +1015,18 @@ class OllamaModelInterface:
         return None
 
     def provider(self) -> ProviderInfo:
-        # Prefer the ``/api/show``-discovered context length when the probe has
-        # already run and produced one; otherwise fall back to the static
-        # table. ``provider()`` is synchronous, so it reads the cached probe
-        # result non-blockingly rather than triggering discovery itself.
+        # Resolve the reported window by precedence (SC-6): an explicit caller
+        # override wins; else the ``/api/show``-discovered context length when
+        # the probe has already run and produced one; else the static table.
+        # ``provider()`` is synchronous, so it reads the cached probe result
+        # non-blockingly rather than triggering discovery itself.
         discovered = self._model_meta.context_length if self._model_meta is not None else None
-        window = discovered if discovered is not None else context_window(self._model_id)
+        if self._context_window_override is not None:
+            window = self._context_window_override
+        elif discovered is not None:
+            window = discovered
+        else:
+            window = context_window(self._model_id)
         return ProviderInfo(
             name="ollama",
             model_id=self._model_id,

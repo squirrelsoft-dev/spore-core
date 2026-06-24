@@ -856,6 +856,10 @@ class BudgetContext:
     phase: str
     steps_taken: int = 0
     continues_used: int = 0
+    #: In-process auto-grants spent at this scope's escalation point under
+    #: :class:`EscalationModeAutoContinue` (SC-5). Bounded by the mode's
+    #: ``max_grants``. Runtime-only, like ``continues_used``; never serialized.
+    auto_grants_used: int = 0
 
     def _allowance(self) -> int | None:
         """The per-scope step allowance (``None`` for ``Unlimited``)."""
@@ -903,6 +907,26 @@ class BudgetContext:
         checkpoint is DEFERRED to #129. Mirrors Rust's ``consume_continue``."""
         self.continues_used += 1
         self.steps_taken = 0
+
+    def grant_auto_continue(self, steps_per_grant: int) -> None:
+        """Grant one in-process AUTO-continue at this scope's escalation point
+        (SC-5, :class:`EscalationModeAutoContinue`): bump ``auto_grants_used``
+        and raise the scope's cap to ``steps_taken + steps_per_grant`` so the
+        loop gets exactly ``steps_per_grant`` more steps after the exhaustion
+        point (mirrors a human ``ContinueWithBudget { steps }`` grant, applied
+        automatically). ``Unlimited`` never reaches here. Unlike
+        :meth:`consume_continue` this does NOT rewind ``steps_taken`` — the cap
+        moves up instead, so the grant is a strict, additive
+        ``steps_per_grant``. Mirrors Rust's ``grant_auto_continue``."""
+        self.auto_grants_used += 1
+        granted = self.steps_taken + steps_per_grant
+        self.policy = _grant_budget_policy(self.policy, granted)
+
+    def auto_grants_remaining(self, max_grants: int) -> int:
+        """Auto-grants still available before falling through to the autonomous
+        terminal, given the mode's ``max_grants`` (SC-5). ``0`` once spent.
+        Mirrors Rust's ``auto_grants_remaining``."""
+        return max(max_grants - self.auto_grants_used, 0)
 
     @classmethod
     def resumed(
@@ -1245,6 +1269,36 @@ class ExecutionContext:
         if scope is None:
             return ExhaustedResolution.FAIL
         return scope.resolve_exhausted()
+
+    def try_auto_continue(self, mode: EscalationMode) -> bool:
+        """SC-5: attempt one :class:`EscalationModeAutoContinue` auto-grant at
+        the CURRENT scope. Returns ``True`` when the mode is ``AutoContinue``,
+        grants remain (``auto_grants_used < max_grants``), and the scope was
+        refreshed with ``steps_per_grant`` more steps — the caller should then
+        ``continue`` its loop IN-PROCESS (the scope is still on the stack).
+        Fires ``on_grant`` for the grant. Returns ``False`` for any other mode,
+        when grants are spent, or when there is no current scope — the caller
+        then falls through to its existing pause (``SurfaceToHuman``) / abort
+        (``Autonomous``) handling. Mirrors Rust's ``try_auto_continue``."""
+        from .execution_registry import AutoGrantInfo, EscalationModeAutoContinue
+
+        if not isinstance(mode, EscalationModeAutoContinue):
+            return False
+        scope = self.budgets.current()
+        if scope is None:
+            return False
+        if scope.auto_grants_remaining(mode.max_grants) == 0:
+            return False
+        scope.grant_auto_continue(mode.steps_per_grant)
+        if mode.on_grant is not None:
+            mode.on_grant(
+                AutoGrantInfo(
+                    grant_number=scope.auto_grants_used,
+                    steps_granted=mode.steps_per_grant,
+                    phase=scope.phase,
+                )
+            )
+        return True
 
 
 @runtime_checkable
@@ -2429,6 +2483,14 @@ async def _run_plan_execute_config(
             # ``BudgetExhausted`` request via the ``terminal_override`` seam.
             from .execution_registry import EscalationModeSurfaceToHuman
 
+            # SC-5: AutoContinue auto-grants this scope in-process (bounded by
+            # ``max_grants``, fires ``on_grant``) and re-walks the ready set —
+            # mirroring the ``Continue`` arm above. Once grants are spent it
+            # falls through to the surface/abort handling below.
+            if cx.try_auto_continue(executor.escalation_mode()):
+                task_list.update(task_id, TaskStatus.PENDING)
+                await executor.persist_task_list(session_id, task_list)
+                continue
             surface = isinstance(executor.escalation_mode(), EscalationModeSurfaceToHuman)
             # #138 AC2-b: under SurfaceToHuman the task is NOT permanently failed —
             # it pauses awaiting a budget grant. Leave it ``InProgress`` (the
@@ -2512,6 +2574,12 @@ async def _run_plan_execute_config(
                 # scheduling the remaining ready tasks IN-PROCESS (this step already
                 # completed). Do NOT pop the scope. NO serialization (AC3).
                 if resolution == ExhaustedResolution.CONTINUE:
+                    continue
+                # SC-5: AutoContinue auto-grants in-process at this Escalate
+                # point (scope still pushed) before surfacing.
+                if resolution == ExhaustedResolution.ESCALATE and cx.try_auto_continue(
+                    executor.escalation_mode()
+                ):
                     continue
                 partial = _plan_execute_partial_json(task_list)
                 cx.pop_budget()
@@ -2767,6 +2835,12 @@ async def _run_self_verifying_config(
             # continues under the refreshed allowance). NO serialization (AC3).
             # ``max_continues`` bounds the loop.
             if resolution == ExhaustedResolution.CONTINUE:
+                continue
+            # SC-5: AutoContinue auto-grants in-process at this Escalate point
+            # (scope still pushed) before surfacing/aborting.
+            if resolution == ExhaustedResolution.ESCALATE and cx.try_auto_continue(
+                executor.escalation_mode()
+            ):
                 continue
             partial = _self_verifying_partial_json(last_worker_output, last_reason)
             cx.pop_budget()
@@ -3045,6 +3119,12 @@ async def _run_hill_climbing_config(
             # charge pass). NO serialization (AC3). ``max_continues`` bounds the
             # loop.
             if resolution == ExhaustedResolution.CONTINUE:
+                continue
+            # SC-5: AutoContinue auto-grants in-process at this Escalate point
+            # (scope still pushed) before surfacing/aborting.
+            if resolution == ExhaustedResolution.ESCALATE and cx.try_auto_continue(
+                executor.escalation_mode()
+            ):
                 continue
             await executor.hill_write_tsv(task_id, rows)
             partial = _hill_climbing_partial_json(current_best)
@@ -7919,6 +7999,12 @@ class StandardHarness:
         # The Continue resolution state threaded across in-process rounds: the
         # (possibly fallen-through) behavior + how many continues have been spent.
         behavior_for_resolution: tuple[BudgetExhaustedBehavior, int] | None = None
+        # SC-5: auto-grants spent at the BARE-LEAF Escalate site under
+        # :class:`EscalationModeAutoContinue`. The scope is rebuilt each round
+        # here (unlike the in-loop combinator scopes, which carry their own
+        # ``auto_grants_used``), so the counter lives across rounds in this
+        # local.
+        auto_grants_used: int = 0
 
         while True:
             cx = ExecutionContext(registry=self._config.registry)
@@ -8014,9 +8100,41 @@ class StandardHarness:
                 behavior_for_resolution = (scope.behavior, scope.continues_used)
                 continue
 
-            from .execution_registry import EscalationModeSurfaceToHuman
+            from .execution_registry import (
+                AutoGrantInfo,
+                EscalationModeAutoContinue,
+                EscalationModeSurfaceToHuman,
+            )
 
             if resolution == ExhaustedResolution.ESCALATE:
+                # SC-5: AutoContinue auto-grants ``steps_per_grant`` more steps
+                # and re-drives IN-PROCESS (mirroring the ``Continue`` arm
+                # above), up to ``max_grants`` times, firing ``on_grant`` per
+                # grant. This is the bare-leaf / top-level
+                # keep-working-but-capped site — where consumers otherwise
+                # hand-roll a drive loop. Once the grants are spent it falls
+                # through to the surface/abort handling below (the
+                # ``Autonomous`` terminal).
+                mode = self._config.escalation_mode
+                if (
+                    isinstance(mode, EscalationModeAutoContinue)
+                    and auto_grants_used < mode.max_grants
+                ):
+                    auto_grants_used += 1
+                    if mode.on_grant is not None:
+                        mode.on_grant(
+                            AutoGrantInfo(
+                                grant_number=auto_grants_used,
+                                steps_granted=mode.steps_per_grant,
+                                phase=outcome.phase,
+                            )
+                        )
+                    granted = outcome.steps_taken + mode.steps_per_grant
+                    task = _grant_task_budget(task, granted)
+                    session_state = cx.scratch.run_session
+                    budget_used = cx.scratch.run_budget.model_copy(deep=True)
+                    on_stream = cx.stream
+                    continue
                 # #130: a BARE LEAF ``Escalate`` under ``SurfaceToHuman`` PAUSES
                 # with a ``BudgetExhausted`` request offering ``[ContinueWithBudget,
                 # Fail]`` (fork C — no sibling to ``Skip`` to).
