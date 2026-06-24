@@ -21,8 +21,10 @@ import {
   emptySessionState,
   middleware,
   newTask,
+  memoryConfig,
   context as contextNs,
   skills as skillsNs,
+  memory as memoryNs,
   type Agent,
   type Context,
   type ContextManager,
@@ -1099,9 +1101,10 @@ describe("Harness — ContextSources structural injection (#115/SC-26)", () => {
 
   /**
    * Minimal context manager mirroring the production adapter: render
-   * `sources.guides` into a leading System block, so the loop's
-   * sources-building + system-prompt merge can be asserted without the adapter's
-   * model machinery.
+   * `sources.guides` then `sources.memory` into a leading System block, so the
+   * loop's sources-building + system-prompt merge can be asserted without the
+   * adapter's model machinery. (The adapter's own rendering is unit-tested in
+   * `compaction-adapter`.)
    */
   class GuideRenderingCm extends NoopContextManager {
     override async assemble(
@@ -1110,13 +1113,172 @@ describe("Harness — ContextSources structural injection (#115/SC-26)", () => {
       sources: contextNs.ContextSources,
     ): Promise<Context> {
       const messages = session.messages.slice();
-      const block = sources.guides.map((g) => `# ${g.id.toString()}\n${g.content}`).join("\n\n");
+      const block = [
+        ...sources.guides.map((g) => `# ${g.id.toString()}\n${g.content}`),
+        ...sources.memory.map((m) => m.content),
+      ].join("\n\n");
       if (block.length > 0) {
         messages.unshift({ role: "system", content: { type: "text", text: block } });
       }
       return { messages, tools: [], params: { stop_sequences: [] } };
     }
   }
+
+  /**
+   * Call the harness's `private buildContextSources` directly (the Rust tests do
+   * the same on the inherent method). The cast reaches the private member for the
+   * purpose of the unit test only.
+   */
+  function callBuildContextSources(
+    h: StandardHarness,
+    toolSchemas: ToolSchema[],
+    taskInstruction: string,
+  ): Promise<contextNs.ContextSources> {
+    return (
+      h as unknown as {
+        buildContextSources(
+          toolSchemas: ToolSchema[],
+          taskInstruction: string,
+        ): Promise<contextNs.ContextSources>;
+      }
+    ).buildContextSources(toolSchemas, taskInstruction);
+  }
+
+  /**
+   * Build a {@link StandardMemoryProvider} holding a single active semantic
+   * memory. Stored through the {@link MemoryProvider} interface (object-safety
+   * is a no-op in TS: the interface is already dynamically dispatched).
+   */
+  async function memoryWith(id: string, content: string): Promise<memoryNs.MemoryProvider> {
+    const provider = new memoryNs.StandardMemoryProvider();
+    const mem: memoryNs.SemanticMemory = {
+      id: new memoryNs.MemoryId(id),
+      content,
+      source: { kind: "manual" },
+      domain: null,
+      version: 1,
+      previous_versions: [],
+      created_at: new memoryNs.Timestamp("2026-06-24T00:00:00Z"),
+      updated_at: new memoryNs.Timestamp("2026-06-24T00:00:00Z"),
+      status: { kind: "active" },
+    };
+    await provider.storeSemantic(mem, "reject");
+    return provider;
+  }
+
+  /** A ReAct task with an explicit instruction string. */
+  function reactTask(instruction: string): Task {
+    return newTask(instruction, SessionId.of("s1"), {
+      kind: "react",
+      budget: { kind: "per_loop", value: 5 },
+      agent: "",
+      toolset: "",
+    });
+  }
+
+  it("memory reaches the model as a leading System block via the assemble seam, not a User message (#163)", async () => {
+    const recording = new RecordingAgent();
+    // Held as the MemoryProvider INTERFACE type — proves object-safety (no-op in
+    // TS: the interface is already dynamically dispatched).
+    const provider: memoryNs.MemoryProvider = await memoryWith(
+      "m1",
+      "REFUND IDEMPOTENCY: audit the payments refund path",
+    );
+    const cfg: HarnessConfig = {
+      registry: registryWith({ agent: recording }),
+      toolRegistry: new ScriptedToolRegistry(),
+      sandbox: new AllowAllSandbox(),
+      contextManager: new GuideRenderingCm(),
+      terminationPolicy: new AlwaysContinuePolicy(),
+      modelParams: { stop_sequences: [] },
+      systemPrompt: "SYSTEM PROMPT",
+      memory: memoryConfig(provider, { minRelevance: 0.1 }),
+    };
+    const h = new StandardHarness(cfg);
+    // The query text defaults to the task instruction, so a related task surfaces
+    // the memory.
+    await h.run({ task: reactTask("audit the payments refund path") });
+
+    expect(recording.seen.length).toBeGreaterThan(0);
+    const first = recording.seen[0]!;
+    const head = first.messages[0]!;
+    expect(head.role).toBe("system");
+    if (head.content.type !== "text") throw new Error("expected a text System block");
+    // System prompt leads the merged System block; the memory rides structurally.
+    expect(head.content.text.startsWith("SYSTEM PROMPT")).toBe(true);
+    expect(head.content.text).toContain("REFUND IDEMPOTENCY");
+    // The memory is NOT delivered as a stray User message.
+    const userMemory = first.messages.some(
+      (m) =>
+        m.role === "user" &&
+        m.content.type === "text" &&
+        m.content.text.includes("REFUND IDEMPOTENCY"),
+    );
+    expect(userMemory, "memory must not be injected as a User message").toBe(false);
+  });
+
+  it("buildContextSources: no provider configured leaves memory empty (#163)", async () => {
+    const recording = new RecordingAgent();
+    const cfg: HarnessConfig = {
+      registry: registryWith({ agent: recording }),
+      toolRegistry: new ScriptedToolRegistry(),
+      sandbox: new AllowAllSandbox(),
+      contextManager: new GuideRenderingCm(),
+      terminationPolicy: new AlwaysContinuePolicy(),
+      modelParams: { stop_sequences: [] },
+    };
+    const h = new StandardHarness(cfg);
+    const sources = await callBuildContextSources(h, [], "audit the payments refund path");
+    expect(sources.memory).toEqual([]);
+  });
+
+  it("buildContextSources: query defaults to the task instruction (#163)", async () => {
+    const recording = new RecordingAgent();
+    const provider = await memoryWith("m1", "REFUND IDEMPOTENCY: audit the payments refund path");
+    // 0.3 cleanly separates the related instruction from the unrelated one (only
+    // a shared stopword), so the override test below is meaningful.
+    const cfg: HarnessConfig = {
+      registry: registryWith({ agent: recording }),
+      toolRegistry: new ScriptedToolRegistry(),
+      sandbox: new AllowAllSandbox(),
+      contextManager: new GuideRenderingCm(),
+      terminationPolicy: new AlwaysContinuePolicy(),
+      modelParams: { stop_sequences: [] },
+      memory: memoryConfig(provider, { minRelevance: 0.3 }),
+    };
+    const h = new StandardHarness(cfg);
+
+    // Related instruction surfaces the memory.
+    const byTask = await callBuildContextSources(h, [], "audit the payments refund path");
+    expect(byTask.memory.length).toBe(1);
+    expect(byTask.memory[0]!.content).toContain("REFUND IDEMPOTENCY");
+
+    // An unrelated instruction surfaces nothing at the same threshold.
+    const unrelated = await callBuildContextSources(h, [], "compile the rust workspace");
+    expect(unrelated.memory).toEqual([]);
+  });
+
+  it("buildContextSources: a configured query overrides the task instruction (#163)", async () => {
+    const recording = new RecordingAgent();
+    const provider = await memoryWith("m1", "REFUND IDEMPOTENCY: audit the payments refund path");
+    const cfg: HarnessConfig = {
+      registry: registryWith({ agent: recording }),
+      toolRegistry: new ScriptedToolRegistry(),
+      sandbox: new AllowAllSandbox(),
+      contextManager: new GuideRenderingCm(),
+      terminationPolicy: new AlwaysContinuePolicy(),
+      modelParams: { stop_sequences: [] },
+      memory: memoryConfig(provider, {
+        query: "audit the payments refund path",
+        minRelevance: 0.1,
+      }),
+    };
+    const h = new StandardHarness(cfg);
+    // Even an UNRELATED task instruction surfaces the memory: the fixed query wins.
+    const byOverride = await callBuildContextSources(h, [], "compile the rust workspace");
+    expect(byOverride.memory.length).toBe(1);
+    expect(byOverride.memory[0]!.content).toContain("REFUND IDEMPOTENCY");
+  });
 
   it("a configured guide reaches the model as a leading System block with the system prompt merged in front", async () => {
     const recording = new RecordingAgent();

@@ -8,6 +8,8 @@ export {
   StandardHarness,
   HarnessBuilder,
   type HarnessConfig,
+  type MemoryConfig,
+  memoryConfig,
   HOOK_POINTS,
   isReact,
 } from "./standard.js";

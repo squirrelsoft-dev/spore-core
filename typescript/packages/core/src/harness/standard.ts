@@ -39,7 +39,8 @@ import { NullSandbox } from "../sandbox/null-sandbox.js";
 import { EmptyToolRegistry } from "../tool-registry/empty.js";
 import { CompleteOnFinalResponse } from "./complete-on-final-response.js";
 import type { SessionOutcome } from "../guide-registry/types.js";
-import { Timestamp } from "../memory/types.js";
+import { Timestamp, DEFAULT_MIN_RELEVANCE, DEFAULT_MAX_ITEMS } from "../memory/types.js";
+import type { MemoryProvider, MemoryQuery } from "../memory/types.js";
 import type { StopReason, TokenUsage } from "../model/schemas.js";
 import {
   ContentCaptureConfig,
@@ -194,6 +195,61 @@ import {
   type ToolResultRecord,
 } from "./types.js";
 import { ExecutionRegistry } from "./execution-registry.js";
+
+/**
+ * A configured memory source for the live loop (issue #163 / #160 / SC-26
+ * follow-up).
+ *
+ * Bundles a {@link MemoryProvider} — dynamically dispatched through the
+ * interface, so any implementation (including a wrapper) can be held here, the
+ * TS analogue of Rust's object-safe `Arc<dyn MemoryProvider>` — with the
+ * per-turn query policy. When present on {@link HarnessConfig.memory}, the
+ * harness queries the provider each turn in {@link buildContextSources} and
+ * injects the returned items into {@link ContextSources.memory}, which the
+ * production {@link "../context/compaction-adapter.js".StandardCompactionAdapter}
+ * renders into the leading structural System block — alongside guides and
+ * skills, with no consumer-side wrapper. Absent (the default) leaves
+ * `ContextSources.memory` empty, byte-identical to pre-#163 behaviour.
+ */
+export interface MemoryConfig {
+  /** The provider queried each turn. */
+  provider: MemoryProvider;
+  /**
+   * Fixed query text. Absent (the default) uses the current task's
+   * `instruction`, so retrieved memory tracks what the agent is working on.
+   */
+  query?: string;
+  /** Optional domain filter passed to {@link MemoryQuery.domain}. */
+  domain?: string;
+  /**
+   * Minimum relevance score; items below it are dropped. Defaults to
+   * {@link DEFAULT_MIN_RELEVANCE} (0.5), matching {@link MemoryQuery}.
+   */
+  minRelevance: number;
+  /** Maximum number of items injected per turn. Defaults to {@link DEFAULT_MAX_ITEMS} (10). */
+  maxItems: number;
+}
+
+/**
+ * Build a {@link MemoryConfig} from a provider plus optional query-policy
+ * overrides. Defaults the threshold/cap to {@link DEFAULT_MIN_RELEVANCE} (0.5)
+ * and {@link DEFAULT_MAX_ITEMS} (10) — the {@link MemoryQuery} defaults — and
+ * leaves `query`/`domain` unset so the per-turn query falls back to the task
+ * instruction with no domain filter. Mirrors the optional-config idiom used by
+ * the skills wiring.
+ */
+export function memoryConfig(
+  provider: MemoryProvider,
+  opts?: { query?: string; domain?: string; minRelevance?: number; maxItems?: number },
+): MemoryConfig {
+  return {
+    provider,
+    query: opts?.query,
+    domain: opts?.domain,
+    minRelevance: opts?.minRelevance ?? DEFAULT_MIN_RELEVANCE,
+    maxItems: opts?.maxItems ?? DEFAULT_MAX_ITEMS,
+  };
+}
 
 /** Components injected at construction. Mirrors `HarnessConfig` in the spec. */
 export interface HarnessConfig {
@@ -356,6 +412,15 @@ export interface HarnessConfig {
    * Absent (the default) means no skills, byte-identical.
    */
   skills?: SkillCatalog;
+  /**
+   * Optional memory source (issue #163 / #160 / SC-26 follow-up). When set, the
+   * harness queries the provider each turn and injects the returned items into
+   * {@link ContextSources.memory}, rendered into the structural System block
+   * alongside guides + skills. Absent (the default) leaves memory empty,
+   * byte-identical to pre-#163 behaviour. See {@link HarnessBuilder.memory} and
+   * {@link MemoryConfig}.
+   */
+  memory?: MemoryConfig;
   /**
    * Authoritative per-run model sampling/decoding parameters (issue #93). The
    * harness replaces each turn's {@link Context.params} with this value
@@ -590,12 +655,14 @@ export class StandardHarness implements Harness, StrategyExecutor {
    * Build the per-turn {@link ContextSources} threaded into the structural
    * `ContextManager.assemble` seam (issue #115 / SC-26). Carries the tool
    * schemas, the configured guides (guide source + each ACTIVE skill's body),
-   * and — empty for now (memory deferred to #163; composed prompt until the
-   * chunk-provider path is wired) — the remaining slots. An empty result renders
-   * to nothing, so a harness with no sources stays byte-identical to the pre-#115
-   * pass-through.
+   * and merged memory (#163); the composed static prompt populates once the
+   * chunk-provider path is wired. An empty result renders to nothing, so a
+   * harness with no sources stays byte-identical to the pre-#115 pass-through.
    */
-  private buildContextSources(toolSchemas: ModelToolSchema[]): ContextSources {
+  private async buildContextSources(
+    toolSchemas: ModelToolSchema[],
+    taskInstruction: string,
+  ): Promise<ContextSources> {
     // #115 / SC-26 / #9: configured guides reach the model structurally through
     // the assemble seam, not as an ad-hoc User-message prepend.
     const guides: Guide[] = [...(this.config.guides ?? [])];
@@ -605,7 +672,32 @@ export class StandardHarness implements Harness, StrategyExecutor {
     if (this.config.skills) {
       guides.push(...this.config.skills.activeGuides());
     }
-    return { ...emptyContextSources(), guides, tool_schemas: toolSchemas };
+    // #163 / SC-26 follow-up: query the configured memory provider and inject the
+    // relevant items structurally (rendered into the same System block as
+    // guides). The query text defaults to the task instruction, so retrieved
+    // memory tracks the current work; a configured `query` overrides it. A query
+    // error is swallowed (empty memory) — memory is best-effort context, never a
+    // halt. Absent provider leaves memory empty (byte-identical pre-#163 path).
+    const memory: ContextSources["memory"] = [];
+    const memCfg = this.config.memory;
+    if (memCfg) {
+      const query: MemoryQuery = {
+        task_instruction: memCfg.query ?? taskInstruction,
+        domain: memCfg.domain ?? null,
+        session_id: null,
+        min_relevance: memCfg.minRelevance,
+        max_items: memCfg.maxItems,
+      };
+      try {
+        const items = await memCfg.provider.query(query);
+        for (const it of items) {
+          memory.push({ key: it.memory.id.toString(), content: it.memory.content });
+        }
+      } catch {
+        // Swallowed: best-effort context, never a halt.
+      }
+    }
+    return { ...emptyContextSources(), guides, memory, tool_schemas: toolSchemas };
   }
 
   /**
@@ -2957,7 +3049,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
       // carries the rich ContextSources into the structural assemble seam: tool
       // schemas, the configured guides, and each active skill's body. An empty
       // `sources` renders to nothing, so the no-source path stays byte-identical.
-      const sources = this.buildContextSources(toolRegistry.schemas());
+      const sources = await this.buildContextSources(toolRegistry.schemas(), task.instruction);
       const context = await this.config.contextManager.assemble(
         sessionState,
         task,
@@ -4238,6 +4330,11 @@ export class HarnessBuilder {
    *  its `activeGuides()` ride the per-turn sources and `load_skill` is added to
    *  the standard tools. `undefined` (the default) means no skills. */
   private _skills?: SkillCatalog;
+  /** Memory source registered via {@link memory} (issue #163 / SC-26). When set,
+   *  the harness queries the provider each turn and injects the relevant items
+   *  into the structural System block. `undefined` (the default) leaves memory
+   *  empty. */
+  private _memory?: MemoryConfig;
   private _modelParams: ModelParams = ModelParamsSchema.parse({});
   private _autoPersistSessions = false;
   private _promptToolCallFlag?: SharedFlag;
@@ -4577,6 +4674,23 @@ export class HarnessBuilder {
   }
 
   /**
+   * Wire a memory source (issue #163 / #160 / SC-26 follow-up). The harness
+   * queries the provider each turn and injects the relevant memories into the
+   * structural System block — alongside guides + skills via the rich
+   * {@link ContextSources} seam — with no consumer-side context-manager shim.
+   *
+   * Pass a {@link MemoryConfig} (build one with {@link memoryConfig}) to control
+   * the query policy. Without an explicit query text the current task
+   * instruction is used, so retrieved memory tracks what the agent is working
+   * on. Not set (the default) leaves memory empty, byte-identical to pre-#163
+   * behaviour.
+   */
+  memory(cfg: MemoryConfig): this {
+    this._memory = cfg;
+    return this;
+  }
+
+  /**
    * Set the authoritative model sampling/decoding parameters for the whole run
    * (issue #93).
    *
@@ -4855,6 +4969,7 @@ export class HarnessBuilder {
       systemPrompt: this._systemPrompt,
       guides: this._guides,
       skills: this._skills,
+      memory: this._memory,
       modelParams: this._modelParams,
       autoPersistSessions: this._autoPersistSessions,
       prompt_tool_call_flag: this._promptToolCallFlag,

@@ -534,4 +534,16 @@ describe("renderContextBlock", () => {
     };
     expect(renderContextBlock(sources)).toBe("COMPOSED\n\n# g\nGUIDE\n\nMEMORY");
   });
+
+  it("appends memory after guides (#163)", () => {
+    // Mirrors Rust `render_context_block_appends_memory_after_guides`: memory
+    // items render into the SAME structural block, after the guides, as plain
+    // content joined by blank lines.
+    const sources = {
+      ...emptyContextSources(),
+      guides: [{ id: GuideId.of("audit"), content: "AUDIT BODY" }],
+      memory: [{ key: "m1", content: "MEMORY CONTENT" }],
+    };
+    expect(renderContextBlock(sources)).toBe("# audit\nAUDIT BODY\n\nMEMORY CONTENT");
+  });
 });
