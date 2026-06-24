@@ -297,6 +297,13 @@ class ExecutionRegistry:
             # #124 Q1: the evaluator's wire string (a ``SchemaRef``) is the
             # VERIFIER registry key — resolved against the ``verifiers`` map.
             self._check_verifier(ls.evaluator)
+            # The optional eval-phase overrides resolve against the ``agents`` /
+            # ``toolsets`` maps when set; ``None`` ⇒ the worker-agent / global-
+            # catalogue fallback (no validation needed, mirrors Ralph's agent).
+            if ls.eval_agent is not None:
+                self._check_agent(ls.eval_agent)
+            if ls.eval_toolset is not None:
+                self._check_toolset(ls.eval_toolset)
         elif isinstance(ls, RalphConfig):
             self._walk_strategy(ls.inner)
             self._check_agent(ls.agent)

@@ -29,6 +29,7 @@ from spore_core import (
     RunResultSuccess,
     SandboxReadOnlyViolation,
     SandboxViolation,
+    ScriptedMiddleware,
     ScriptedToolRegistry,
     SessionId,
     SessionState,
@@ -486,3 +487,191 @@ async def test_read_only_sandbox_forbids_exec_and_write_paths() -> None:
     # A read resolve delegates to the inner sandbox (returns the path).
     p = await ro.resolve_path("x", "read")
     assert isinstance(p, Path)
+
+
+# ---------------------------------------------------------------------------
+# #151 — eval-phase reviewer context: caller-middleware drop + eval_agent /
+# eval_toolset overrides. #147 — charge the evaluator's turns against the scope.
+#
+# Mirrors the Rust regression tests
+# ``self_verifying_eval_phase_drops_caller_middleware``,
+# ``self_verifying_eval_agent_override_runs_distinct_reviewer``,
+# ``self_verifying_config_eval_overrides_serde`` (#151) and
+# ``self_verifying_charges_evaluator_turns_against_scope`` (#147) in
+# ``rust/crates/spore-core/src/harness.rs``.
+# ---------------------------------------------------------------------------
+
+
+# BLOCKER FIX (#151): the evaluate phase must NOT inherit the caller's approval
+# middleware. A nested review run is non-interactive (the caller never sees its
+# generated session id), so a ``SurfaceToHuman`` BeforeTool decision would pause
+# it with no human able to resume — the reviewer's first tool call would never
+# dispatch and the review half would silently never run. With the caller
+# middleware dropped for the read-only eval phase, the reviewer's read dispatches
+# and the run reaches a verdict.
+async def test_self_verifying_eval_phase_drops_caller_middleware() -> None:
+    from spore_core import (
+        HumanRequestToolApproval,
+        MiddlewareSurfaceToHuman,
+    )
+    from spore_core.middleware import HookPoint
+
+    # Build emits a tool-free FinalResponse (so the BUILD phase, which DOES run
+    # the caller middleware, never trips it); the eval phase (same worker per
+    # Q1c) then issues a read — the call the middleware would have gated.
+    worker = MockAgent(AgentId("build"))
+    worker.push(FinalResponse(content="built", usage=TokenUsage(input_tokens=1, output_tokens=1)))
+    worker.push(
+        ToolCallRequested(
+            calls=[ToolCall(id="c1", name="read_file", input={})],
+            usage=TokenUsage(input_tokens=1, output_tokens=1),
+        )
+    )
+    worker.push(
+        FinalResponse(content="reviewed: PASS", usage=TokenUsage(input_tokens=1, output_tokens=1))
+    )
+
+    # The dispatch count is the discriminator: it only increments if the eval
+    # phase's tool call actually dispatched (i.e. was NOT paused at BeforeTool).
+    reg = ScriptedToolRegistry()
+
+    # The caller's approval middleware: SurfaceToHuman at BeforeTool. Without the
+    # eval-phase drop, it pauses the reviewer's read and the run never dispatches.
+    mw = ScriptedMiddleware()
+    mw.push(
+        HookPoint.BEFORE_TOOL,
+        MiddlewareSurfaceToHuman(
+            request=HumanRequestToolApproval(
+                calls=[ToolCall(id="c1", name="read_file", input={})],
+                risk_level="medium",  # type: ignore[arg-type]
+            )
+        ),
+    )
+
+    cfg = HarnessConfig(
+        agent=worker,
+        tool_registry=reg,
+        sandbox=AllowAllSandbox(),
+        context_manager=NoopContextManager(),
+        termination_policy=AlwaysContinuePolicy(),
+        verifier=ScriptedVerifier([_passed()], max_iterations=3),
+        middleware=mw,
+    )
+    h = StandardHarness(cfg)
+    r = await h.run(HarnessRunOptions(_task()))
+    assert isinstance(r, RunResultSuccess), f"eval phase must run to a verdict, got {r!r}"
+    # Load-bearing: the reviewer's read actually dispatched. With the caller
+    # middleware NOT dropped, the eval phase pauses at BeforeTool BEFORE dispatch
+    # and this count stays 0.
+    assert reg.call_count >= 1, (
+        "eval-phase reviewer tool must dispatch (caller approval middleware must "
+        "be dropped for the read-only review run)"
+    )
+
+
+# The evaluate phase runs the configured ``eval_agent`` (a dedicated reviewer),
+# not the inner worker's agent — so the model reviewing the work is not the one
+# that wrote it (a builder reviewing itself tends to rubber-stamp).
+async def test_eval_agent_override_runs_distinct_reviewer() -> None:
+    from spore_core.execution_registry import ExecutionRegistry
+
+    build = MockAgent(AgentId("build"))
+    build.push(FinalResponse(content="built", usage=TokenUsage(input_tokens=1, output_tokens=1)))
+    reviewer = MockAgent(AgentId("reviewer"))
+    reviewer.push(
+        FinalResponse(content="reviewed", usage=TokenUsage(input_tokens=1, output_tokens=1))
+    )
+
+    # Register the reviewer under the "reviewer" key; ``build`` is folded as the
+    # default (empty-key) worker agent.
+    registry = ExecutionRegistry.empty().into_builder().agent("reviewer", reviewer).build()
+    cfg = HarnessConfig(
+        agent=build,
+        tool_registry=ScriptedToolRegistry(),
+        sandbox=AllowAllSandbox(),
+        context_manager=NoopContextManager(),
+        termination_policy=AlwaysContinuePolicy(),
+        verifier=ScriptedVerifier([_passed()], max_iterations=3),
+        registry=registry,
+    )
+    h = StandardHarness(cfg)
+    simple = SelfVerifyingConfig.simple()
+    strategy = simple.model_copy(update={"eval_agent": "reviewer"})
+    t = Task.new(
+        "implement the thing",
+        SessionId("build-session"),
+        strategy,
+        budget=BudgetLimits(),
+    )
+    r = await h.run(HarnessRunOptions(t))
+    assert isinstance(r, RunResultSuccess), f"expected Success, got {r!r}"
+    # The reviewer ran the evaluate phase exactly once; the builder ran only the
+    # build phase. Without the override the worker would serve BOTH and the
+    # reviewer would never be called.
+    assert reviewer.call_count == 1, "eval_agent reviewer runs the evaluate phase"
+    assert build.call_count == 1, "builder runs only the build phase"
+
+
+# Wire-format contract (cross-language parity): the two optional eval-phase
+# overrides are OMITTED when unset (existing configs stay byte-identical) and
+# serialize as bare string handles in declaration order (evaluator < eval_agent <
+# eval_toolset < behavior) when set, round-tripping intact.
+def test_config_eval_overrides_serde() -> None:
+    bare = SelfVerifyingConfig.simple()
+    bare_dump = bare.model_dump()
+    assert "eval_agent" not in bare_dump, "eval_agent omitted when None"
+    assert "eval_toolset" not in bare_dump, "eval_toolset omitted when None"
+
+    with_ov = bare.model_copy(update={"eval_agent": "reviewer", "eval_toolset": "ro-tools"})
+    dump = with_ov.model_dump()
+    # Bare string handles (not nested objects).
+    assert dump["eval_agent"] == "reviewer", dump
+    assert dump["eval_toolset"] == "ro-tools", dump
+    # Declaration / serialization order locked for parity.
+    keys = list(dump.keys())
+    assert (
+        keys.index("evaluator")
+        < keys.index("eval_agent")
+        < keys.index("eval_toolset")
+        < keys.index("behavior")
+    ), f"field order locked for parity: {keys}"
+    # Round-trips intact through JSON.
+    back = SelfVerifyingConfig.model_validate(json.loads(json.dumps(dump)))
+    assert back == with_ov, "round-trips intact"
+
+
+# #147: the SelfVerifying combinator must charge the evaluator's turns against
+# its budget scope. A 2-iteration loop with build+eval turns passes at a turn
+# cap that includes the eval turns, and budget-exhausts at a cap one below.
+async def _run_sv_two_iters_with_cap(cap: int) -> RunResult:
+    # 2 iterations × (build 1 turn + eval 1 turn) = 4 turns. Same worker serves
+    # both phases (Q1c default), so queue four FinalResponses.
+    worker = MockAgent(AgentId("build"))
+    for content in ("build0", "eval0", "build1", "eval1"):
+        worker.push(
+            FinalResponse(content=content, usage=TokenUsage(input_tokens=1, output_tokens=1))
+        )
+    cfg = HarnessConfig(
+        agent=worker,
+        tool_registry=ScriptedToolRegistry(),
+        sandbox=AllowAllSandbox(),
+        context_manager=NoopContextManager(),
+        termination_policy=AlwaysContinuePolicy(),
+        # iteration 0 fails (retry), iteration 1 passes.
+        verifier=ScriptedVerifier([_failed("retry"), _passed()], max_iterations=3),
+    )
+    h = StandardHarness(cfg)
+    return await h.run(HarnessRunOptions(_task(max_turns=cap)))
+
+
+async def test_self_verifying_charges_evaluator_turns_against_scope() -> None:
+    # With the evaluator turns charged, a cap of 4 just fits → Success; a cap of
+    # 3 is overrun by the second iteration's EVALUATOR turn (the two build turns
+    # alone are only 2, so without charging the evaluator this would wrongly
+    # succeed).
+    fit = await _run_sv_two_iters_with_cap(4)
+    assert isinstance(fit, RunResultSuccess), f"cap=4 should fit all 4 turns, got {fit!r}"
+    exhausted = await _run_sv_two_iters_with_cap(3)
+    assert not isinstance(exhausted, RunResultSuccess), (
+        f"cap=3 must be exhausted once evaluator turns are charged, got {exhausted!r}"
+    )

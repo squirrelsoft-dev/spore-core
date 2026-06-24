@@ -468,9 +468,31 @@ class SelfVerifyingConfig(_Model):
     kind: Literal["self_verifying"] = "self_verifying"
     inner: LoopStrategy
     evaluator: SchemaRef
+    # Optional dedicated reviewer agent for the evaluate phase. None ⇒ the
+    # evaluate phase reuses the inner worker's resolved agent (Q1c default). Set
+    # this to a SEPARATE agent so the reviewer is not the same model that wrote
+    # the code (a builder reviewing its own work tends to rubber-stamp). OMITTED
+    # from the JSON wire when None (existing configs stay byte-identical).
+    eval_agent: AgentRef | None = None
+    # Optional read-only/inspection toolset for the evaluate phase. None ⇒ the
+    # empty handle (global-catalogue fallback), byte-identical to prior behavior.
+    # The evaluate phase already runs on a read-only sandbox; scoping the toolset
+    # to read-only tools additionally prevents the reviewer from reaching
+    # non-filesystem side-effecting tools (web/MCP) the sandbox does not gate.
+    # OMITTED from the JSON wire when None.
+    eval_toolset: ToolsetRef | None = None
     # #129: what this combinator does when its build↔evaluate budget is spent.
     # CANONICAL POSITION on a combinator: the LAST field. Always serialized (Q1).
     behavior: BudgetExhaustedBehavior = Field(default_factory=default_budget_behavior)
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data = handler(self)
+        if self.eval_agent is None:
+            data.pop("eval_agent", None)
+        if self.eval_toolset is None:
+            data.pop("eval_toolset", None)
+        return data
 
     @classmethod
     def simple(cls) -> SelfVerifyingConfig:
@@ -1385,11 +1407,13 @@ class StrategyExecutor(Protocol):
         self,
         task: Task,
         eval_agent: Agent,
+        eval_toolset: ToolsetRef,
         carried: BudgetSnapshot,
         total_usage: AggregateUsage,
     ) -> RunResult:
         """Run the SelfVerifying evaluate phase (#124): a fresh evaluator RUN over
-        a read-only sandbox in a never-shared session, on ``eval_agent``. Folds the
+        a read-only sandbox in a never-shared session, on ``eval_agent``, scoped to
+        ``eval_toolset`` (empty handle ⇒ global-catalogue fallback). Folds the
         run's usage into ``total_usage`` / ``carried``; returns its terminal."""
         ...
 
@@ -2778,11 +2802,20 @@ async def _run_self_verifying_config(
             session_state=SessionState(),
         )
         return await cx._finish(executor, task, result)
-    # Q1c: the evaluate-phase agent defaults to the inner worker's agent.
-    eval_agent = executor.resolve_agent_ref(_worker_agent_key_of(self.inner), build_session_id)
+    # Q1c: the evaluate-phase agent defaults to the inner worker's agent; an
+    # explicit ``eval_agent`` override (a dedicated reviewer, distinct from the
+    # builder) takes precedence.
+    eval_agent_ref = (
+        self.eval_agent if self.eval_agent is not None else _worker_agent_key_of(self.inner)
+    )
+    eval_agent = executor.resolve_agent_ref(eval_agent_ref, build_session_id)
     if isinstance(eval_agent, RunResultFailure):
         cx.stream = on_stream
         return await cx._finish(executor, task, eval_agent)
+    # The evaluate phase runs against ``eval_toolset`` (a read-only/inspection
+    # catalogue) when set; None ⇒ the empty handle (global-catalogue fallback),
+    # byte-identical to pre-override behavior.
+    eval_toolset = self.eval_toolset if self.eval_toolset is not None else ""
 
     max_iterations = verifier.max_iterations()
     total_usage = AggregateUsage()
@@ -2909,7 +2942,60 @@ async def _run_self_verifying_config(
             raise AssertionError(f"unhandled resolution {resolution!r}")
 
         # ── Evaluate phase: a fresh evaluator run on ``eval_agent``.
-        eval_result = await executor.evaluate_phase(task, eval_agent, carried, total_usage)
+        eval_result = await executor.evaluate_phase(
+            task, eval_agent, eval_toolset, carried, total_usage
+        )
+
+        # #147: charge the evaluator's OWN turns against the SelfVerifying scope,
+        # mirroring the build charge above. ``evaluate_phase`` runs the evaluator
+        # in an isolated harness from a fresh ``BudgetSnapshot``, so
+        # ``eval_result.turns`` is the evaluator's standalone turn count — and
+        # ``_fold_usage`` folds it via ``max`` (NOT a sum), so it never reaches
+        # ``carried.turns`` once build turns dominate. Charging the build delta
+        # alone therefore missed the evaluate phase entirely; charge it explicitly
+        # here so both phases count against the budget.
+        if isinstance(eval_result, RunResultSuccess | RunResultFailure | RunResultEscalate):
+            eval_turns = eval_result.turns
+        else:
+            eval_turns = 0
+        eval_charge_err = cx.charge_current(eval_turns)
+        if eval_charge_err is not None:
+            resolution = cx.resolve_current()
+            # A granted ``Continue`` resets the scope and re-runs the
+            # build↔evaluate iteration in-process (mirrors the build path).
+            if resolution == ExhaustedResolution.CONTINUE:
+                continue
+            # SC-5: AutoContinue auto-grants in-process at this Escalate point
+            # (scope still pushed) before surfacing/aborting.
+            if resolution == ExhaustedResolution.ESCALATE and cx.try_auto_continue(
+                executor.escalation_mode()
+            ):
+                continue
+            partial = _self_verifying_partial_json(last_worker_output, last_reason)
+            cx.pop_budget()
+            cx.scratch.task = task
+            cx.stream = on_stream
+            if resolution == ExhaustedResolution.FAIL:
+                return _promote_budget_exhausted(eval_charge_err, None)
+            if resolution == ExhaustedResolution.ESCALATE:
+                from .execution_registry import EscalationModeSurfaceToHuman
+
+                if isinstance(executor.escalation_mode(), EscalationModeSurfaceToHuman):
+                    waiting = _promote_budget_exhausted_to_human(
+                        eval_charge_err,
+                        partial,
+                        _combinator_escalation_actions(eval_charge_err),
+                        build_session_id,
+                        task,
+                        carried.model_copy(deep=True),
+                        carried.turns,
+                        session_state,
+                        _worker_toolset_of(self.inner),
+                    )
+                    return cx._record_terminal(waiting)
+                return _promote_budget_exhausted(eval_charge_err, partial)
+            # Defensive: ``ExhaustedResolution`` is exhausted above.
+            raise AssertionError(f"unhandled resolution {resolution!r}")
 
         verdict = await verifier.verify(
             VerifierInput(
@@ -7992,12 +8078,13 @@ class StandardHarness:
         self,
         task: Task,
         eval_agent: Agent,
+        eval_toolset: ToolsetRef,
         carried: BudgetSnapshot,
         total_usage: AggregateUsage,
     ) -> RunResult:
         """:class:`StrategyExecutor` primitive: the SelfVerifying evaluate phase
         (delegates to :meth:`_run_evaluate_phase`)."""
-        return await self._run_evaluate_phase(task, eval_agent, carried, total_usage)
+        return await self._run_evaluate_phase(task, eval_agent, eval_toolset, carried, total_usage)
 
     async def append_user_message(self, session_state: SessionState, text: str) -> None:
         """:class:`StrategyExecutor` primitive: append ``text`` as a user message
@@ -8418,12 +8505,14 @@ class StandardHarness:
         self,
         task: Task,
         eval_agent: Agent,
+        eval_toolset: ToolsetRef,
         carried: BudgetSnapshot,
         total_usage: AggregateUsage,
     ) -> RunResult:
         """Run the SelfVerifying evaluate phase (issue #61, #124): a fresh
         evaluator RUN over a read-only sandbox in a never-shared session, on the
-        passed ``eval_agent`` (Q1c — the inner worker's resolved agent).
+        passed ``eval_agent`` (Q1c — the inner worker's resolved agent), scoped to
+        ``eval_toolset`` (empty handle ⇒ global-catalogue fallback).
 
         Builds a child :class:`StandardHarness` from a copy of ``self._config``
         with the ``sandbox`` wrapped in a :class:`ReadOnlySandbox` (R3). The
@@ -8466,6 +8555,20 @@ class StandardHarness:
         # distinct session id). The evaluate agent is passed to ``_run_react``
         # directly (#124 — no ``config.agent`` swap).
         eval_config = config.with_sandbox(read_only_sandbox)
+        # The evaluate phase is a NON-INTERACTIVE nested review run: the caller
+        # never sees its (freshly generated) session id, so an approval/HITL
+        # middleware that resolves ``SurfaceToHuman`` would pause this run with no
+        # human able to resume it — the reviewer's first ``read_file`` would yield
+        # ``WaitingForHuman``, which the verifier reads as a misconfiguration, and
+        # the review half would silently never run. The read-only sandbox already
+        # enforces the only safety property a reviewer needs (no writes, no command
+        # execution), so the caller's approval middleware is both redundant and
+        # harmful here — drop it for the evaluate phase ONLY (cleared on this
+        # eval-specific clone, not in ``with_sandbox`` globally). Observability /
+        # pricing / storage seams stay (they are separate fields). Pair with an
+        # ``eval_toolset`` scoped to read-only tools so non-filesystem
+        # side-effecting tools the sandbox does not gate stay out of reach.
+        eval_config.middleware = None
         eval_harness = StandardHarness(eval_config)
 
         eval_state = SessionState()
@@ -8473,7 +8576,7 @@ class StandardHarness:
 
         cap = task.budget.max_turns if task.budget.max_turns is not None else 2**31 - 1
         eval_result = await eval_harness._run_react(
-            eval_task, cap, eval_state, BudgetSnapshot(), None, eval_agent
+            eval_task, cap, eval_state, BudgetSnapshot(), None, eval_agent, eval_toolset
         )
 
         _fold_usage(total_usage, carried, eval_result)
@@ -9214,14 +9317,19 @@ class StandardHarness:
         budget_used: BudgetSnapshot,
         on_stream: StreamSink | None,
         agent: Agent,
+        toolset: ToolsetRef = "",
     ) -> RunResult:
         """Drive the ReAct loop, then finalize observability for terminal
         outcomes. A ``WaitingForHuman`` pause is not terminal, so it is never
         flushed here — the eventual ``resume`` reaches a terminal outcome and
         flushes then. Mirrors Rust's ``run_react`` wrapper. The worker ``agent``
-        is RESOLVED by the caller (#124)."""
+        is RESOLVED by the caller (#124). ``toolset`` is the RESOLVED toolset
+        handle (mirrors ``agent``); the evaluate phase passes its ``eval_toolset``
+        so the reviewer is scoped to read-only tools. The empty handle (the
+        default) ⇒ global-catalogue fallback, as the other ``_run_react`` callers
+        pass."""
         result = await self._run_react_inner(
-            task, max_iterations, session_state, budget_used, on_stream, agent
+            task, max_iterations, session_state, budget_used, on_stream, agent, toolset
         )
         if isinstance(result, RunResultSuccess):
             await self._finalize_observability(result.session_id, SessionOutcomeSuccess())
