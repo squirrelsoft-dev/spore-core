@@ -139,7 +139,7 @@ use thiserror::Error;
 
 use crate::agent::{Agent, AgentError, Context, TurnResult};
 use crate::context::{
-    CompactionPreserveHints, CompactionVerifier, ContextError, KeyTermVerifier,
+    CompactionPreserveHints, CompactionVerifier, ContextError, ContextSources, KeyTermVerifier,
     SessionState as ContextSessionState,
 };
 use crate::execution_registry::{AutoGrantInfo, EscalationMode, ExecutionRegistry};
@@ -5241,7 +5241,18 @@ pub struct CompactionTurn {
 /// managers that do not compact (the default `should_compact` returns `false`)
 /// need not implement them.
 pub trait ContextManager: Send + Sync {
-    fn assemble<'a>(&'a self, session: &'a SessionState, task: &'a Task) -> BoxFut<'a, Context>;
+    /// Build one turn's model input. `sources` (issue #115 / SC-26) carries the
+    /// rich [`ContextSources`] — guides, merged memory, tool schemas, and the
+    /// composed static prompt — so a manager can place them in structural slots
+    /// instead of the caller injecting them ad-hoc as User messages. Managers
+    /// that do not consume sources may ignore the argument (the pre-#115
+    /// behaviour); the production [`StandardCompactionAdapter`] renders them.
+    fn assemble<'a>(
+        &'a self,
+        session: &'a SessionState,
+        task: &'a Task,
+        sources: &'a ContextSources,
+    ) -> BoxFut<'a, Context>;
 
     fn append_tool_result<'a>(
         &'a self,
@@ -7527,6 +7538,18 @@ impl StandardHarness {
         }
     }
 
+    /// Build the per-turn [`ContextSources`] threaded into the structural
+    /// `ContextManager::assemble` seam (issue #115 / SC-26). Slice 1 supplies the
+    /// tool schemas only; guides (guide source + active skills), merged memory,
+    /// and the composed static prompt populate in later slices. An empty result
+    /// renders to nothing, so a harness with no sources stays byte-identical.
+    fn build_context_sources(&self, tool_schemas: Vec<ToolSchema>) -> ContextSources {
+        ContextSources {
+            tool_schemas,
+            ..Default::default()
+        }
+    }
+
     /// Whether a sandbox violation should HALT the run under the configured
     /// [`SandboxViolationPolicy`]: only when the policy is `Halt` AND the
     /// violation is halt-eligible (`PathEscape` / `NetworkViolation`). Layer-2
@@ -8207,11 +8230,16 @@ impl StandardHarness {
                 }
             }
 
-            // Assemble + invoke agent for one turn.
+            // Assemble + invoke agent for one turn. `sources` (issue #115 / SC-26)
+            // carries the rich ContextSources into the structural assemble seam.
+            // Slice 1 threads the seam with tool schemas only; guides/memory/skills
+            // populate in later slices. An empty `sources` renders to nothing, so
+            // the no-source path stays byte-identical.
+            let sources = self.build_context_sources(tool_registry.schemas());
             let mut context = self
                 .config
                 .context_manager
-                .assemble(&session_state, &task)
+                .assemble(&session_state, &task, &sources)
                 .await;
             // Deliver the registry's tool schemas to the model. Tool schemas are
             // owned by the `ToolRegistry`; the harness wires them into the
@@ -12143,6 +12171,7 @@ pub mod testing {
             &'a self,
             session: &'a SessionState,
             _task: &'a Task,
+            _sources: &'a ContextSources,
         ) -> BoxFut<'a, Context> {
             let messages = session.messages.clone();
             Box::pin(async move {
@@ -15191,6 +15220,7 @@ mod tests {
             &'a self,
             session: &'a SessionState,
             _task: &'a Task,
+            _sources: &'a ContextSources,
         ) -> BoxFut<'a, Context> {
             let messages = session.messages.clone();
             Box::pin(async move {
@@ -18779,6 +18809,7 @@ mod tests {
                 &'a self,
                 session: &'a SessionState,
                 _task: &'a Task,
+                _sources: &'a ContextSources,
             ) -> BoxFut<'a, Context> {
                 let messages = session.messages.clone();
                 Box::pin(async move {
@@ -19343,6 +19374,7 @@ mod tests {
             &'a self,
             session: &'a SessionState,
             _task: &'a Task,
+            _sources: &'a ContextSources,
         ) -> BoxFut<'a, Context> {
             let messages = session.messages.clone();
             Box::pin(async move {

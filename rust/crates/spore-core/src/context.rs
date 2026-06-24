@@ -326,7 +326,7 @@ impl SessionState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContextSources {
     pub guides: Vec<Guide>,
     pub memory: Vec<MemoryItem>,

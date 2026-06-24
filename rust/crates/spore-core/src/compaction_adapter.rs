@@ -53,8 +53,8 @@ use std::sync::Arc;
 
 use crate::agent::Context as AgentContext;
 use crate::context::{
-    CompactionResult, ContextManager as RichContextManager, SessionState as RichSessionState,
-    StandardContextManager,
+    CompactionResult, ContextManager as RichContextManager, ContextSources,
+    SessionState as RichSessionState, StandardContextManager,
 };
 use crate::harness::{
     BoxFut, CompactionTurn, ContextManager as HarnessContextManager, SessionState as HarnessState,
@@ -145,6 +145,7 @@ impl<M: ModelInterface + 'static> HarnessContextManager for StandardCompactionAd
         &'a self,
         session: &'a HarnessState,
         _task: &'a Task,
+        _sources: &'a ContextSources,
     ) -> BoxFut<'a, AgentContext> {
         // NOT load-bearing for compaction. The rich `assemble` requires
         // `ContextSources` the seam does not supply, so we produce a minimal

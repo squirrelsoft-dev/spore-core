@@ -227,7 +227,7 @@ impl PromptChunk {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComposedPrompt {
     pub chunks: Vec<PromptChunk>,
     pub block_1_hash: u64,

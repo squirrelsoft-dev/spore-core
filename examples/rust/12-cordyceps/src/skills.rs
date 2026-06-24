@@ -45,9 +45,9 @@ use serde_json::json;
 
 use spore_core::harness::{BoxFut, CompactionTurn, SandboxProvider};
 use spore_core::{
-    AgentContext, Content, HarnessContextManager, HarnessToolResult, Message, RegisteredToolSchema,
-    Role, SessionState, StandardTool, Task, Tool, ToolAnnotations, ToolCall, ToolContext,
-    ToolOutput,
+    AgentContext, ContextSources, Content, HarnessContextManager, HarnessToolResult, Message,
+    RegisteredToolSchema, Role, SessionState, StandardTool, Task, Tool, ToolAnnotations, ToolCall,
+    ToolContext, ToolOutput,
 };
 
 // ============================================================================
@@ -296,9 +296,10 @@ impl HarnessContextManager for SkillInjectingContextManager {
         &'a self,
         session: &'a SessionState,
         task: &'a Task,
+        sources: &'a ContextSources,
     ) -> BoxFut<'a, AgentContext> {
         Box::pin(async move {
-            let mut context = self.inner.assemble(session, task).await;
+            let mut context = self.inner.assemble(session, task, sources).await;
             // Build the injection AFTER the await, so the mutex is never held
             // across a suspension point.
             let mut messages = self.injected_messages();
