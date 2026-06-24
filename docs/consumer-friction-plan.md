@@ -125,6 +125,7 @@ The result: cordyceps carries ~700 lines of `main.rs` that is mostly workarounds
 - *Hook consumers that must keep working:* looper `plan_tracker` seed (`repl.rs:50-55`); cordyceps `plan_announcer` (`main.rs:1169-1173`, reads `plan.tasks`). The relaxation must stay backward-compatible — a JSON plan must still populate `plan.tasks`.
 - *Design note:* `OnTaskAdvance` carries only a `task_index` (flips already-seeded items Done/Active/Pending, `repl.rs:68-78`); panel **texts** come from `plan.tasks`. A free-string artifact with no `tasks` leaves the panel textless.
 - *Acceptance:* (1) markdown plan captures without parse failure; (2) a JSON plan still populates `plan.tasks`; (3) stored `PLAN_EXECUTE_EXTRAS_KEY` still deserializes; (4) looper removes only suppression + re-emission code, seed intact.
+> **LANDED (Rust) — local `main`, not pushed.** Relaxed at ONE seam: `capture_and_persist_plan` (the single funnel for both the `run_plan_phase` test seam and the recursive `PlanExecuteConfig::run` path). On a JSON-capture miss (`capture_plan_artifact_with_repair` fails) the driver no longer returns `PlanPhaseFailed` — it captures a free-text `PlanArtifact { rationale: <verbatim prose>, tasks: <from `load_task_list`, else empty> }`, then fires `OnPlanCreated` + persists exactly as the JSON path does. Tasks are sourced from the `task_list` TOOL store (the ONE authoring path the execute phase already prefers since #126 C — JSON `tasks` were already secondary for execution), so the `OnPlanCreated`/`PLAN_EXECUTE_EXTRAS_KEY` payload keeps `tasks` populated for the panel consumers; a prose plan that authored no `task_list` yields empty `tasks` → `EmptyPlan` (same as JSON `{"tasks":[]}`). **ZERO contract/wire change** — `PlanArtifact { tasks, rationale }` is unchanged (`rationale` carries the prose), so acceptance (3) holds trivially and there is NO struct-literal churn. The pure `capture_plan_artifact` grammar stays STRICT/byte-identical (its 30+ tests untouched); only the harness driver is tolerant. `plan_directive` left intact — JSON is still the default request; prose-first consumers override the plan-leaf prompt via SC-10. Tests: `plan_phase_unparseable_response_fails` → `plan_phase_freetext_response_captures_as_prose`; new `plan_phase_freetext_sources_tasks_from_task_list`. JSON path + all 4 plan/plan_execute fixture-replay suites byte-identical; suite green (1252 lib pass). **LOC-2** (looper-side cleanup) rides the parity port. TS/Py/Go parity **#162**.
 
 **SC-11 — `fire` gets only `&SessionState` (collapses into Q2). Hit by looper. — DONE (Rust) `ca41f8f`.** looper hand-rolls `pending_calls` + `risk_level` (`policy.rs:287-366`). The rich chain's `fire_before_tool(calls: &mut …)` + priority fan-out resolve it; **Q5 moot** (no `DenyOverridesChain`). The loop now hands `&mut calls` to the priority-ordered chain at BeforeTool. *Acceptance:* looper's `decide` consumes harness-supplied calls + risk; derivations deleted. ✅ for the core seam (`before_tool_middleware_mutates_calls_in_priority_order`); the looper-side deletion rides the parity port + looper's own adoption.
 
@@ -176,7 +177,7 @@ The result: cordyceps carries ~700 lines of `main.rs` that is mostly workarounds
 ## 7. Looper-local cleanups
 
 - **LOC-1** — wire parsed `Compat` into the model once SC-27's `with_compat` exists (keep the struct; removal only if SC-27 rejected).
-- **LOC-2** — with SC-28 preserving `tasks`, delete only the `FinalResponse` suppression (`repl.rs:167-173`, `main.rs:210-212`) + `governor::finish` re-emission (`governor.rs:438-441`); seed survives. Lands with SC-28.
+- **LOC-2** — with SC-28 preserving `tasks`, delete only the `FinalResponse` suppression (`repl.rs:167-173`, `main.rs:210-212`) + `governor::finish` re-emission (`governor.rs:438-441`); seed survives. **SC-28 core LANDED (Rust)** — `plan.tasks` stays populated (sourced from `task_list` on the free-text path), so this looper-side deletion is now unblocked; it rides the SC-28 parity port (looper repo, not spore-core).
 - **LOC-3** — unify three arg-extractors into one `str_arg` helper. Minor.
 - **LOC-4** — fold away the `--verify` headless flag (`main.rs:37`).
 - **LOC-5** — decide JSON-vs-TOML config split.
@@ -195,7 +196,7 @@ The result: cordyceps carries ~700 lines of `main.rs` that is mostly workarounds
 | SC-6 | Tier 2 | — | — |
 | SC-8 | "do first" #4 | — | — |
 | SC-9 | — | Tier 1 #2 | — |
-| SC-10 | DONE (Rust) #161 | Tier 1 #1 | partial (SC-28) |
+| SC-10 | DONE (Rust) #161 | Tier 1 #1 | DONE (SC-28) |
 | SC-11 | — | — | #1/#2 (D1) |
 | SC-12 | — | — | #2 |
 | SC-13 | — | — | #3 |
@@ -205,7 +206,7 @@ The result: cordyceps carries ~700 lines of `main.rs` that is mostly workarounds
 | SC-17–25 | Tier 2/3 | — | — |
 | SC-26 | reframed | Tier 2 #6 | — |
 | SC-27 | confirmed | — | Gap A |
-| SC-28 | contract caveat | `plan_announcer` consumer | Gap B |
+| SC-28 | DONE (Rust) #162 | `plan_announcer` consumer | Gap B |
 | SC-29 | DONE #151 | — | Gap D-i |
 | SC-30 | mechanism DONE | — | Gap D-ii |
 | SC-BUG-1 | — | — | #4 |
@@ -219,7 +220,7 @@ The result: cordyceps carries ~700 lines of `main.rs` that is mostly workarounds
 3. **SC-BUG-1** — with the #151 work; it's the resume path the reviewer depends on (SC-30 inert for looper until then). **LANDED (Rust) `8d1d679`; parity #156.**
 4. **Phase 2** (SC-4/5/6/27) — additive, ships alongside Phase 1 (un-gated by Q1). **LANDED (Rust) `f1c0beb`; parity #155.**
 5. **Phase 2.5** (SC-8) — presets, once Phase 1 lands. **LANDED (Rust) `6f39933`; parity #157.** Example migration (the "~40 lines" proof) **DONE 2026-06-24** — `10-hill-climbing` + `12-cordyceps` now build from the presets, live-verified.
-6. **Phase 3** — Q2 canonical-chain adoption (subsumes SC-9 + SC-11) **LANDED (Rust) `ca41f8f`** (parity #158); **SC-26 guides + skills LANDED (Rust) `a061b6d`/`18ed309`/`00b6106`/`2a9b62b`** (parity #159; memory deferred #160); **SC-10 per-leaf system prompt LANDED (Rust)** (parity #161); remaining **SC-28**. **Phase 4/5** as capacity allows.
+6. **Phase 3 — COMPLETE.** Q2 canonical-chain adoption (subsumes SC-9 + SC-11) **LANDED (Rust) `ca41f8f`** (parity #158); **SC-26 guides + skills LANDED (Rust) `a061b6d`/`18ed309`/`00b6106`/`2a9b62b`** (parity #159; memory deferred #160); **SC-10 per-leaf system prompt LANDED (Rust)** (parity #161); **SC-28 free-text/markdown plan LANDED (Rust)** (parity #162). **Phase 4/5** as capacity allows.
 7. **agent-repl-kit** (ARK) + **looper-local** (LOC) — alongside, mostly independent.
 8. **SC-29** — confirm always-drop, port to TS/Py/Go (#151).
 
