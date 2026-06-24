@@ -346,11 +346,16 @@ func TestPlanPhaseToolCallFailsAndStoresNoArtifact(t *testing.T) {
 	}
 }
 
-// R3 (failure path): an unparseable response surfaces PlanPhaseFailed /
-// UnparseablePlan and stores no artifact.
-func TestPlanPhaseUnparseableIsPlanPhaseFailed(t *testing.T) {
+// SC-28 acceptance (1): a free-text / markdown plan no longer fails the plan
+// phase. The strict JSON grammar (+ prose repair) misses, so the driver captures
+// it as a prose artifact instead of aborting: Rationale holds the verbatim prose
+// and Tasks is sourced from the task_list tool store (empty here — the planner
+// authored none). The artifact IS stored (R4/R11 still apply) and round-trips
+// (acceptance 3). Was TestPlanPhaseUnparseableIsPlanPhaseFailed.
+func TestPlanPhaseFreetextResponseCapturesAsProse(t *testing.T) {
+	prose := "This is a markdown plan.\n\n1. do the thing\n2. do the other"
 	a := NewMockAgent("planner")
-	a.Push(planFinal("this is not json"))
+	a.Push(planFinal(prose))
 	store := newFakeRunStore()
 	cfg := standardCfg(a)
 	cfg.RunStore = store
@@ -359,15 +364,76 @@ func TestPlanPhaseUnparseableIsPlanPhaseFailed(t *testing.T) {
 	task := planTask("do")
 	state := SessionState{}
 	outcome, failure := h.runPlanPhase(context.Background(), &task, &state, BudgetSnapshot{}, nil)
-	if outcome != nil || failure == nil {
-		t.Fatalf("expected failure, got outcome=%+v failure=%v", outcome, failure)
+	if failure != nil || outcome == nil {
+		t.Fatalf("a free-text plan captures rather than failing, got outcome=%+v failure=%+v", outcome, failure)
 	}
-	if failure.Reason.Kind != HaltPlanPhaseFailed || failure.Reason.PlanError == nil ||
-		failure.Reason.PlanError.Kind != PlanErrorUnparseablePlan {
-		t.Fatalf("got %+v", failure.Reason)
+	// Prose preserved verbatim; no JSON tasks parsed and no task_list authored.
+	if outcome.artifact.Rationale != prose {
+		t.Fatalf("rationale = %q, want %q", outcome.artifact.Rationale, prose)
 	}
-	if _, ok := store.get(task.SessionID, PlanExecuteExtrasKey); ok {
-		t.Fatal("artifact stored despite unparseable plan")
+	if len(outcome.artifact.Tasks) != 0 {
+		t.Fatalf("tasks = %+v, want empty", outcome.artifact.Tasks)
+	}
+	// R4: the artifact IS stored now (was absent pre-SC-28) and round-trips.
+	stored := storedArtifact(t, store, task.SessionID)
+	if stored.Rationale != outcome.artifact.Rationale || len(stored.Tasks) != len(outcome.artifact.Tasks) {
+		t.Fatalf("stored = %+v, want %+v", stored, outcome.artifact)
+	}
+}
+
+// SC-28 acceptance (1): a markdown plan captures without parse failure AND the
+// OnPlanCreated payload's Tasks are sourced from the task_list tool store (the
+// ONE authoring path) — so panel consumers (looper plan_tracker, cordyceps
+// plan_announcer) still get task texts even though the plan prose is free-text
+// rather than the JSON PlanArtifact. NOTE: a REAL in-memory RunStore is wired
+// here (not the no-op default), or the durable LoadTaskList read would no-op and
+// the test would assert empty tasks while passing.
+func TestPlanPhaseFreetextSourcesTasksFromTaskList(t *testing.T) {
+	prose := "Here's my plan in prose, no JSON object at all."
+	a := NewMockAgent("planner")
+	a.Push(planFinal(prose))
+	store := newFakeRunStore()
+	cfg := standardCfg(a)
+	cfg.RunStore = store
+	h := NewStandardHarness(cfg)
+
+	task := planTask("do")
+
+	// Seed the durable task_list store as if the plan leaf had authored it via the
+	// task_list tool during the plan turn (keyed under the durable namespace,
+	// which with no ProjectNamespace is the session id).
+	seeded := DefaultTaskList()
+	if _, err := seeded.Add("build it", nil); err != nil {
+		t.Fatalf("seed add: %v", err)
+	}
+	if _, err := seeded.Add("test it", nil); err != nil {
+		t.Fatalf("seed add: %v", err)
+	}
+	raw, err := json.Marshal(seeded)
+	if err != nil {
+		t.Fatalf("marshal seeded task list: %v", err)
+	}
+	if err := store.Put(context.Background(), task.SessionID, TaskListExtrasKey, json.RawMessage(raw)); err != nil {
+		t.Fatalf("seed task_list: %v", err)
+	}
+
+	state := SessionState{}
+	outcome, failure := h.runPlanPhase(context.Background(), &task, &state, BudgetSnapshot{}, nil)
+	if failure != nil || outcome == nil {
+		t.Fatalf("markdown plan captures, got outcome=%+v failure=%+v", outcome, failure)
+	}
+	// Tasks pulled from the seeded task_list; prose preserved as rationale.
+	want := []string{"build it", "test it"}
+	if len(outcome.artifact.Tasks) != len(want) || outcome.artifact.Tasks[0] != want[0] || outcome.artifact.Tasks[1] != want[1] {
+		t.Fatalf("tasks = %+v, want %+v", outcome.artifact.Tasks, want)
+	}
+	if outcome.artifact.Rationale != prose {
+		t.Fatalf("rationale = %q, want %q", outcome.artifact.Rationale, prose)
+	}
+	// Stored artifact round-trips (acceptance 3).
+	stored := storedArtifact(t, store, task.SessionID)
+	if stored.Rationale != prose || len(stored.Tasks) != len(want) || stored.Tasks[0] != want[0] || stored.Tasks[1] != want[1] {
+		t.Fatalf("stored = %+v, want tasks=%+v rationale=%q", stored, want, prose)
 	}
 }
 

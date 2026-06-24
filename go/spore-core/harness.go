@@ -4543,22 +4543,41 @@ func planDirective(instruction string) string {
 // turn that produced planOutput ran elsewhere — the recursive c.Plan child via
 // c.Plan.Run — so this carries no agent call. Returns the captured outcome, or a
 // non-nil terminal failure to propagate.
+//
+// SC-28 — a free-text / markdown plan is NOT a hard failure.
+// The strict canonical grammar (+ prose repair) runs first, so a JSON plan
+// captures exactly as before — tasks/rationale come straight from the object.
+// When BOTH fail the planner emitted prose rather than the JSON object; rather
+// than aborting the whole run we capture it as a free-text artifact: the
+// verbatim prose is preserved in Rationale, and the runnable Tasks are sourced
+// from the durable task_list tool store via LoadTaskList — the ONE authoring
+// path (#126 decision C) that the execute phase already prefers over the
+// artifact, so JSON was never the only source of executable steps. Mirroring it
+// here keeps the OnPlanCreated payload's Tasks populated for panel consumers
+// (looper plan_tracker, cordyceps plan_announcer). A prose plan that authored no
+// task_list yields empty Tasks — the execute phase then halts with EmptyPlan,
+// exactly as a JSON {"tasks": []} would. The pure CapturePlanArtifact grammar
+// stays strict and byte-identical across languages; only this harness driver is
+// tolerant.
 func (h *StandardHarness) captureAndPersistPlan(ctx context.Context, sessionID SessionID, planOutput string, usage AggregateUsage, turns uint32) (*planPhaseOutcome, *RunResult) {
 	// R3: capture the artifact from the response text. Uses the prose-repair
 	// fallback: a planner that wraps its plan JSON in prose still captures (the
 	// strict canonical grammar runs first; repair only rescues a failure).
 	artifact, err := CapturePlanArtifactWithRepair(planOutput)
 	if err != nil {
-		pe, ok := err.(*PlanPhaseError)
-		if !ok {
-			pe = newUnparseablePlan(err.Error())
+		// SC-28: not JSON → capture as free-text. Tasks come from the task_list
+		// tool store (LoadTaskList reads the durable, project-scoped list the plan
+		// leaf authored via the tool); prose preserved verbatim.
+		var tasks []string
+		if list, ok := h.LoadTaskList(ctx, sessionID); ok {
+			tasks = make([]string, 0, len(list.Tasks))
+			for _, t := range list.Tasks {
+				tasks = append(tasks, t.Description)
+			}
 		}
-		return nil, &RunResult{
-			Kind:      RunFailure,
-			Reason:    HaltReason{Kind: HaltPlanPhaseFailed, PlanError: pe},
-			SessionID: sessionID,
-			Usage:     usage,
-			Turns:     turns,
+		artifact = PlanArtifact{
+			Tasks:     tasks,
+			Rationale: planOutput,
 		}
 	}
 
