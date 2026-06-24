@@ -51,6 +51,13 @@ import {
   type ToolCall,
   type ToolSchema,
 } from "../model/schemas.js";
+// Issue #11 / Phase 3 (Q2): the rich (canonical) `HookPoint` lives in
+// `../middleware/types.js` (the former harness-local 4-variant stub was
+// deleted). Imported type-only so the `HaltReason` `middleware_halt` variant can
+// reference it; `middleware/types.ts` imports from THIS module, so a value
+// import would create a runtime cycle (ESM tolerates type-only cycles). Also
+// re-exported below under the plain name.
+import type { HookPoint as MiddlewareHookPoint } from "../middleware/types.js";
 
 // ============================================================================
 // Identity newtypes
@@ -4142,7 +4149,7 @@ export interface WorkspaceConfig {
   max_file_size?: number;
 }
 
-export type HookPoint = "before_turn" | "before_tool" | "after_tool" | "before_completion";
+export type { HookPoint, MiddlewareDecision, MiddlewareChain } from "../middleware/types.js";
 
 export type TerminationDecision = { kind: "continue" } | { kind: "halt"; reason: string };
 
@@ -4297,6 +4304,22 @@ export interface ContextManager {
    *  no-op (mirrors the Rust trait's default-no-op method). */
   appendAssistantMessage?(session: SessionState, message: Message): Promise<void>;
 
+  /** Replace the tool-result message previously appended at `messageIndex` with
+   *  a fresh rendering of `result` (issue #11 / SC-9). The harness loop calls
+   *  this from the `AfterTool` middleware hook when a middleware rewrote a
+   *  result in place, so the rewrite reaches the next model turn. `messageIndex`
+   *  is the position in `session.messages` recorded right after the original
+   *  {@link appendToolResult}. OPTIONAL so a manager that does not store tool
+   *  results as standalone messages need not act (the rewrite simply does not
+   *  propagate — the pre-#11 behaviour); the harness calls it via `?.` and
+   *  treats absence as a no-op (mirrors the Rust trait's default-no-op method).
+   *  An out-of-range index must be a defensive no-op. */
+  replaceToolResult?(
+    session: SessionState,
+    messageIndex: number,
+    result: ToolResultRecord,
+  ): Promise<void>;
+
   /** Build the inputs for one compaction turn (issue #46). Returns `undefined`
    *  when there is nothing to compact (e.g. history shorter than the preserve
    *  window), in which case the harness skips compaction entirely. Default
@@ -4329,16 +4352,12 @@ export interface TerminationPolicy {
   evaluate(session: SessionState, budgetUsed: BudgetSnapshot): Promise<TerminationDecision>;
 }
 
-/** Issue #11 — Middleware decision. */
-export type MiddlewareDecision =
-  | { kind: "continue" }
-  | { kind: "continue_with_modification"; calls: ToolCall[] }
-  | { kind: "halt"; reason: string }
-  | { kind: "surface_to_human"; request: HumanRequest };
-
-export interface MiddlewareChain {
-  fire(hook: HookPoint, session: SessionState): Promise<MiddlewareDecision>;
-}
+// Issue #11 / Phase 3 (Q2): the canonical `MiddlewareDecision` type and
+// `MiddlewareChain` interface (the rich, fixtured surface) live in
+// `../middleware/types.js` and are re-exported above. The former harness-local
+// stubs (4-variant `HookPoint`, stub `MiddlewareDecision` carrying a `calls`
+// payload, stub `MiddlewareChain {fire}`) were deleted; the harness loop wires
+// the rich chain's per-hook `fire*` methods directly.
 
 /** Issue #12 — ObservabilityProvider. Re-exported from the canonical
  *  definition in {@link ../observability/types.js} so the harness loop and the
@@ -4657,7 +4676,7 @@ export function loadCheckpoint(blob: string): PausedState {
 export type HaltReason =
   | { kind: "budget_exceeded"; limit_type: BudgetLimitType }
   | { kind: "termination_policy_halt"; reason: string }
-  | { kind: "middleware_halt"; hook: HookPoint; reason: string }
+  | { kind: "middleware_halt"; hook: MiddlewareHookPoint; reason: string }
   | { kind: "agent_error"; error: AgentError }
   /**
    * A {@link ContextError} surfaced by the {@link ContextManager} during

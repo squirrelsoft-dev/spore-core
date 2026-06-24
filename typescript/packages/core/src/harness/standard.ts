@@ -62,6 +62,7 @@ import type {
   Message,
   ModelParams,
   ToolCall,
+  ToolResult as ModelToolResult,
   ToolSchema as ModelToolSchema,
 } from "../model/schemas.js";
 import { ModelParamsSchema } from "../model/schemas.js";
@@ -2815,9 +2816,14 @@ export class StandardHarness implements Harness, StrategyExecutor {
         );
       }
 
-      // Middleware: BeforeTurn
+      // Middleware: BeforeTurn (rich chain, issue #11). The chain may mutate
+      // `sessionState` in place (priority-ordered fan-out); a
+      // `continue_with_modification` is the modified-but-proceed signal.
       if (this.config.middleware) {
-        const decision = await this.config.middleware.fire("before_turn", sessionState);
+        const decision = await this.config.middleware.fireBeforeTurn(
+          sessionState,
+          budgetUsed.turns,
+        );
         switch (decision.kind) {
           case "continue":
           case "continue_with_modification":
@@ -2848,6 +2854,21 @@ export class StandardHarness implements Harness, StrategyExecutor {
             };
             return { kind: "waiting_for_human", state: ps, request: decision.request };
           }
+          // `force_another_turn` is valid only at `before_completion`; the
+          // StandardMiddlewareChain converts it to `halt` here. Handle it
+          // defensively as a halt for any custom/scripted chain that emits it raw.
+          case "force_another_turn":
+            return failure(
+              {
+                kind: "middleware_halt",
+                hook: "before_turn",
+                reason: `ForceAnotherTurn not valid at before_turn: ${decision.inject}`,
+              },
+              sessionId,
+              usage,
+              budgetUsed.turns,
+              sessionState,
+            );
           default: {
             const _exhaustive: never = decision;
             return _exhaustive;
@@ -3049,13 +3070,32 @@ export class StandardHarness implements Harness, StrategyExecutor {
             }
           }
 
-          // Middleware: BeforeCompletion
+          // Middleware: BeforeCompletion (rich chain, issue #11).
           if (this.config.middleware) {
-            const d = await this.config.middleware.fire("before_completion", sessionState);
+            const d = await this.config.middleware.fireBeforeCompletion(
+              result.content,
+              budgetUsed.turns,
+              sessionState,
+            );
             switch (d.kind) {
               case "continue":
               case "continue_with_modification":
                 break;
+              // The chain concatenates every middleware's injection into one
+              // `force_another_turn` (issue #11). Record the model's final text,
+              // then the injection as a user message, and force another turn
+              // instead of completing — the same channel the prose-escalation /
+              // Stop-block breaker uses, so the conversation stays well-formed
+              // (assistant final text → user injection).
+              case "force_another_turn": {
+                const assistant: Message = {
+                  role: "assistant",
+                  content: { type: "text", text: result.content },
+                };
+                await this.config.contextManager.appendAssistantMessage?.(sessionState, assistant);
+                await this.config.contextManager.appendUserMessage(sessionState, d.inject);
+                continue;
+              }
               case "halt":
                 return failure(
                   { kind: "middleware_halt", hook: "before_completion", reason: d.reason },
@@ -3278,15 +3318,19 @@ export class StandardHarness implements Harness, StrategyExecutor {
             await this.config.contextManager.appendAssistantMessage?.(sessionState, msg);
           }
 
-          // Middleware: BeforeTool
-          let calls = result.calls;
+          // Middleware: BeforeTool (rich chain, issue #11 / SC-11). The chain
+          // mutates `calls` IN PLACE via a priority-ordered fan-out;
+          // `continue_with_modification` is the modified-but-proceed signal (NOT
+          // a payload carrying replacement calls — that was the deleted stub).
+          // Clone the call list off the model's request so the assistant turn
+          // recorded just above keeps the model's ORIGINAL request — only what is
+          // dispatched changes.
+          const calls = [...result.calls];
           if (this.config.middleware) {
-            const d = await this.config.middleware.fire("before_tool", sessionState);
+            const d = await this.config.middleware.fireBeforeTool(calls, budgetUsed.turns);
             switch (d.kind) {
               case "continue":
-                break;
               case "continue_with_modification":
-                calls = d.calls;
                 break;
               case "halt":
                 return failure(
@@ -3314,6 +3358,21 @@ export class StandardHarness implements Harness, StrategyExecutor {
                 };
                 return { kind: "waiting_for_human", state: ps, request: d.request };
               }
+              // `force_another_turn` is valid only at `before_completion`; the
+              // StandardMiddlewareChain converts it to `halt` here. Defensive for
+              // a custom/scripted chain that emits it raw.
+              case "force_another_turn":
+                return failure(
+                  {
+                    kind: "middleware_halt",
+                    hook: "before_tool",
+                    reason: `ForceAnotherTurn not valid at before_tool: ${d.inject}`,
+                  },
+                  sessionId,
+                  usage,
+                  budgetUsed.turns,
+                  sessionState,
+                );
               default: {
                 const _exhaustive: never = d;
                 return _exhaustive;
@@ -3322,6 +3381,13 @@ export class StandardHarness implements Harness, StrategyExecutor {
           }
 
           const approvedResults: ToolResultRecord[] = [];
+          // SC-9: the `sessionState.messages` index of each appended tool result,
+          // recorded 1:1 with `approvedResults`. The AfterTool middleware hook
+          // uses these to re-render any result it rewrites in place (via
+          // {@link ContextManager.replaceToolResult}). Captured at append time so
+          // it survives the #137 corrective-message interleaving (re-sync, not
+          // defer-append).
+          const resultMsgIndices: number[] = [];
           for (let i = 0; i < calls.length; i++) {
             const call = calls[i]!;
             // Sandbox validation
@@ -3353,6 +3419,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
                 content: `sandbox: ${violation.kind}`,
               });
               await this.config.contextManager.appendToolResult(sessionState, tr);
+              resultMsgIndices.push(Math.max(0, sessionState.messages.length - 1));
               approvedResults.push(tr);
               continue;
             }
@@ -3718,6 +3785,10 @@ export class StandardHarness implements Harness, StrategyExecutor {
               content: resultContentForStream,
             });
             await this.config.contextManager.appendToolResult(sessionState, tr);
+            // SC-9: capture the result's message index BEFORE any corrective
+            // user message is interleaved (#137), so the AfterTool re-sync
+            // addresses the tool result itself.
+            resultMsgIndices.push(Math.max(0, sessionState.messages.length - 1));
             approvedResults.push(tr);
 
             // #137 (AC2): inject the ONE corrective user message at the N
@@ -3730,17 +3801,62 @@ export class StandardHarness implements Harness, StrategyExecutor {
             }
           }
 
-          // Middleware: AfterTool
+          // Middleware: AfterTool (rich chain, issue #11 / SC-9). The chain
+          // receives the batch's results as a mutable array and may rewrite any
+          // of them in place (priority-ordered, descending). On
+          // `continue_with_modification`, re-render the affected tool-result
+          // messages so the rewrite reaches the next model turn — this is what
+          // lets an after-tool middleware turn a landed write into a model-visible
+          // error (or vice versa) without the tool itself having to invert its
+          // output (the cordyceps `build_check` inversion, done by the harness).
           if (this.config.middleware) {
-            const d = await this.config.middleware.fire("after_tool", sessionState);
-            if (d.kind === "halt") {
-              return failure(
-                { kind: "middleware_halt", hook: "after_tool", reason: d.reason },
-                sessionId,
-                usage,
-                budgetUsed.turns,
-                sessionState,
-              );
+            // Project the harness-loop results onto the model-facing shape the
+            // rich hook mutates; keep the originals 1:1 so the fold-back addresses
+            // each by index.
+            const modelResults = approvedResults.map(toModelToolResult);
+            const d = await this.config.middleware.fireAfterTool(calls, modelResults);
+            switch (d.kind) {
+              case "continue":
+                break;
+              case "continue_with_modification":
+                for (let i = 0; i < approvedResults.length; i++) {
+                  const original = approvedResults[i]!;
+                  const folded = fromModelToolResult(original, modelResults[i]!);
+                  approvedResults[i] = folded;
+                  const idx = resultMsgIndices[i];
+                  if (idx !== undefined) {
+                    await this.config.contextManager.replaceToolResult?.(sessionState, idx, folded);
+                  }
+                }
+                break;
+              case "halt":
+                return failure(
+                  { kind: "middleware_halt", hook: "after_tool", reason: d.reason },
+                  sessionId,
+                  usage,
+                  budgetUsed.turns,
+                  sessionState,
+                );
+              // `surface_to_human` / `force_another_turn` are not valid at
+              // `after_tool`; the StandardMiddlewareChain converts them to `halt`.
+              // Defensive for a custom/scripted chain that emits one raw.
+              case "surface_to_human":
+              case "force_another_turn":
+                return failure(
+                  {
+                    kind: "middleware_halt",
+                    hook: "after_tool",
+                    reason: `illegal AfterTool decision: ${d.kind}`,
+                  },
+                  sessionId,
+                  usage,
+                  budgetUsed.turns,
+                  sessionState,
+                );
+              default: {
+                const _exhaustive: never = d;
+                return _exhaustive;
+              }
             }
           }
 
@@ -4612,6 +4728,40 @@ function emit(sink: StreamSink | undefined, event: Parameters<StreamSink>[0]): v
   if (sink) sink(event);
 }
 
+/**
+ * Project a harness-loop {@link ToolResultRecord} onto the model-facing
+ * {@link ModelToolResult} the rich `AfterTool` middleware hook (issue #11)
+ * operates on (`{ tool_use_id, content, is_error }`). Non-text outputs
+ * (waiting/escalate/clarification/consult) never reach the AfterTool hook (the
+ * loop pauses/terminates first), so they render as an empty, non-error body
+ * defensively. Mirrors the Rust reference, where both shapes are the same type.
+ */
+function toModelToolResult(record: ToolResultRecord): ModelToolResult {
+  switch (record.output.kind) {
+    case "success":
+      return { tool_use_id: record.call_id, content: record.output.content, is_error: false };
+    case "error":
+      return { tool_use_id: record.call_id, content: record.output.message, is_error: true };
+    default:
+      return { tool_use_id: record.call_id, content: "", is_error: false };
+  }
+}
+
+/**
+ * Fold a (possibly middleware-mutated) {@link ModelToolResult} back into a
+ * harness-loop {@link ToolResultRecord} so the loop re-renders the recorded
+ * tool-result message via {@link ContextManager.replaceToolResult} (SC-9). An
+ * `is_error` result becomes a recoverable {@link ToolOutput} `error`; otherwise
+ * a non-truncated `success`. The `call_id` is preserved from the original record
+ * (the middleware addresses results by `tool_use_id`, which the loop seeds 1:1).
+ */
+function fromModelToolResult(record: ToolResultRecord, mutated: ModelToolResult): ToolResultRecord {
+  const output: ToolOutput = mutated.is_error
+    ? { kind: "error", message: mutated.content, recoverable: true }
+    : { kind: "success", content: mutated.content, truncated: false };
+  return { call_id: record.call_id, output };
+}
+
 function failure(
   reason: HaltReason,
   sessionId: SessionId,
@@ -4674,7 +4824,10 @@ function budgetExceeded(
   return null;
 }
 
-// Hook point set (helper for completeness, not required by the loop).
+// The subset of the rich {@link HookPoint} union the ReAct loop actually fires
+// (issue #11 / Phase 3 Q2). `before_session` / `after_session` are DEFERRED —
+// not wired by the loop (needs a single-exit refactor of the run loop), so they
+// are intentionally absent here even though the rich union defines them.
 export const HOOK_POINTS: readonly HookPoint[] = [
   "before_turn",
   "before_tool",

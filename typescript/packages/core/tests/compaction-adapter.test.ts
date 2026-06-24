@@ -42,6 +42,7 @@ import {
   type SessionState as HarnessSessionState,
   type StreamEvent,
   type Task,
+  type ToolResultRecord,
   type TurnResult,
   cacheProvider as cacheNs,
   context as contextNs,
@@ -290,6 +291,37 @@ function task(): Task {
     toolset: "",
   });
 }
+
+// ---- replaceToolResult (SC-9 in-place AfterTool rewrite, issue #11) ---------
+
+describe("StandardCompactionAdapter — replaceToolResult (issue #11 / SC-9)", () => {
+  it("replace_tool_result_rerenders_the_recorded_message", async () => {
+    const adapter = new StandardCompactionAdapter(richManager());
+    const state = emptySessionState();
+    const original: ToolResultRecord = {
+      call_id: "c1",
+      output: { kind: "success", content: "ORIGINAL", truncated: false },
+    };
+    await adapter.appendToolResult(state, original);
+    const idx = state.messages.length - 1;
+    expect(state.messages[idx]!.content).toEqual({ type: "text", text: "ORIGINAL" });
+
+    // A middleware rewrote the result; re-render the recorded message.
+    const rewritten: ToolResultRecord = {
+      call_id: "c1",
+      output: { kind: "error", message: "REWRITTEN", recoverable: true },
+    };
+    await adapter.replaceToolResult(state, idx, rewritten);
+    expect(state.messages.length, "no message added on replace").toBe(1);
+    expect(state.messages[idx]!.role).toBe("tool");
+    expect(state.messages[idx]!.content).toEqual({ type: "text", text: "REWRITTEN" });
+
+    // Out-of-range index is a defensive no-op.
+    await adapter.replaceToolResult(state, 99, original);
+    expect(state.messages.length).toBe(1);
+    expect(state.messages[idx]!.content).toEqual({ type: "text", text: "REWRITTEN" });
+  });
+});
 
 describe("StandardCompactionAdapter — end-to-end through the seam (issue #55)", () => {
   it("drives a real compaction turn that shrinks the session", async () => {

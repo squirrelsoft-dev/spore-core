@@ -19,6 +19,7 @@ import {
   Timeout,
   emptyBudgetSnapshot,
   emptySessionState,
+  middleware,
   newTask,
   type Agent,
   type Context,
@@ -32,7 +33,9 @@ import {
   type Task,
   type TokenUsage,
   type ToolCall,
+  type ToolOutput,
   type ToolResultRecord,
+  type ToolSchema,
   type TurnResult,
 } from "../src/index.js";
 
@@ -858,5 +861,221 @@ describe("Harness — modelParams threading (#93)", () => {
 
     // And it carries its own instruction.
     expect(ctxText(agent.seen[3]!)).toContain("summarize findings");
+  });
+});
+
+// ── Phase 3 / Q2 (#158): the rich middleware chain is wired into the loop ────
+//
+// These exercise the wired StandardMiddlewareChain (not the ScriptedMiddleware
+// double) end-to-end through the loop: SC-9 (AfterTool rewrites a result in
+// place), SC-11 (BeforeTool mutates calls in place + priority fan-out), and the
+// BeforeCompletion force_another_turn injection the former harness stub lacked.
+
+type RichMiddleware = middleware.Middleware;
+type RichHookContext = middleware.HookContext;
+type RichHookPoint = middleware.HookPoint;
+type RichDecision = middleware.MiddlewareDecision;
+const { StandardMiddlewareChain } = middleware;
+
+describe("Harness — rich middleware chain wired into the loop (#158)", () => {
+  /**
+   * Context manager that stores each tool result as a `role:"tool"` text message
+   * AND honours `replaceToolResult` — so a SC-9 in-place rewrite is observable in
+   * the post-run session_state.
+   */
+  class ReplaceRecordingCm implements ContextManager {
+    private static render(output: ToolOutput): string {
+      switch (output.kind) {
+        case "success":
+          return output.content;
+        case "error":
+          return output.message;
+        default:
+          return "";
+      }
+    }
+    async assemble(session: SessionState, _task: Task): Promise<Context> {
+      return { messages: session.messages.slice(), tools: [], params: { stop_sequences: [] } };
+    }
+    async appendToolResult(session: SessionState, result: ToolResultRecord): Promise<void> {
+      const text = ReplaceRecordingCm.render(result.output);
+      session.messages.push({ role: "tool", content: { type: "text", text } });
+    }
+    async replaceToolResult(
+      session: SessionState,
+      messageIndex: number,
+      result: ToolResultRecord,
+    ): Promise<void> {
+      if (messageIndex < 0 || messageIndex >= session.messages.length) return;
+      const text = ReplaceRecordingCm.render(result.output);
+      session.messages[messageIndex] = { role: "tool", content: { type: "text", text } };
+    }
+    async appendAssistantMessage(session: SessionState, message: Message): Promise<void> {
+      session.messages.push(message);
+    }
+    async appendUserMessage(session: SessionState, text: string): Promise<void> {
+      session.messages.push({ role: "user", content: { type: "text", text } });
+    }
+    shouldCompact(_session: SessionState): boolean {
+      return false;
+    }
+  }
+
+  /** AfterTool middleware that rewrites the first result's output in place. */
+  class RewriteFirstResultMw implements RichMiddleware {
+    constructor(private readonly to: string) {}
+    async handle(ctx: RichHookContext): Promise<RichDecision> {
+      if (ctx.kind === "after_tool" && ctx.results.length > 0) {
+        const r = ctx.results[0]!;
+        r.content = this.to;
+        r.is_error = true;
+        return { kind: "continue_with_modification" };
+      }
+      return { kind: "continue" };
+    }
+    hooks(): RichHookPoint[] {
+      return ["after_tool"];
+    }
+    name(): string {
+      return "rewrite_first_result";
+    }
+  }
+
+  // SC-9: an AfterTool middleware rewrites a result; the rewrite reaches the
+  // conversation the next model turn sees (the cordyceps build_check inversion,
+  // done by the harness instead of the tool returning a fake error).
+  it("after_tool_middleware_rewrites_result_in_place", async () => {
+    const a = makeAgent();
+    a.push(tcr(toolCall("c1")));
+    a.push(fr("done"));
+    const cfg = standardConfig(a);
+    cfg.contextManager = new ReplaceRecordingCm();
+    cfg.toolRegistry = new ScriptedToolRegistry().push({ kind: "success", content: "ORIGINAL" });
+    const chain = new StandardMiddlewareChain();
+    chain.register(new RewriteFirstResultMw("REWRITTEN"));
+    cfg.middleware = chain;
+    const h = new StandardHarness(cfg);
+    const r = await h.run({ task: react(5) });
+    expect(r.kind).toBe("success");
+    if (r.kind !== "success") throw new Error("expected success");
+    const toolTexts = r.session_state.messages
+      .filter((m) => m.role === "tool" && m.content.type === "text")
+      .map((m) => (m.content.type === "text" ? m.content.text : ""));
+    expect(toolTexts, `got ${JSON.stringify(toolTexts)}`).toContain("REWRITTEN");
+    expect(toolTexts).not.toContain("ORIGINAL");
+  });
+
+  /** Tool registry that records every dispatched call and echoes success. */
+  class RecordingToolRegistry implements ToolRegistry {
+    readonly seen: ToolCall[] = [];
+    async dispatch(call: ToolCall): Promise<ToolOutput> {
+      this.seen.push(call);
+      return { kind: "success", content: "ok" };
+    }
+    isAlwaysHalt(_name: string): boolean {
+      return false;
+    }
+    schemas(): ToolSchema[] {
+      return [];
+    }
+  }
+
+  /** BeforeTool middleware that appends `tag` to `calls[0].input.trace` in place,
+   *  at the given priority. */
+  class TraceTagMw implements RichMiddleware {
+    constructor(
+      private readonly tag: string,
+      private readonly prio: number,
+    ) {}
+    async handle(ctx: RichHookContext): Promise<RichDecision> {
+      if (ctx.kind === "before_tool" && ctx.calls.length > 0) {
+        const first = ctx.calls[0]!;
+        const obj = (first.input ?? {}) as Record<string, unknown>;
+        const trace = Array.isArray(obj.trace) ? (obj.trace as unknown[]) : [];
+        trace.push(this.tag);
+        obj.trace = trace;
+        first.input = obj;
+        return { kind: "continue_with_modification" };
+      }
+      return { kind: "continue" };
+    }
+    hooks(): RichHookPoint[] {
+      return ["before_tool"];
+    }
+    priority(): number {
+      return this.prio;
+    }
+    name(): string {
+      // Distinct names so the chain accepts both registrations.
+      return this.prio <= 1 ? "trace_first" : "trace_second";
+    }
+  }
+
+  // SC-11: BeforeTool middleware mutates the dispatched calls IN PLACE, and the
+  // chain fans out in priority order (ascending for a before-hook). The lower
+  // priority runs first, so the dispatched call carries ["first","second"].
+  it("before_tool_middleware_mutates_calls_in_priority_order", async () => {
+    const a = makeAgent();
+    a.push(tcr(toolCall("c1")));
+    a.push(fr("done"));
+    const cfg = standardConfig(a);
+    const reg = new RecordingToolRegistry();
+    cfg.toolRegistry = reg;
+    const chain = new StandardMiddlewareChain();
+    // Register out of order to prove the chain sorts by priority, not insertion.
+    chain.register(new TraceTagMw("second", 2));
+    chain.register(new TraceTagMw("first", 1));
+    cfg.middleware = chain;
+    const h = new StandardHarness(cfg);
+    const r = await h.run({ task: react(5) });
+    expect(r.kind).toBe("success");
+    expect(reg.seen.length, "exactly one tool dispatched").toBe(1);
+    const input = reg.seen[0]!.input as Record<string, unknown>;
+    expect(input.trace).toEqual(["first", "second"]);
+  });
+
+  /** BeforeCompletion middleware that forces ONE extra turn, then lets the run
+   *  complete. */
+  class ForceOnceMw implements RichMiddleware {
+    private fired = false;
+    constructor(private readonly inject: string) {}
+    async handle(ctx: RichHookContext): Promise<RichDecision> {
+      if (ctx.kind === "before_completion" && !this.fired) {
+        this.fired = true;
+        return { kind: "force_another_turn", inject: this.inject };
+      }
+      return { kind: "continue" };
+    }
+    hooks(): RichHookPoint[] {
+      return ["before_completion"];
+    }
+    name(): string {
+      return "force_once";
+    }
+  }
+
+  // BeforeCompletion force_another_turn: the chain injects a follow-up and the
+  // loop runs another turn instead of completing — behaviour the former harness
+  // stub could not express. The injection lands as a user message and the run
+  // completes on the SECOND final response.
+  it("before_completion_force_another_turn_runs_extra_turn", async () => {
+    const a = makeAgent();
+    a.push(fr("first"));
+    a.push(fr("second"));
+    const cfg = standardConfig(a);
+    cfg.contextManager = new ReplaceRecordingCm();
+    const chain = new StandardMiddlewareChain();
+    chain.register(new ForceOnceMw("keep going"));
+    cfg.middleware = chain;
+    const h = new StandardHarness(cfg);
+    const r = await h.run({ task: react(5) });
+    expect(r.kind).toBe("success");
+    if (r.kind !== "success") throw new Error("expected success");
+    expect(r.output, "the forced second turn must win").toBe("second");
+    expect(r.turns, "exactly one extra turn was forced").toBe(2);
+    const injected = r.session_state.messages.some(
+      (m) => m.role === "user" && m.content.type === "text" && m.content.text === "keep going",
+    );
+    expect(injected, "the force_another_turn injection must be recorded").toBe(true);
   });
 });

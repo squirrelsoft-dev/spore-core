@@ -162,6 +162,21 @@ export class StandardCompactionAdapter implements HarnessContextManager {
     session.messages.push({ role: "tool", content: { type: "text", text } });
   }
 
+  // SC-9: an `AfterTool` middleware may rewrite a result in place (issue #11).
+  // Re-render the already-appended `role:"tool"` message at `messageIndex` so the
+  // rewrite reaches the next model turn. Out-of-range indices are ignored
+  // defensively (the loop only passes indices it recorded right after
+  // `appendToolResult`).
+  async replaceToolResult(
+    session: HarnessState,
+    messageIndex: number,
+    result: ToolResultRecord,
+  ): Promise<void> {
+    if (messageIndex < 0 || messageIndex >= session.messages.length) return;
+    const text = renderToolOutput(result);
+    session.messages[messageIndex] = { role: "tool", content: { type: "text", text } };
+  }
+
   async appendAssistantMessage(session: HarnessState, message: Message): Promise<void> {
     // Record the assistant's turn (text and/or requested tool calls) so the
     // next assemble() reflects what the agent already did. Mirrors

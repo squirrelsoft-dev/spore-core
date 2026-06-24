@@ -5,9 +5,10 @@
 
 import type { Context } from "../agent/types.js";
 import type { Agent } from "../agent/interface.js";
-import type { ToolCall, ToolSchema } from "../model/schemas.js";
+import type { ToolCall, ToolResult, ToolSchema } from "../model/schemas.js";
 import type { Verifier } from "../verifier/types.js";
 import type { MetricEvaluator } from "../metric/types.js";
+import type { Middleware } from "../middleware/types.js";
 
 import type { VcsLogArgs, VcsProvider } from "./vcs.js";
 import { ExecutionRegistry } from "./execution-registry.js";
@@ -17,8 +18,10 @@ import type {
   HookPoint,
   MiddlewareChain,
   MiddlewareDecision,
+  RunResult,
   SandboxProvider,
   SandboxViolation,
+  SessionId,
   SessionState,
   Task,
   TerminationDecision,
@@ -206,18 +209,65 @@ export class ScriptedTerminationPolicy implements TerminationPolicy {
   }
 }
 
+/**
+ * Scripted {@link MiddlewareChain} test double (rich surface, issue #11).
+ * Decisions are queued per hook via {@link ScriptedMiddleware.push}; each
+ * `fire*` method pops the front entry if it targets that hook, else returns
+ * `continue`. Unlike {@link StandardMiddlewareChain}, scripted decisions are
+ * returned RAW (no `validateDecision`), so a test can exercise the harness's
+ * defensive handling of an out-of-place decision. The `.push(hook, decision)`
+ * API is stable across the stub→rich migration.
+ */
 export class ScriptedMiddleware implements MiddlewareChain {
   private readonly decisions: [HookPoint, MiddlewareDecision][] = [];
+
   push(hook: HookPoint, d: MiddlewareDecision): this {
     this.decisions.push([hook, d]);
     return this;
   }
-  async fire(hook: HookPoint, _session: SessionState): Promise<MiddlewareDecision> {
+
+  /** Pop and return the scripted decision for `hook` if it is at the front of
+   *  the queue, else `continue`. */
+  private nextFor(hook: HookPoint): MiddlewareDecision {
     const front = this.decisions[0];
     if (front && front[0] === hook) {
       this.decisions.shift();
       return front[1];
     }
     return { kind: "continue" };
+  }
+
+  // The double scripts decisions directly; registration is a no-op.
+  register(_middleware: Middleware): void {
+    void _middleware;
+  }
+
+  async fireBeforeSession(_task: Task, _sessionId: SessionId): Promise<MiddlewareDecision> {
+    return this.nextFor("before_session");
+  }
+
+  async fireBeforeTurn(_session: SessionState, _turnNumber: number): Promise<MiddlewareDecision> {
+    return this.nextFor("before_turn");
+  }
+
+  async fireBeforeTool(_calls: ToolCall[], _turnNumber: number): Promise<MiddlewareDecision> {
+    return this.nextFor("before_tool");
+  }
+
+  async fireAfterTool(_calls: ToolCall[], _results: ToolResult[]): Promise<MiddlewareDecision> {
+    return this.nextFor("after_tool");
+  }
+
+  async fireBeforeCompletion(
+    _response: string,
+    _turnNumber: number,
+    _state: SessionState,
+  ): Promise<MiddlewareDecision> {
+    return this.nextFor("before_completion");
+  }
+
+  async fireAfterSession(_result: RunResult, _sessionId: SessionId): Promise<void> {
+    // After hooks ignore the decision; drain a scripted after_session entry.
+    void this.nextFor("after_session");
   }
 }
