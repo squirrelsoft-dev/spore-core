@@ -542,6 +542,19 @@ type HarnessBuilder struct {
 	// satisfies the harness-side RunStore interface, threads it through so the
 	// task_list / plan / Ralph checkpoint persist under the project id.
 	projectNamespace sporecore.SessionID
+	// escalationMode is the HITL-vs-AFK escalation knob (#120/#155) threaded onto
+	// HarnessConfig.EscalationMode at build time. The zero value (empty Kind) is
+	// left unset, so HarnessConfig.EffectiveEscalationMode defaults it to
+	// SurfaceToHuman — byte-for-byte today's behaviour. The SC-8 autonomous
+	// presets set it to AutoContinueEscalation; a consumer overrides the whole
+	// policy via EscalationMode(..). See EscalationMode.
+	escalationMode sporecore.EscalationMode
+	// metricEvaluator is the optional scoring evaluator (#124/SC-8) registered in
+	// the built config's ExecutionRegistry under the default ("") handle, where
+	// the HillClimbing loop strategy resolves it. nil (the default) registers
+	// nothing. Set via MetricEvaluator (or the hill_climber preset). See
+	// MetricEvaluator.
+	metricEvaluator sporecore.MetricEvaluator
 }
 
 // NewHarnessBuilder starts a builder from the five required components.
@@ -860,6 +873,28 @@ func (b *HarnessBuilder) AutoPersistSessions(enabled bool) *HarnessBuilder {
 	return b
 }
 
+// EscalationMode selects the HITL-vs-AFK escalation mode (#120/#155) threaded
+// onto the built config's EscalationMode: whether a spent step budget surfaces
+// to a human (SurfaceToHumanEscalation, the default), proceeds without bound
+// (AutonomousEscalation), or auto-continues a capped number of times
+// (AutoContinueEscalation — what the SC-8 autonomous presets default to).
+// Returns the receiver for fluent chaining.
+func (b *HarnessBuilder) EscalationMode(mode sporecore.EscalationMode) *HarnessBuilder {
+	b.escalationMode = mode
+	return b
+}
+
+// MetricEvaluator registers the scoring evaluator the HillClimbing loop strategy
+// requires (#124/SC-8) under the built config's default ("") evaluator handle —
+// the handle a HillClimbing task with an empty Evaluator ref resolves. Pass an
+// already-bridged sporecore.MetricEvaluator (e.g. metric.AsHarnessMetricEvaluator
+// over a metric.MetricEvaluator). nil leaves the registry untouched. Returns the
+// receiver for fluent chaining.
+func (b *HarnessBuilder) MetricEvaluator(evaluator sporecore.MetricEvaluator) *HarnessBuilder {
+	b.metricEvaluator = evaluator
+	return b
+}
+
 // foldCatalogueRegistry folds every accumulated catalogue tool into a fresh,
 // populated *StandardToolRegistry via Register() (a last-wins upsert) and returns
 // it, or nil when no catalogue tools were added. Mirrors the Rust builder's
@@ -949,6 +984,16 @@ func (b *HarnessBuilder) BuildConfig() sporecore.HarnessConfig {
 		if rs, ok := runStore.(sporecore.RunStore); ok {
 			cfg.RunStore = rs
 		}
+	}
+	// #120/#155: thread the explicit escalation mode (left unset → the config's
+	// EffectiveEscalationMode defaults it to SurfaceToHuman).
+	if b.escalationMode.Kind != "" {
+		cfg = cfg.WithEscalationMode(b.escalationMode)
+	}
+	// #124/SC-8: register the scoring evaluator under the default ("") handle so a
+	// HillClimbing task with an empty Evaluator ref resolves it.
+	if b.metricEvaluator != nil {
+		cfg = cfg.WithRegistryMetricEvaluator("", b.metricEvaluator)
 	}
 	if b.provider != nil {
 		cfg.Observability = NewHarnessObserverWithContent(b.provider, b.pricing, b.content)
