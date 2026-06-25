@@ -126,6 +126,10 @@ pub struct OllamaModelInterface {
     /// `/api/show`-discovered metadata (context length + capabilities); empty
     /// `ModelMeta` when discovery failed but availability succeeded.
     model_checked: Arc<OnceCell<ModelMeta>>,
+    /// SC-16 once-guard: set the first time a requested `think` flag is dropped
+    /// because the model lacks the `"thinking"` capability, so the warning is
+    /// emitted once per client instead of every turn.
+    thinking_unsupported_warned: std::sync::atomic::AtomicBool,
 }
 
 /// `/api/show`-discovered metadata for the model. Populated once, alongside the
@@ -181,6 +185,7 @@ impl OllamaModelInterface {
             context_window_override: None,
             http_client: Arc::new(Self::default_http_client()),
             model_checked: Arc::new(OnceCell::new()),
+            thinking_unsupported_warned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -682,16 +687,24 @@ fn build_request(
     }
 }
 
-/// Drop the request-side `think: true` flag when the model can't reason.
-/// Sending `think` to a non-thinking model returns an Ollama 400, so — like the
+/// Drop the request-side `think` flag when the model can't reason. Sending
+/// `think` to a non-thinking model returns an Ollama 400, so — like the
 /// tool-capability guard — we fail closed: reasoning requested on a model whose
 /// `/api/show` `capabilities` omit `"thinking"` (or whose metadata is
-/// unavailable) silently no-ops rather than erroring. Leaves `think` untouched
-/// when it was never set.
-fn gate_thinking(body: &mut OllamaRequest, meta: &ModelMeta) {
+/// unavailable) no-ops rather than erroring. Leaves `think` untouched when it
+/// was never set.
+///
+/// Returns `true` when a requested flag was actually dropped, so the caller can
+/// surface a one-time warning (SC-16: the drop is no longer silent). The model
+/// layer has no [`ObservabilityProvider`](crate::observability) handle, so the
+/// signal is an `eprintln!` (the house library-warning facade) rather than a
+/// typed `WarnSpan`.
+fn gate_thinking(body: &mut OllamaRequest, meta: &ModelMeta) -> bool {
     if body.think.is_some() && !meta.supports_thinking() {
         body.think = None;
+        return true;
     }
+    false
 }
 
 fn system_message(content: String) -> OllamaMessage {
@@ -934,6 +947,25 @@ async fn map_status_error(resp: reqwest::Response, model_id: &str) -> ModelError
 // ModelInterface impl
 // ============================================================================
 
+impl OllamaModelInterface {
+    /// SC-16: surface a one-time warning when a requested `think` flag was
+    /// dropped because the model lacks the `"thinking"` capability. Guarded by
+    /// an atomic so it fires once per client, not every turn.
+    fn warn_thinking_unsupported_once(&self) {
+        if !self
+            .thinking_unsupported_warned
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!(
+                "[spore-core] reasoning requested but Ollama model '{}' lacks the \
+                 'thinking' capability — the think flag was dropped; the request \
+                 proceeds without reasoning",
+                self.model_id
+            );
+        }
+    }
+}
+
 impl ModelInterface for OllamaModelInterface {
     fn call<'a>(&'a self, request: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
         Box::pin(async move {
@@ -946,7 +978,9 @@ impl ModelInterface for OllamaModelInterface {
             &request,
             false,
         );
-        gate_thinking(&mut body, meta);
+        if gate_thinking(&mut body, meta) {
+            self.warn_thinking_unsupported_once();
+        }
         let url = format!("{}/api/chat", self.base_url);
         let encoded = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
             code: 0,
@@ -987,7 +1021,9 @@ impl ModelInterface for OllamaModelInterface {
             &request,
             true,
         );
-        gate_thinking(&mut body, meta);
+        if gate_thinking(&mut body, meta) {
+            self.warn_thinking_unsupported_once();
+        }
         let url = format!("{}/api/chat", self.base_url);
         let encoded = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
             code: 0,
@@ -1680,7 +1716,9 @@ mod tests {
                 context_length: None,
                 capabilities: vec!["completion".into()],
             };
-            gate_thinking(&mut body, &meta);
+            // SC-16: gate_thinking signals the drop so the caller can warn.
+            let dropped = gate_thinking(&mut body, &meta);
+            assert!(dropped, "drop must be signalled to the caller");
             assert_eq!(body.think, None, "think must be dropped without capability");
         }
     }
@@ -1694,11 +1732,30 @@ mod tests {
             context_length: None,
             capabilities: vec!["thinking".into()],
         };
-        gate_thinking(&mut body, &meta);
+        // SC-16: nothing dropped ⇒ no warning signal.
+        let dropped = gate_thinking(&mut body, &meta);
+        assert!(!dropped, "no drop ⇒ no signal when capability present");
         assert_eq!(
             body.think,
             Some(OllamaThink::Level("max")),
             "think must survive with capability"
+        );
+    }
+
+    #[test]
+    fn gate_thinking_no_signal_when_think_never_requested() {
+        // No reasoning requested at all: the flag was never set, nothing to drop,
+        // no warning signal (SC-16).
+        let r = req(vec![user("hi")]);
+        let mut body = build_request("llama3.2", &None, None, &r, false);
+        assert_eq!(body.think, None);
+        let meta = ModelMeta {
+            context_length: None,
+            capabilities: vec!["completion".into()],
+        };
+        assert!(
+            !gate_thinking(&mut body, &meta),
+            "unset think must not signal a drop"
         );
     }
 
