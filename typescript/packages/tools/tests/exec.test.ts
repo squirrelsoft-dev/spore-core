@@ -76,6 +76,25 @@ describe("ExecTool", () => {
     expect(r.recoverable).toBe(true);
   });
 
+  // SC-15: a missing binary becomes an exec_spawn_failed sandbox violation
+  // (via the default executeCommand spawn-error path), carried TYPED to the
+  // harness as a `sandbox_violation` ToolOutput — NOT a fake exit_code: -1
+  // success. The harness's default SandboxViolationPolicy makes it recoverable.
+  it.runIf(IS_UNIX)("missing binary is a typed spawn failure", async () => {
+    const sb = new AllowAllSandbox();
+    const r = await new ExecTool().execute(
+      call("exec", { command: "spore-definitely-no-such-binary-xyz" }),
+      sb,
+      ctx,
+    );
+    expect(r.kind).toBe("sandbox_violation");
+    if (r.kind !== "sandbox_violation") throw new Error("unreachable");
+    expect(r.violation.kind).toBe("exec_spawn_failed");
+    if (r.violation.kind === "exec_spawn_failed") {
+      expect(r.violation.command).toBe("spore-definitely-no-such-binary-xyz");
+    }
+  });
+
   it.runIf(IS_UNIX)(
     "timeout returns recoverable error",
     async () => {

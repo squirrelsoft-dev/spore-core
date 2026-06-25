@@ -4395,15 +4395,25 @@ export type SandboxViolation =
   | { kind: "read_only_violation"; path: string }
   | { kind: "file_size_exceeded"; path: string; size: number; limit: number }
   | { kind: "disallowed_command"; command: string }
-  | { kind: "network_violation"; host: string };
+  | { kind: "network_violation"; host: string }
+  /**
+   * The process could not be spawned at all (e.g. the command binary does not
+   * exist, or the OS refused the spawn). SC-15: reported as a typed violation
+   * rather than a fake `CommandOutput { exit_code: -1 }`, so "the command ran
+   * and exited -1" and "the command never started" are no longer conflated.
+   * Always recoverable (never halt-eligible). A genuine timeout keeps its
+   * `CommandOutput { exit_code: -1, timed_out: true }` — only never-started
+   * spawn failures become this variant.
+   */
+  | { kind: "exec_spawn_failed"; command: string; message: string };
 
 /**
  * The halt-ELIGIBLE Layer-1 violations: a path escaping the workspace root or a
  * blocked network host. Whether such a violation actually halts the run is
  * governed by {@link SandboxViolationPolicy}; under the default (`recoverable`)
  * even these are fed back to the model. The Layer-2 variants (`path_denied`,
- * `read_only_violation`, …) are never halt-eligible — they are always
- * recoverable regardless of policy.
+ * `read_only_violation`, `exec_spawn_failed`, …) are never halt-eligible — they
+ * are always recoverable regardless of policy.
  */
 export function sandboxViolationIsAlwaysHalt(v: SandboxViolation): boolean {
   return v.kind === "path_escape" || v.kind === "network_violation";
@@ -4483,6 +4493,42 @@ export type DangerousIsolationMode = { kind: "none" } & {
  */
 export type AnyIsolationMode = IsolationMode | DangerousIsolationMode;
 
+/**
+ * Process-execution hardening knobs for {@link WorkspaceScopedSandbox} `executeCommand`
+ * (SC-12). `undefined` on {@link WorkspaceConfig.exec_config} keeps the legacy
+ * behavior: the child inherits the parent's stdin and full environment, no
+ * implicit timeout is applied, and a cancelled/aborted exec leaves the child.
+ * Setting it tightens subprocess execution — the hardening the looper coding
+ * agent needs so build/test commands fail fast on a prompt instead of hanging,
+ * and aborted processes are reaped.
+ */
+export interface ExecConfig {
+  /**
+   * Timeout (milliseconds) applied when the per-call `timeoutMs` argument is
+   * absent. The per-call value always wins; this is the floor for callers that
+   * pass no timeout. `undefined` leaves such commands un-timed (legacy).
+   */
+  default_timeout?: number;
+  /**
+   * Redirect the child's stdin from the null device so a command that blocks
+   * reading input fails fast (EOF) instead of hanging on the inherited terminal.
+   */
+  close_stdin?: boolean;
+  /**
+   * Environment variables forced onto every child (e.g. `GIT_TERMINAL_PROMPT=0`,
+   * `DEBIAN_FRONTEND=noninteractive`, `CI=1`) on top of the inherited
+   * environment, so would-be interactive prompts turn into non-interactive
+   * failures. Applied in sorted-key order (deterministic, mirroring Rust's
+   * `BTreeMap`).
+   */
+  non_interactive_env?: Record<string, string>;
+  /**
+   * Kill the child if the exec is cancelled/aborted (e.g. an outer
+   * {@link AbortSignal}, or the timeout firing) instead of orphaning it.
+   */
+  kill_on_drop?: boolean;
+}
+
 /** Configuration consumed by `WorkspaceScopedSandbox`. */
 export interface WorkspaceConfig {
   /** Workspace root. Canonicalized at construction. */
@@ -4499,6 +4545,21 @@ export interface WorkspaceConfig {
   read_only?: boolean;
   /** Max file size (bytes) for reads. `0` disables. */
   max_file_size?: number;
+  /**
+   * Optional process-execution hardening (SC-12). `undefined` keeps the legacy
+   * inherit-stdin / no-timeout / inherit-env / leak-on-abort behavior.
+   */
+  exec_config?: ExecConfig;
+  /**
+   * Optional narrower boundary for write operations (SC-13). When set, writes
+   * must resolve under `write_root` while reads (and execute) may range over the
+   * wider {@link root} — "read-everywhere, write-scoped". `undefined` gates
+   * writes by `root` exactly like reads (the legacy single-root behavior). Path
+   * strings stay root-relative for both reads and writes; only the boundary
+   * check tightens (it is NOT a second join base). Canonicalized at construction
+   * and must exist; typically a subdirectory of `root`.
+   */
+  write_root?: string;
 }
 
 export type { HookPoint, MiddlewareDecision, MiddlewareChain } from "../middleware/types.js";

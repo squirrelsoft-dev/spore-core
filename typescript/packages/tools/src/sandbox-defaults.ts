@@ -80,6 +80,20 @@ export async function defaultExecuteCommand(
     child.on("error", (err) => {
       if (timer) clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", onAbort);
+      // SC-15: a genuine spawn failure (the binary never started) is a typed
+      // violation, not a fake `exit_code: -1` success. A timeout/abort is a real
+      // run that exceeded the clock / was cancelled — it KEEPS the legacy
+      // `CommandOutput { exit_code: -1, timed_out }` (only never-started spawns
+      // become the violation). Callers already narrow the union.
+      const code = (err as NodeJS.ErrnoException).code;
+      if (!timedOut && !aborted && (code === "ENOENT" || code === "EACCES")) {
+        resolve({
+          kind: "exec_spawn_failed",
+          command,
+          message: String(err),
+        });
+        return;
+      }
       resolve({
         stdout,
         stderr: stderr + String(err),
@@ -197,7 +211,8 @@ export function isSandboxViolation(v: unknown): v is SandboxViolation {
     k === "read_only_violation" ||
     k === "file_size_exceeded" ||
     k === "disallowed_command" ||
-    k === "network_violation"
+    k === "network_violation" ||
+    k === "exec_spawn_failed"
   );
 }
 

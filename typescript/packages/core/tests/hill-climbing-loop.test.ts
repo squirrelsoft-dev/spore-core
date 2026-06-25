@@ -23,6 +23,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   AgentId,
+  GitVcsProvider,
   SessionId,
   StandardHarness,
   newTask,
@@ -37,6 +38,7 @@ import {
   type TokenUsage,
   type ToolCall,
   type TurnResult,
+  type VcsProvider,
 } from "../src/index.js";
 import type { MetricError, MetricEvaluator, MetricOutcome } from "../src/metric/types.js";
 import type { SessionStateSnapshot } from "../src/termination/types.js";
@@ -179,6 +181,24 @@ class RecordingSandbox implements SandboxProvider {
     return this.commands.filter(
       (c) => c.command === "git" && c.args.join(" ") === "reset --hard HEAD",
     ).length;
+  }
+}
+
+/**
+ * A {@link VcsProvider} that spies on `revert()` calls (SC-14). Used to prove the
+ * HillClimbing revert routes through a wired provider instead of the hardcoded
+ * git fallback. `log`/`status` return empty strings.
+ */
+class SpyVcsProvider implements VcsProvider {
+  reverts = 0;
+  async log(): Promise<string> {
+    return "";
+  }
+  async status(): Promise<string> {
+    return "";
+  }
+  async revert(): Promise<void> {
+    this.reverts += 1;
   }
 }
 
@@ -365,6 +385,35 @@ describe("HillClimbing loop strategy (issue #60)", () => {
       ),
     });
     expect(sandbox.revertCount()).toBe(0);
+  });
+
+  // SC-14: when a VcsProvider is wired, the revert routes THROUGH it and the
+  // hardcoded git-reset fallback does NOT fire.
+  it("SC-14 revert routes through a wired VcsProvider; the git fallback stays silent", async () => {
+    const agent = new AlwaysDoneAgent(AgentId.of("a"));
+    const evaluator = new ScriptedMetricEvaluator([2.0, 3.0], "minimize");
+    const sandbox = new RecordingSandbox();
+    const vcs = new SpyVcsProvider();
+    const h = new StandardHarness(
+      config(agent, { metricEvaluator: evaluator, sandbox, vcsProvider: vcs }),
+    );
+    await h.run({
+      task: task(
+        hcStrategy({ direction: "minimize", max_stagnation: 1, revert_on_no_improvement: true }),
+      ),
+    });
+    expect(vcs.reverts).toBe(1);
+    // The hardcoded git-reset fallback must NOT fire when a provider is wired.
+    expect(sandbox.revertCount()).toBe(0);
+  });
+
+  // SC-14: GitVcsProvider.revert issues `git reset --hard HEAD` through the
+  // sandbox (the behavior relocated out of the harness).
+  it("SC-14 GitVcsProvider.revert issues git reset --hard HEAD through the sandbox", async () => {
+    const sandbox = new RecordingSandbox();
+    const provider = new GitVcsProvider(sandbox, "/work");
+    await provider.revert();
+    expect(sandbox.revertCount()).toBe(1);
   });
 
   it("strict min_delta boundary: an improvement of EXACTLY min_delta is NOT progress → discarded", async () => {

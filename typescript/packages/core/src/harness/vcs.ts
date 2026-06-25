@@ -55,6 +55,19 @@ export interface VcsProvider {
 
   /** Return the working-tree status (e.g. `git status` stdout), verbatim. */
   status(): Promise<string>;
+
+  /**
+   * Revert the working tree to the last known-good state (SC-14). Called by the
+   * HillClimbing loop to discard a no-improvement iteration's changes. OPTIONAL
+   * (the additive-default analogue of Rust's defaulted trait method): a provider
+   * that has no concept of revert — or whose workspace is not under version
+   * control — simply omits it, and HillClimbing falls back to its hardcoded git
+   * reset. {@link GitVcsProvider} implements it with `git reset --hard HEAD`
+   * THROUGH the sandbox; a consumer climbing a non-git workspace (or one whose
+   * "checkpoint" means something else) supplies its own. Best-effort: an error
+   * is surfaced but does not halt the climb.
+   */
+  revert?(): Promise<void>;
 }
 
 /**
@@ -126,6 +139,16 @@ export class GitVcsProvider implements VcsProvider {
 
   async status(): Promise<string> {
     return this.run(["status"]);
+  }
+
+  /**
+   * Revert the working tree with `git reset --hard HEAD` THROUGH the sandbox
+   * (SC-14) — never spawned directly. Relocated from the harness's hardcoded
+   * HillClimbing revert. Reuses {@link run}, which rejects with a {@link VcsError}
+   * on a sandbox refusal or non-zero exit.
+   */
+  async revert(): Promise<void> {
+    await this.run(["reset", "--hard", "HEAD"]);
   }
 
   private async run(argv: string[]): Promise<string> {

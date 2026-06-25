@@ -2735,12 +2735,26 @@ export class StandardHarness implements Harness, StrategyExecutor {
   // --------------------------------------------------------------------------
 
   /**
-   * Revert the working tree to current HEAD for a no-improvement iteration
-   * (issue #60, D1). Runs `git reset --hard HEAD` THROUGH the sandbox; the
-   * harness NEVER spawns git directly. A sandbox rejection / non-zero exit is
-   * best-effort: the loop continues (the next agent turn re-derives state).
+   * Revert the working tree for a no-improvement iteration (issue #60, D1).
+   * SC-14: when a {@link VcsProvider} with a `revert` is wired it OWNS the revert
+   * (e.g. {@link GitVcsProvider} runs `git reset --hard HEAD`, a custom provider
+   * does whatever its workspace needs); with no such provider (the default) the
+   * harness falls back to the original hardcoded `git reset --hard HEAD` THROUGH
+   * the sandbox — byte-identical to the pre-SC-14 behavior. Either way the
+   * harness NEVER spawns git directly, and the revert is best-effort: an error /
+   * non-zero exit is swallowed and the loop continues (the next agent turn
+   * re-derives state).
    */
   private async hillClimbingRevert(signal?: AbortSignal): Promise<void> {
+    const vcs = this.config.vcsProvider;
+    if (vcs?.revert != null) {
+      try {
+        await vcs.revert();
+      } catch {
+        // Best-effort — swallow exactly like the Rust impl.
+      }
+      return;
+    }
     const exec = this.config.sandbox.executeCommand;
     if (exec == null) return;
     try {

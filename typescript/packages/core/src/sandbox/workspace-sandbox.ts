@@ -26,6 +26,7 @@ import type { ToolCall } from "../model/schemas.js";
 import type {
   AnyIsolationMode,
   CommandOutput,
+  ExecConfig,
   FileRef,
   IsolationMode,
   Operation,
@@ -43,7 +44,14 @@ import type {
 export class BuildError extends Error {
   readonly name = "BuildError";
   constructor(
-    readonly kind: "root_not_found" | "root_not_canonical" | "root_io",
+    readonly kind:
+      | "root_not_found"
+      | "root_not_canonical"
+      | "root_io"
+      // SC-13: an optional `write_root` was supplied but does not exist / could
+      // not be canonicalized.
+      | "write_root_not_found"
+      | "write_root_io",
     readonly path: string,
     message: string,
   ) {
@@ -111,6 +119,10 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
   private readonly readOnly: boolean;
   private readonly maxFileSize: number;
   private readonly mode: AnyIsolationMode;
+  /** SC-13: canonical narrower write boundary, or `null` for legacy single-root. */
+  private readonly writeRoot: string | null;
+  /** SC-12: process-execution hardening knobs, or `null` for legacy behavior. */
+  private readonly execConfig: ExecConfig | null;
 
   /**
    * Construct a sandbox with the given isolation mode.
@@ -172,6 +184,34 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
     // `{ kind: "none" }` mode is injected by `unsafeWithMode`, which emits the
     // warning itself.
     this.mode = mode ?? { kind: "workspace_scoped" };
+
+    // SC-12: process-execution hardening knobs (or null for legacy behavior).
+    this.execConfig = config.exec_config ?? null;
+
+    // SC-13: canonicalize the optional write_root the same way as the root so
+    // the boundary check compares canonical paths. It must exist — a missing or
+    // unreadable write_root is a construction error.
+    if (config.write_root != null) {
+      try {
+        if (!existsSync(config.write_root)) {
+          throw new BuildError(
+            "write_root_not_found",
+            config.write_root,
+            `workspace write_root does not exist: ${config.write_root}`,
+          );
+        }
+        this.writeRoot = realpathSync(config.write_root);
+      } catch (e) {
+        if (e instanceof BuildError) throw e;
+        throw new BuildError(
+          "write_root_io",
+          config.write_root,
+          `workspace write_root io error: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    } else {
+      this.writeRoot = null;
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -240,8 +280,14 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
       }
     }
 
-    // 3. Boundary check.
-    if (!pathStartsWith(canonical, this.root)) {
+    // 3. Boundary check. Reads and execute must stay under the read `root`;
+    //    writes must stay under `writeRoot` when set (SC-13: read-everywhere,
+    //    write-scoped). The path string was already joined onto `root` above —
+    //    `writeRoot` only narrows where the resolved write target may land, it
+    //    is NOT a separate join base — so a write under `root` but outside
+    //    `writeRoot` is a PathEscape.
+    const boundary = operation === "write" && this.writeRoot != null ? this.writeRoot : this.root;
+    if (!pathStartsWith(canonical, boundary)) {
       return { kind: "path_escape", path: canonical };
     }
 
@@ -327,12 +373,34 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
         };
     }
 
-    return new Promise<CommandOutput>((resolveFn) => {
+    // SC-12: apply exec-hardening knobs when configured. The per-call timeout
+    // always wins; `default_timeout` is the floor for callers that pass none.
+    const ec = this.execConfig;
+    const effectiveTimeoutMs = timeoutMs ?? ec?.default_timeout ?? null;
+    // `non_interactive_env` is forced onto the inherited environment in sorted
+    // key order (deterministic, mirroring Rust's BTreeMap iteration).
+    let childEnv: NodeJS.ProcessEnv | undefined;
+    if (ec?.non_interactive_env != null) {
+      const nie = ec.non_interactive_env;
+      childEnv = { ...process.env };
+      for (const key of Object.keys(nie).sort()) {
+        childEnv[key] = nie[key];
+      }
+    }
+    // `close_stdin` redirects the child's stdin to the null device (`"ignore"`)
+    // so an input-blocked command hits EOF instead of hanging.
+    const stdio: ["ignore" | "inherit", "pipe", "pipe"] | undefined = ec?.close_stdin
+      ? ["ignore", "pipe", "pipe"]
+      : undefined;
+
+    return new Promise<CommandOutput | SandboxViolation>((resolveFn) => {
       const controller = new AbortController();
       const child = spawn(command, args as string[], {
         cwd: cwd ?? this.root,
         shell: false,
         signal: controller.signal,
+        ...(childEnv != null ? { env: childEnv } : {}),
+        ...(stdio != null ? { stdio } : {}),
       });
 
       let stdout = "";
@@ -345,19 +413,33 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
         if (timer) clearTimeout(timer);
         if (signal) signal.removeEventListener("abort", onAbort);
       };
+      // SC-12: `kill_on_drop` reaps the child when the exec is cancelled/timed
+      // out. `controller.abort()` already kills the spawned process; with the
+      // knob set we additionally SIGKILL to guarantee the child cannot outlive
+      // the aborted exec (instead of being orphaned).
+      const abortChild = (): void => {
+        controller.abort();
+        if (ec?.kill_on_drop) {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // Child may already be gone — nothing to reap.
+          }
+        }
+      };
       const onAbort = (): void => {
         aborted = true;
-        controller.abort();
+        abortChild();
       };
       if (signal) {
         if (signal.aborted) onAbort();
         else signal.addEventListener("abort", onAbort, { once: true });
       }
-      if (timeoutMs != null && timeoutMs > 0) {
+      if (effectiveTimeoutMs != null && effectiveTimeoutMs > 0) {
         timer = setTimeout(() => {
           timedOut = true;
-          controller.abort();
-        }, timeoutMs);
+          abortChild();
+        }, effectiveTimeoutMs);
       }
 
       child.stdout?.on("data", (chunk: Buffer) => {
@@ -368,10 +450,20 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
       });
       child.on("error", (err) => {
         cleanup();
+        // SC-15: a genuine spawn failure (the binary never started) is a typed
+        // violation, not a fake `exit_code: -1` success. A timeout/abort is a
+        // real run that exceeded the clock / was cancelled — it KEEPS the legacy
+        // `CommandOutput { exit_code: -1, timed_out }` (only never-started spawns
+        // become the violation). Callers already narrow the union.
+        const code = (err as NodeJS.ErrnoException).code;
+        if (!timedOut && !aborted && (code === "ENOENT" || code === "EACCES")) {
+          resolveFn({ kind: "exec_spawn_failed", command, message: String(err) });
+          return;
+        }
         resolveFn({
           stdout,
           stderr: timedOut
-            ? `command timed out after ${Math.round((timeoutMs ?? 0) / 1000)}s`
+            ? `command timed out after ${Math.round((effectiveTimeoutMs ?? 0) / 1000)}s`
             : stderr + (stderr ? "" : String(err)),
           exit_code: -1,
           timed_out: timedOut,

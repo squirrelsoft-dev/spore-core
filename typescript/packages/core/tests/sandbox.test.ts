@@ -3,7 +3,7 @@
  * `rust/crates/spore-core/src/sandbox.rs#tests`.
  */
 
-import { mkdtempSync, realpathSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, realpathSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 import {
   BuildError,
   WorkspaceScopedSandbox,
+  sandboxViolationIsAlwaysHalt,
   type IsolationMode,
   type SandboxViolation,
   type WorkspaceConfig,
@@ -249,6 +250,12 @@ describe("SandboxViolation variants — discriminated union", () => {
     { kind: "file_size_exceeded", path: "/p", size: 1024, limit: 100 },
     { kind: "disallowed_command", command: "rm" },
     { kind: "network_violation", host: "evil" },
+    // SC-15: typed spawn failure.
+    {
+      kind: "exec_spawn_failed",
+      command: "no-such-bin",
+      message: "spawn no-such-bin ENOENT",
+    },
   ];
   for (const c of cases) {
     it(`round-trips ${c.kind}`, () => {
@@ -256,4 +263,180 @@ describe("SandboxViolation variants — discriminated union", () => {
       expect(back).toEqual(c);
     });
   }
+});
+
+// --------------------------------------------------------------------------
+// SC-15 — typed spawn failure (not a fake exit_code: -1)
+// --------------------------------------------------------------------------
+
+describe("executeCommand spawn failure (SC-15)", () => {
+  const IS_UNIX = process.platform !== "win32";
+
+  it.runIf(IS_UNIX)("a missing binary yields exec_spawn_failed, never halt-eligible", async () => {
+    const sb = new WorkspaceScopedSandbox(cfg(tmp()));
+    const out = await sb.executeCommand("spore-definitely-no-such-binary-xyz", []);
+    expect("kind" in out).toBe(true);
+    const v = out as SandboxViolation;
+    expect(v.kind).toBe("exec_spawn_failed");
+    if (v.kind === "exec_spawn_failed") {
+      expect(v.command).toBe("spore-definitely-no-such-binary-xyz");
+      expect(typeof v.message).toBe("string");
+    }
+    // Layer-2: always recoverable feedback, never halt-eligible.
+    expect(sandboxViolationIsAlwaysHalt(v)).toBe(false);
+  });
+
+  it.runIf(IS_UNIX)(
+    "a timeout keeps the legacy CommandOutput { exit_code: -1, timed_out }",
+    async () => {
+      const sb = new WorkspaceScopedSandbox(cfg(tmp()));
+      const out = await sb.executeCommand("sleep", ["5"], null, 50);
+      // A real run that exceeded the clock is NOT converted to exec_spawn_failed.
+      if ("kind" in out) throw new Error("timeout must not be a spawn failure");
+      expect(out.timed_out).toBe(true);
+      expect(out.exit_code).toBe(-1);
+    },
+    15000,
+  );
+});
+
+// --------------------------------------------------------------------------
+// SC-12 — ExecConfig exec-hardening knobs
+// --------------------------------------------------------------------------
+
+describe("ExecConfig exec-hardening (SC-12)", () => {
+  const IS_UNIX = process.platform !== "win32";
+
+  function execCfg(root: string, exec_config: WorkspaceConfig["exec_config"]): WorkspaceConfig {
+    return { root, exec_config };
+  }
+
+  it.runIf(IS_UNIX)(
+    "default_timeout applies when the per-call timeout is absent",
+    async () => {
+      const sb = new WorkspaceScopedSandbox(execCfg(tmp(), { default_timeout: 50 }));
+      // No per-call timeout — the exec_config floor must still fire.
+      const out = await sb.executeCommand("sleep", ["5"], null, null);
+      if ("kind" in out) throw new Error("unexpected violation");
+      expect(out.timed_out).toBe(true);
+    },
+    15000,
+  );
+
+  it.runIf(IS_UNIX)(
+    "per-call timeout overrides a generous default_timeout",
+    async () => {
+      const sb = new WorkspaceScopedSandbox(execCfg(tmp(), { default_timeout: 30_000 }));
+      const out = await sb.executeCommand("sleep", ["5"], null, 50);
+      if ("kind" in out) throw new Error("unexpected violation");
+      expect(out.timed_out).toBe(true);
+    },
+    15000,
+  );
+
+  it.runIf(IS_UNIX)("non_interactive_env is injected onto the child", async () => {
+    const sb = new WorkspaceScopedSandbox(
+      execCfg(tmp(), { non_interactive_env: { SPORE_SC12_ENV: "hardened" } }),
+    );
+    const out = await sb.executeCommand("/bin/sh", ["-c", "echo $SPORE_SC12_ENV"]);
+    if ("kind" in out) throw new Error("unexpected violation");
+    expect(out.exit_code).toBe(0);
+    expect(out.stdout).toContain("hardened");
+  });
+
+  it.runIf(IS_UNIX)(
+    "close_stdin yields prompt EOF (cat exits 0 instead of hanging)",
+    async () => {
+      const sb = new WorkspaceScopedSandbox(execCfg(tmp(), { close_stdin: true }));
+      // `cat` with no args reads stdin to EOF; with stdin redirected to the null
+      // device it returns immediately. A generous per-call timeout guards the
+      // test against a hang if the knob regressed.
+      const out = await sb.executeCommand("cat", [], null, 5000);
+      if ("kind" in out) throw new Error("unexpected violation");
+      expect(out.timed_out).toBe(false);
+      expect(out.exit_code).toBe(0);
+      expect(out.stdout).toBe("");
+    },
+    15000,
+  );
+
+  it.runIf(IS_UNIX)(
+    "kill_on_drop reaps a child on timeout (sentinel never created)",
+    async () => {
+      const root = tmp();
+      const sentinel = join(root, "kod_sentinel");
+      const sb = new WorkspaceScopedSandbox(execCfg(root, { kill_on_drop: true }));
+      // The shell sleeps, then would `touch` the sentinel. The 100ms timeout
+      // aborts the exec; with kill_on_drop the shell is killed before it can run
+      // `touch`, so the sentinel never appears.
+      const out = await sb.executeCommand(
+        "/bin/sh",
+        ["-c", `sleep 1; touch ${sentinel}`],
+        root,
+        100,
+      );
+      if ("kind" in out) throw new Error("unexpected violation");
+      expect(out.timed_out).toBe(true);
+      // Wait past when the un-killed shell would have created the sentinel.
+      await new Promise((r) => setTimeout(r, 1500));
+      expect(existsSync(sentinel)).toBe(false);
+    },
+    15000,
+  );
+
+  it.runIf(IS_UNIX)("unset exec_config preserves legacy behavior", async () => {
+    const sb = new WorkspaceScopedSandbox(cfg(tmp()));
+    // No implicit timeout: a quick echo runs to completion, un-timed.
+    const out = await sb.executeCommand("echo", ["ok"]);
+    if ("kind" in out) throw new Error("unexpected violation");
+    expect(out.exit_code).toBe(0);
+    expect(out.stdout).toContain("ok");
+    expect(out.timed_out).toBe(false);
+  });
+});
+
+// --------------------------------------------------------------------------
+// SC-13 — read-everywhere / write-scoped write_root
+// --------------------------------------------------------------------------
+
+describe("write_root read-everywhere / write-scoped (SC-13)", () => {
+  it("read of a file under root but outside write_root succeeds; write is a PathEscape", async () => {
+    const root = tmp();
+    const out = join(root, "out");
+    mkdirSync(out);
+    writeFileSync(join(root, "secret.txt"), "s");
+    const sb = new WorkspaceScopedSandbox({ root, write_root: out });
+
+    // Read-everywhere: a file under `root` but outside `write_root` resolves.
+    const read = await sb.resolvePath("secret.txt", "read");
+    expect(typeof read).toBe("string");
+
+    // Write-scoped: writing that same file is a PathEscape.
+    const write = await sb.resolvePath("secret.txt", "write");
+    expect((write as SandboxViolation).kind).toBe("path_escape");
+
+    // A write under `write_root` (path strings stay root-relative) is OK.
+    const ok = await sb.resolvePath("out/result.txt", "write");
+    expect(typeof ok).toBe("string");
+  });
+
+  it("with no write_root, writes resolve anywhere under root (legacy)", async () => {
+    const root = tmp();
+    writeFileSync(join(root, "a.txt"), "x");
+    const sb = new WorkspaceScopedSandbox(cfg(root));
+    const write = await sb.resolvePath("a.txt", "write");
+    expect(typeof write).toBe("string");
+  });
+
+  it("constructing with a missing write_root throws write_root_not_found", () => {
+    const root = tmp();
+    let err: unknown;
+    try {
+      new WorkspaceScopedSandbox({ root, write_root: join(root, "does-not-exist") });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(BuildError);
+    expect((err as BuildError).kind).toBe("write_root_not_found");
+  });
 });
