@@ -1198,6 +1198,19 @@ pub struct RunScratch {
     /// [`resume`](Harness::resume)'s `ContinueWithBudget` arm (#138 budget).
     /// `None` on a fresh run / after the seed is consumed.
     pub resume_seed: Option<SessionState>,
+    /// Explicit "continue the durable task list" signal for a [`PlanExecuteConfig`]
+    /// re-entry that carries NO `resume_seed` (there is no stalled worker
+    /// conversation to thread in — the continuation is purely "keep walking the
+    /// already-authored DAG"). Set by **Ralph** (each window continues the one
+    /// logical task across the per-window session reset) and by the **`Skip`**
+    /// budget-escalation resolution (advance past the skipped task). A `resume_seed`
+    /// already implies continuation, so the seed-carrying resume paths leave this
+    /// `false`. A fresh `run()` and a HillClimbing neighbor leave it `false`, so
+    /// PlanExecute plans FRESH by default (it no longer infers "resume" from the
+    /// mere presence of a project-scoped durable list). Consumed (reset to `false`)
+    /// by the FIRST PlanExecute that reads it, so it never leaks into a nested
+    /// per-task PlanExecute, which must plan fresh.
+    pub continue_task_list: bool,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -1435,6 +1448,15 @@ pub trait StrategyExecutor: Send + Sync {
         &'a self,
         session_id: &'a SessionId,
     ) -> BoxFut<'a, Option<crate::tasklist::TaskList>>;
+
+    /// Clear the persisted [`TaskList`](crate::tasklist::TaskList) from the
+    /// RunStore seam (the durable, project-scoped store under
+    /// [`TASK_LIST_EXTRAS_KEY`](crate::tasklist::TASK_LIST_EXTRAS_KEY)). Called at
+    /// the start of a FRESH plan (a non-resume PlanExecute run) so a prior run's
+    /// stale list — which `#142` keys by the stable project namespace, NOT the
+    /// per-run instruction — does not survive into and suppress the new plan. The
+    /// ephemeral `session_id` is unused (mirrors `persist_task_list`/`load_task_list`).
+    fn clear_task_list<'a>(&'a self, session_id: &'a SessionId) -> BoxFut<'a, ()>;
 
     /// Drain and reset the harness-observed write/edit file-path accumulator
     /// (#126, AC2). The dispatch seam records the `path` of every `write_file` /
@@ -1857,7 +1879,29 @@ impl RunStrategy for PlanExecuteConfig {
             // (AC1-a artifact-optional) — nothing downstream requires it once a
             // task_list exists.
             let preexisting = executor.load_task_list(&session_id).await;
-            let skip_plan = matches!(&preexisting, Some(l) if !l.tasks.is_empty());
+            // Skip the plan phase ONLY when this is an explicit CONTINUATION that
+            // still has UNFINISHED work to resume — never on the mere presence of a
+            // durable list. The durable task_list is keyed by the stable project
+            // namespace (#142), so it survives across independent re-entries that
+            // share a workspace: separate `run()` calls on one long-lived harness
+            // (a conversational host), and HillClimbing iterations (each a fresh
+            // neighbor candidate). Treating "a list exists" as "resume it" made
+            // those re-plan into nothing — a second `run()`/iteration found the
+            // prior, fully-`Completed` graph, walked to no ready task, and drained
+            // to a silent empty `Success`. Continuation is therefore SIGNALLED, not
+            // inferred: a `resume_seed` (consult/budget/clarification/HITL resume)
+            // or an explicit `continue_task_list` flag set by Ralph (cross-window
+            // continuation of one logical task) / the `Skip` resolution (advance
+            // past the skipped task). The signal is CONSUMED here so it never leaks
+            // into a nested per-task PlanExecute (which must plan fresh).
+            let is_continuation =
+                resume_seed_session.is_some() || std::mem::take(&mut cx.scratch.continue_task_list);
+            let has_unfinished_work = preexisting.as_ref().is_some_and(|l| {
+                l.tasks
+                    .iter()
+                    .any(|t| matches!(t.status, TaskStatus::Pending | TaskStatus::InProgress))
+            });
+            let skip_plan = is_continuation && has_unfinished_work;
 
             let (mut task_list, mut total_usage, mut carried) = if skip_plan {
                 // ── AC1: skip-plan path. The list is the durable source of truth.
@@ -1898,6 +1942,14 @@ impl RunStrategy for PlanExecuteConfig {
                 // the PLAN session from the carried conversation so the planner
                 // CONTINUES on it instead of starting fresh — and consume the seed
                 // here so the execute-phase re-attach below does not also fire.
+                // Fresh plan: clear any stale durable list lingering in this
+                // project-scoped namespace so the freshly-authored list is the sole
+                // source of truth. The post-plan `load_task_list` below prefers the
+                // durable list while non-empty, so a stale completed/abandoned list
+                // would otherwise re-suppress the walk and drain to empty. Harmless
+                // no-op when the list is already empty (e.g. a plan-phase resume
+                // that only seeds the planner conversation).
+                executor.clear_task_list(&session_id).await;
                 let plan_resume = resume_seed_session.is_some()
                     && preexisting
                         .as_ref()
@@ -3015,6 +3067,14 @@ impl RunStrategy for RalphConfig {
                 cx.scratch.run_session = session_state;
                 // FRESH per-window budget (the reset discards the turn budget).
                 cx.scratch.run_budget = BudgetSnapshot::default();
+                // Model (A): Ralph is the continuation loop — each window continues
+                // the ONE logical task across the per-window session reset. Signal
+                // it so a PlanExecute inner resumes its durable task list (window 0
+                // / fresh-start has an empty list ⇒ the inner's "unfinished work"
+                // check still plans fresh; a window that finished its whole plan but
+                // is not yet "done" likewise has no unfinished work ⇒ re-plans for
+                // the remaining work instead of no-op draining).
+                cx.scratch.continue_task_list = true;
                 let window_outcome = inner_for_window.run(cx).await;
                 // #125 rule 4/7: a window child's BudgetExhausted reaches Ralph as
                 // a `StrategyOutcome`, never auto-cascaded. Ralph's recovery
@@ -3289,6 +3349,12 @@ impl RunStrategy for HillClimbingConfig {
                     .await;
                 cx.scratch.run_session = iter_state;
                 cx.scratch.run_budget = carried.clone();
+                // Model (A): each HillClimbing iteration generates a FRESH neighbor
+                // candidate — never a continuation of the prior iteration's plan.
+                // Clear the continue signal so a PlanExecute inner re-plans each
+                // iteration (the load-bearing requirement of hill climbing), and so
+                // an enclosing Ralph window's continue signal does not leak in.
+                cx.scratch.continue_task_list = false;
                 let iter_outcome = self.inner.run(cx).await;
                 // #125 rule 4/7: a child's BudgetExhausted reaches HillClimbing as
                 // a `StrategyOutcome`, never auto-cascaded. Surface this node's own
@@ -6202,6 +6268,16 @@ pub struct HarnessRunOptions {
     pub on_stream: Option<StreamSink>,
     /// Optional starting session state (e.g. resumed conversation history).
     pub session_state: Option<SessionState>,
+    /// Opt in to CONTINUING the durable, project-scoped task list from a prior
+    /// run rather than planning fresh (model A). Default `false`: a `PlanExecute`
+    /// `run()` plans fresh and clears any stale list — the correct default for a
+    /// conversational host issuing one independent `run()` per user turn. Set
+    /// `true` only to deliberately resume an in-flight plan across `run()` calls
+    /// (e.g. a cross-process resume of a top-level `PlanExecute` by project id);
+    /// the in-process HITL / budget / consult resume paths and the Ralph window
+    /// loop signal continuation on their own and do NOT need this. Has effect only
+    /// when there is unfinished (`Pending`/`InProgress`) work to resume.
+    pub continue_task_list: bool,
 }
 
 impl HarnessRunOptions {
@@ -6210,6 +6286,7 @@ impl HarnessRunOptions {
             task,
             on_stream: None,
             session_state: None,
+            continue_task_list: false,
         }
     }
 
@@ -6217,6 +6294,13 @@ impl HarnessRunOptions {
     /// conversation history for multi-turn scenarios — issue #57 S2).
     pub fn with_session_state(mut self, session_state: SessionState) -> Self {
         self.session_state = Some(session_state);
+        self
+    }
+
+    /// Opt in to continuing a prior run's durable task list (model A). See
+    /// [`continue_task_list`](HarnessRunOptions::continue_task_list).
+    pub fn continue_task_list(mut self, yes: bool) -> Self {
+        self.continue_task_list = yes;
         self
     }
 
@@ -11131,6 +11215,24 @@ impl StrategyExecutor for StandardHarness {
         })
     }
 
+    fn clear_task_list<'a>(&'a self, session_id: &'a SessionId) -> BoxFut<'a, ()> {
+        // #142: the durable task_list is keyed by the STABLE project namespace,
+        // NOT the ephemeral per-run `session_id` — so the delete must target the
+        // same project-scoped key as `persist_task_list`/`load_task_list`.
+        let _ = session_id;
+        Box::pin(async move {
+            let _ = self
+                .config
+                .storage
+                .run()
+                .delete(
+                    &self.config.project_id.namespace(),
+                    crate::tasklist::TASK_LIST_EXTRAS_KEY,
+                )
+                .await;
+        })
+    }
+
     fn take_observed_writes(&self) -> Vec<String> {
         match self.observed_writes.lock() {
             Ok(mut acc) => std::mem::take(&mut *acc),
@@ -11587,6 +11689,8 @@ impl StandardHarness {
                     on_stream,
                     None,
                     Some(session_state),
+                    // resume_seed carries the continuation signal.
+                    false,
                 )
                 .await;
         }
@@ -11704,6 +11808,7 @@ impl StandardHarness {
             task,
             on_stream,
             session_state,
+            continue_task_list,
         } = options;
 
         // #124 startup validation: every serializable handle in the task's
@@ -11776,8 +11881,18 @@ impl StandardHarness {
                 .append_user_message(&mut session_state, &task.instruction)
                 .await;
         }
-        self.drive_strategy(task, session_state, budget_used, on_stream)
-            .await
+        self.drive_strategy_with_resume_seed(
+            task,
+            session_state,
+            budget_used,
+            on_stream,
+            None,
+            None,
+            // Model (A): a fresh `run()` plans fresh unless the caller explicitly
+            // opts in to continuing a prior run's durable task list.
+            continue_task_list,
+        )
+        .await
     }
 
     /// The recursive-executor entry (#124): build the shared [`ExecutionContext`],
@@ -11786,25 +11901,8 @@ impl StandardHarness {
     /// terminal [`RunResult`] (Q5). A non-terminal pause / escalate stashed in
     /// `scratch.terminal_override` propagates VERBATIM (it never collapses into a
     /// `StrategyOutcome`).
-    async fn drive_strategy(
-        &self,
-        task: Task,
-        session_state: SessionState,
-        budget_used: BudgetSnapshot,
-        on_stream: Option<StreamSink>,
-    ) -> RunResult {
-        self.drive_strategy_with_resume_seed(
-            task,
-            session_state,
-            budget_used,
-            on_stream,
-            None,
-            None,
-        )
-        .await
-    }
-
-    /// `drive_strategy` with an optional cross-process Continue checkpoint seed
+    /// Drive a task's strategy through the recursive executor, with an optional
+    /// cross-process Continue checkpoint seed
     /// (#129, AC2): `resume_continues = Some((phase, continues_used))` seeds the
     /// FIRST matching budget scope's `continues_used` (via [`BudgetContext::resumed`])
     /// so a `Continue` that spanned a process pause resumes with the correct
@@ -11817,6 +11915,10 @@ impl StandardHarness {
     /// it to the single `InProgress` task (execute-phase exhaustion) or, when the
     /// durable task_list has no `InProgress` task, to the PLAN session (#138 AC3
     /// plan-phase exhaustion). `None` on every fresh / non-resume path.
+    // The resume/continuation surface is genuinely multi-axis (session, budget,
+    // stream, continue-checkpoint, resume-seed, continue-task-list); grouping it
+    // into a struct would not improve clarity at the handful of call sites.
+    #[allow(clippy::too_many_arguments)]
     async fn drive_strategy_with_resume_seed(
         &self,
         task: Task,
@@ -11825,6 +11927,11 @@ impl StandardHarness {
         on_stream: Option<StreamSink>,
         resume_continues: Option<(String, u32)>,
         resume_seed: Option<SessionState>,
+        // Model (A): an explicit "continue the durable task list" signal for a
+        // SEEDLESS PlanExecute continuation (Ralph window re-entry / `Skip`
+        // resolution). The seed-carrying resume paths pass `false` — a
+        // `resume_seed` already implies continuation; a fresh run passes `false`.
+        continue_task_list: bool,
     ) -> RunResult {
         // #129: the BARE-LEAF resolution site is `drive_strategy` (a bare leaf
         // never self-resolves inside its own body — rule 6 — it PROPAGATES a typed
@@ -11851,6 +11958,10 @@ impl StandardHarness {
         // #131/#138: the resume seed is consumed by the FIRST round's
         // PlanExecute walk only; later in-process rounds run normally.
         let mut resume_seed = resume_seed;
+        // Model (A): the seedless continue signal is likewise consumed by the
+        // FIRST round (an in-process `Continue` re-drive is a bare-leaf ReAct and
+        // never reads it, so this is belt-and-suspenders against re-asserting it).
+        let mut continue_task_list = continue_task_list;
         // SC-5: auto-grants spent at the BARE-LEAF Escalate site under
         // `EscalationMode::AutoContinue`. The scope is rebuilt each round here
         // (unlike the in-loop combinator scopes, which carry their own
@@ -11869,6 +11980,7 @@ impl StandardHarness {
             cx.scratch.task = Some(task.clone());
             cx.scratch.resume_continues = resume_continues.take();
             cx.scratch.resume_seed = resume_seed.take();
+            cx.scratch.continue_task_list = std::mem::take(&mut continue_task_list);
 
             let outcome = task.loop_strategy.run(&mut cx).await;
 
@@ -12141,6 +12253,9 @@ impl StandardHarness {
                             on_stream,
                             Some(resume_continues),
                             resume_seed,
+                            // resume_seed (when present) carries the continuation
+                            // signal; a bare ReAct leaf needs none.
+                            false,
                         )
                         .await;
                 }
@@ -12154,8 +12269,22 @@ impl StandardHarness {
                     action: EscalationAction::Skip,
                 } => {
                     if matches!(task.loop_strategy, LoopStrategy::PlanExecute(_)) {
+                        // Model (A): a Skip carries NO resume_seed (the task is
+                        // abandoned, not continued), so it must explicitly SIGNAL
+                        // continuation — otherwise PlanExecute would now treat the
+                        // re-entry as a fresh run, clear the durable list, and
+                        // re-plan instead of walking past the skipped task to the
+                        // remaining ready ones.
                         return self
-                            .drive_strategy(task, session_state, budget_used, on_stream)
+                            .drive_strategy_with_resume_seed(
+                                task,
+                                session_state,
+                                budget_used,
+                                on_stream,
+                                None,
+                                None,
+                                true,
+                            )
                             .await;
                     }
                     return RunResult::Success {
@@ -12266,6 +12395,8 @@ impl StandardHarness {
                             on_stream,
                             None,
                             Some(session_state),
+                            // resume_seed carries the continuation signal.
+                            false,
                         )
                         .await;
                 }
@@ -12464,6 +12595,8 @@ impl StandardHarness {
                     on_stream,
                     None,
                     Some(session_state),
+                    // resume_seed carries the continuation signal.
+                    false,
                 )
                 .await;
         }
@@ -18770,7 +18903,12 @@ mod tests {
         assert_eq!((g, bad), (1, 2));
         h.persist_task_list(&session, &tl).await;
 
-        match h.run(HarnessRunOptions::new(plan_task())).await {
+        // Model (A): walking a PRE-SEEDED DAG is a continuation (Ralph/Skip/resume),
+        // so opt in explicitly — a fresh run() would clear the list and re-plan.
+        match h
+            .run(HarnessRunOptions::new(plan_task()).continue_task_list(true))
+            .await
+        {
             RunResult::Failure {
                 reason:
                     HaltReason::TasksBlockedByFailure {
@@ -18830,7 +18968,10 @@ mod tests {
         tl.add("four".into(), vec![2, 3]).unwrap(); // 4 -> 2,3
         seed_dag(&h, &session, &tl).await;
 
-        match h.run(HarnessRunOptions::new(plan_task())).await {
+        match h
+            .run(HarnessRunOptions::new(plan_task()).continue_task_list(true))
+            .await
+        {
             RunResult::Success { output, .. } => {
                 // Last completed (id 4) text is the run output.
                 assert_eq!(output, "did 4");
@@ -18882,7 +19023,9 @@ mod tests {
         tl.add("independent".into(), vec![]).unwrap(); // 3 indep
         seed_dag(&h, &session, &tl).await;
 
-        let _ = h.run(HarnessRunOptions::new(plan_task())).await;
+        let _ = h
+            .run(HarnessRunOptions::new(plan_task()).continue_task_list(true))
+            .await;
         let contexts = agent.seen_text();
         // #138 AC1: plan skipped → [0] task1, [1] task2, [2] task3.
         assert_eq!(contexts.len(), 3);
@@ -18953,7 +19096,10 @@ mod tests {
         // task 2 itself records src/real.rs. We assert the run succeeds and that
         // the observed-writes accumulator behaved by checking the cascade-free
         // success plus the persisted completion.
-        match h.run(HarnessRunOptions::new(plan_task())).await {
+        match h
+            .run(HarnessRunOptions::new(plan_task()).continue_task_list(true))
+            .await
+        {
             RunResult::Success { output, .. } => assert_eq!(output, "edited the file"),
             other => panic!("expected Success, got {other:?}"),
         }
@@ -19050,7 +19196,11 @@ mod tests {
         tl.add("indep".into(), vec![]).unwrap(); // 4 independent
         seed_dag(&h, &session, &tl).await;
 
-        match h.run(HarnessRunOptions::new(plan_task())).await {
+        // Model (A): continue the pre-seeded DAG (Ralph/Skip/resume entry).
+        match h
+            .run(HarnessRunOptions::new(plan_task()).continue_task_list(true))
+            .await
+        {
             RunResult::Failure {
                 reason:
                     HaltReason::TasksBlockedByFailure {
@@ -19087,7 +19237,10 @@ mod tests {
         tl.tasks[0].blockers = vec![2]; // 1 -> 2 closes the cycle
         seed_dag(&h, &session, &tl).await;
 
-        match h.run(HarnessRunOptions::new(plan_task())).await {
+        match h
+            .run(HarnessRunOptions::new(plan_task()).continue_task_list(true))
+            .await
+        {
             RunResult::Failure {
                 reason: HaltReason::TaskGraphCycle { .. },
                 ..
@@ -19129,7 +19282,9 @@ mod tests {
         }
         seed_dag(&h, &session, &tl).await;
 
-        let _ = h.run(HarnessRunOptions::new(plan_task())).await;
+        let _ = h
+            .run(HarnessRunOptions::new(plan_task()).continue_task_list(true))
+            .await;
         let contexts = agent.seen_text();
         // The LAST execute step's context (index total) is seeded with the ledger
         // AFTER the first (total-1) completions, so it must show elision and must
@@ -22646,10 +22801,12 @@ mod tests {
     // recursion. A hardcoded-ReAct proposer would NEVER fire the plan phase (the
     // worker never sees the plan directive).
     //
-    // #138 AC1: the durable task_list is project-scoped, so iteration 1 authors it
-    // and iteration 2 SKIPS re-planning (the list already exists). The plan phase
-    // therefore fires EXACTLY ONCE across the whole climb — which still proves the
-    // recursion (a ReAct proposer would fire it zero times).
+    // Model (A): each HillClimbing iteration generates a FRESH neighbor candidate,
+    // so the inner PlanExecute re-plans EVERY iteration — it does NOT reuse the
+    // prior iteration's (project-scoped) durable task_list. Reusing a fully-
+    // `Completed` list would make iteration 2 a no-op (no neighbor generated), the
+    // failure mode that defeats hill climbing. The plan phase therefore fires once
+    // PER iteration; with two iterations the worker sees the plan directive twice.
     #[tokio::test]
     async fn hill_climbing_runs_non_react_inner_per_iteration() {
         let sandbox = Arc::new(HcSpySandbox::new());
@@ -22659,13 +22816,16 @@ mod tests {
             vec![Ok(1.0), Ok(2.0), Ok(0.5)],
             HillClimbingDirection::Maximize,
         ));
-        // Iteration 1 fires a plan JSON turn + execute step; #138 AC1 makes
-        // iteration 2 skip the (now-durable) plan phase.
+        // Each iteration fires a plan JSON turn + an execute step — a fresh
+        // neighbor candidate. Iteration 2 re-plans (the stale durable list from
+        // iteration 1 is cleared on the fresh plan), so it needs its own pair.
         let worker = RecordingTurnAgent::new(
             "hc-inner",
             vec![
                 RecordingTurnAgent::final_resp(r#"{"tasks":["only"],"rationale":"r"}"#),
                 RecordingTurnAgent::final_resp("changed iter1"),
+                RecordingTurnAgent::final_resp(r#"{"tasks":["again"],"rationale":"r2"}"#),
+                RecordingTurnAgent::final_resp("changed iter2"),
             ],
         );
         let mut cfg = standard_config(make_agent());
@@ -22699,19 +22859,21 @@ mod tests {
             } => {}
             other => panic!("expected StagnationLimitReached, got {other:?}"),
         }
-        // #138 AC1: the inner PlanExecute fired its plan turn EXACTLY ONCE — the
-        // first iteration authored the durable task_list; later iterations skip
-        // re-planning. A hardcoded-ReAct proposer would record ZERO plan turns, so
-        // a single plan turn still proves the genuine recursion into PlanExecute.
+        // Model (A): the inner PlanExecute re-plans EACH iteration (a fresh
+        // neighbor), so across two iterations the worker saw the plan directive
+        // TWICE. A hardcoded-ReAct proposer would record ZERO plan turns, so this
+        // still proves the genuine recursion into PlanExecute — and the count of 2
+        // proves the per-iteration regeneration that hill climbing requires
+        // (reusing the durable list would make iteration 2 a no-op).
         let seen = worker.seen_text();
         let plan_turns = seen
             .iter()
             .filter(|c| c.contains("step-by-step plan"))
             .count();
         assert_eq!(
-            plan_turns, 1,
-            "the inner PlanExecute plan phase fires once (then #138 AC1 skips \
-             re-planning); saw: {seen:?}"
+            plan_turns, 2,
+            "the inner PlanExecute plan phase fires once PER iteration (no \
+             durable-list reuse across HillClimbing neighbors); saw: {seen:?}"
         );
     }
 
@@ -24591,7 +24753,12 @@ mod tests {
         let _ = tl.complete(1);
         h.persist_task_list(&session, &tl).await;
 
-        match h.run(HarnessRunOptions::new(plan_task())).await {
+        // Model (A): resuming a pre-seeded list (task #1 Completed, #2 Pending) is a
+        // continuation; opt in so the reconcile + walk run instead of re-planning.
+        match h
+            .run(HarnessRunOptions::new(plan_task()).continue_task_list(true))
+            .await
+        {
             RunResult::Success { output, .. } => assert_eq!(output, "did two"),
             other => panic!("expected Success, got {other:?}"),
         }
@@ -24617,6 +24784,83 @@ mod tests {
             .tasks
             .iter()
             .all(|t| t.status == TaskStatus::Completed));
+    }
+
+    // Model (A) regression (the consumer pattern): one long-lived harness, one
+    // `run()` per user turn against a stable workspace — the normal way a
+    // conversational host drives PlanExecute. The durable task_list is keyed by the
+    // stable project namespace (#142), so it survives across `run()` calls; before
+    // model (A), a fresh `run()` saw the prior, fully-`Completed` graph, treated it
+    // as a resume, walked to no ready task, and drained to a silent empty
+    // `Success`. A fresh `run()` carries no continuation signal, so it must now
+    // re-plan + execute and return real output.
+    #[tokio::test]
+    async fn fresh_run_after_completed_plan_replans_instead_of_empty_success() {
+        let a = make_agent();
+        // Run 1: plan two tasks, execute both.
+        a.push(final_resp(r#"{"tasks":["one","two"],"rationale":"r1"}"#));
+        a.push(final_resp("did one"));
+        a.push(final_resp("did two"));
+        // Run 2 (new instruction): MUST re-plan (one task) + execute it.
+        a.push(final_resp(r#"{"tasks":["three"],"rationale":"r2"}"#));
+        a.push(final_resp("did three"));
+        let h = StandardHarness::new(standard_config(a));
+
+        let plan_strategy = || {
+            LoopStrategy::PlanExecute(PlanExecuteConfig {
+                behavior: BudgetExhaustedBehavior::Escalate,
+                plan: Box::new(react_structured(u32::MAX)),
+                execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+                plan_model: None,
+            })
+        };
+
+        // Run 1 — plans + executes; all tasks Completed + persisted to the durable
+        // project-scoped store.
+        let t1 = Task::new(
+            "add a foo() function",
+            SessionId::new("s1"),
+            plan_strategy(),
+        );
+        match h.run(HarnessRunOptions::new(t1)).await {
+            RunResult::Success { output, .. } => assert_eq!(output, "did two"),
+            other => panic!("run 1: expected Success, got {other:?}"),
+        }
+
+        // Run 2 — distinct instruction, SAME harness + project namespace, no resume
+        // signal ⇒ a fresh plan (stale list cleared) and the new task executes.
+        let t2 = Task::new(
+            "now add a bar() function",
+            SessionId::new("s2"),
+            plan_strategy(),
+        );
+        match h.run(HarnessRunOptions::new(t2)).await {
+            RunResult::Success { output, .. } => assert_eq!(
+                output, "did three",
+                "a fresh run() with a new instruction must re-plan + execute, \
+                 not drain to an empty Success"
+            ),
+            other => panic!("run 2: expected Success, got {other:?}"),
+        }
+
+        // The durable store reflects ONLY run 2's freshly-authored task — the stale
+        // completed list was CLEARED, not appended to (which would have re-suppressed
+        // the walk via the post-plan `load_task_list` re-read).
+        let stored: TaskList = serde_json::from_value(
+            h.storage()
+                .run()
+                .get(&durable_ns(), TASK_LIST_EXTRAS_KEY)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            stored.tasks.len(),
+            1,
+            "stale completed tasks cleared on the fresh run, not carried forward"
+        );
+        assert_eq!(stored.tasks[0].description, "three");
     }
 
     // ── Resume: Fail propagates Failure{BudgetExceeded}, partial discarded ────

@@ -322,7 +322,12 @@ async fn plan_builds_dag_execute_walks_readyset() {
     tl.add("audit module two".into(), vec![]).unwrap(); // 2 (independent)
     seed(&storage, &session, &tl).await;
 
-    match h.run(HarnessRunOptions::new(pe_task("cordyceps-pe"))).await {
+    // Model (A): the DAG is pre-seeded (a continuation), so opt in — a fresh
+    // run() would clear the seeded list and re-plan.
+    match h
+        .run(HarnessRunOptions::new(pe_task("cordyceps-pe")).continue_task_list(true))
+        .await
+    {
         RunResult::Success { .. } => {}
         other => panic!("expected Success, got {other:?}"),
     }
@@ -365,6 +370,8 @@ async fn composed_tree_streams_attributed_events() {
     let result = h
         .run(
             HarnessRunOptions::new(pe_task("cordyceps-stream"))
+                // Model (A): pre-seeded DAG ⇒ continuation opt-in.
+                .continue_task_list(true)
                 .with_stream(move |ev| sink.lock().unwrap().push(ev)),
         )
         .await;
@@ -433,7 +440,8 @@ async fn cordyceps_runaway_bounded() {
     seed(&storage, &session, &tl).await;
 
     match h
-        .run(HarnessRunOptions::new(pe_task("cordyceps-runaway")))
+        // Model (A): pre-seeded DAG ⇒ continuation opt-in.
+        .run(HarnessRunOptions::new(pe_task("cordyceps-runaway")).continue_task_list(true))
         .await
     {
         RunResult::Failure {
@@ -549,7 +557,8 @@ async fn worker_consult_surfaces_and_host_resumes() {
 
     // First leg: drive to the consult pause.
     let first = h
-        .run(HarnessRunOptions::new(pe_task("cordyceps-consult")))
+        // Model (A): pre-seeded DAG ⇒ continuation opt-in.
+        .run(HarnessRunOptions::new(pe_task("cordyceps-consult")).continue_task_list(true))
         .await;
     let (request, state) = match first {
         RunResult::Consult { request, state, .. } => (request, state),
@@ -740,7 +749,8 @@ async fn budget_resume_seeds_stalled_worker_and_skips_replanning() {
 
     // Leg 1: drive to the budget-exhaustion pause.
     let first = h
-        .run(HarnessRunOptions::new(small_pe_task("cordyceps-budget")))
+        // Model (A): pre-seeded DAG ⇒ continuation opt-in.
+        .run(HarnessRunOptions::new(small_pe_task("cordyceps-budget")).continue_task_list(true))
         .await;
     let (request, state) = match first {
         RunResult::WaitingForHuman { request, state } => (request, state),

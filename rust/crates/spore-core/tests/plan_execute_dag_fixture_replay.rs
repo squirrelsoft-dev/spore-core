@@ -165,7 +165,10 @@ async fn dag_order_diamond_all_complete() {
     tl.add("four".into(), vec![2, 3]).unwrap(); // 4 -> 2,3
     seed(&storage, &session, &tl).await;
 
-    match h.run(HarnessRunOptions::new(dag_task())).await {
+    match h
+        .run(HarnessRunOptions::new(dag_task()).continue_task_list(true))
+        .await
+    {
         RunResult::Success { output, .. } => assert_eq!(output, "did 4"),
         other => panic!("expected Success, got {other:?}"),
     }
@@ -188,7 +191,10 @@ async fn dag_branch_isolation_completes() {
     tl.add("independent".into(), vec![]).unwrap(); // 3 indep
     seed(&storage, &session, &tl).await;
 
-    match h.run(HarnessRunOptions::new(dag_task())).await {
+    match h
+        .run(HarnessRunOptions::new(dag_task()).continue_task_list(true))
+        .await
+    {
         RunResult::Success { output, .. } => assert_eq!(output, "INDEP_OUTPUT_CCC"),
         other => panic!("expected Success, got {other:?}"),
     }
@@ -212,7 +218,10 @@ async fn dag_failure_cascade_partition() {
     tl.add("indep".into(), vec![]).unwrap(); // 4 independent
     seed(&storage, &session, &tl).await;
 
-    match h.run(HarnessRunOptions::new(dag_task())).await {
+    match h
+        .run(HarnessRunOptions::new(dag_task()).continue_task_list(true))
+        .await
+    {
         RunResult::Failure {
             reason:
                 HaltReason::TasksBlockedByFailure {
@@ -244,7 +253,10 @@ async fn dag_budget_fail_cascade_partition() {
     tl.add("indep".into(), vec![]).unwrap(); // 4 independent
     seed(&storage, &session, &tl).await;
 
-    match h.run(HarnessRunOptions::new(dag_task())).await {
+    match h
+        .run(HarnessRunOptions::new(dag_task()).continue_task_list(true))
+        .await
+    {
         RunResult::Failure {
             reason:
                 HaltReason::TasksBlockedByFailure {
@@ -275,7 +287,10 @@ async fn dag_cycle_rejected_at_entry() {
     tl.tasks[0].blockers = vec![2]; // 1 -> 2 closes the cycle
     seed(&storage, &session, &tl).await;
 
-    match h.run(HarnessRunOptions::new(dag_task())).await {
+    match h
+        .run(HarnessRunOptions::new(dag_task()).continue_task_list(true))
+        .await
+    {
         RunResult::Failure {
             reason: HaltReason::TaskGraphCycle { .. },
             ..
