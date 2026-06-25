@@ -96,6 +96,15 @@ pub struct WorkspaceConfig {
     /// inherit-stdin / no-timeout / inherit-env / leak-on-drop behavior.
     #[serde(default)]
     pub exec_config: Option<ExecConfig>,
+    /// Optional narrower boundary for [`Operation::Write`] (SC-13). When
+    /// `Some`, writes must resolve under `write_root` while reads (and execute)
+    /// may range over the wider [`root`](Self::root) — "read-everywhere,
+    /// write-scoped". `None` gates writes by `root` exactly like reads (the
+    /// legacy single-root behavior). Path strings stay root-relative for both
+    /// reads and writes; only the boundary check tightens. Canonicalized at
+    /// construction and must exist; typically a subdirectory of `root`.
+    #[serde(default)]
+    pub write_root: Option<PathBuf>,
 }
 
 impl WorkspaceConfig {
@@ -112,6 +121,7 @@ impl WorkspaceConfig {
             read_only: false,
             max_file_size: 0,
             exec_config: None,
+            write_root: None,
         }
     }
 }
@@ -130,6 +140,14 @@ pub enum BuildError {
     RootNotCanonical { path: PathBuf },
     #[error("workspace root io error: {source}")]
     RootIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("workspace write_root does not exist: {path}")]
+    WriteRootNotFound { path: PathBuf },
+    #[error("workspace write_root io error: {source}")]
+    WriteRootIo {
         path: PathBuf,
         #[source]
         source: std::io::Error,
@@ -177,6 +195,24 @@ impl WorkspaceScopedSandbox {
             config.root = canonical;
         } else {
             config.root = canonical;
+        }
+
+        // SC-13: canonicalize the optional write_root the same way so the
+        // boundary `starts_with` check compares canonical paths.
+        if let Some(write_root) = config.write_root.take() {
+            let canonical_wr = match std::fs::canonicalize(&write_root) {
+                Ok(p) => p,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(BuildError::WriteRootNotFound { path: write_root });
+                }
+                Err(e) => {
+                    return Err(BuildError::WriteRootIo {
+                        path: write_root,
+                        source: e,
+                    });
+                }
+            };
+            config.write_root = Some(canonical_wr);
         }
 
         #[cfg(feature = "dangerous")]
@@ -251,8 +287,22 @@ impl WorkspaceScopedSandbox {
             }
         };
 
-        // 3. Boundary check.
-        if !canonical.starts_with(&self.config.root) {
+        // 3. Boundary check. Reads and execute must stay under the read
+        //    `root`; writes must stay under `write_root` when set (SC-13:
+        //    read-everywhere, write-scoped). The path string was already
+        //    joined onto `root` above — `write_root` only narrows where the
+        //    resolved target is allowed to land, it is not a separate join
+        //    base — so a write outside `write_root` is a PathEscape even
+        //    though it lives under `root`.
+        let boundary_root: &Path = match operation {
+            Operation::Write => self
+                .config
+                .write_root
+                .as_deref()
+                .unwrap_or(&self.config.root),
+            _ => &self.config.root,
+        };
+        if !canonical.starts_with(boundary_root) {
             return Err(SandboxViolation::PathEscape {
                 path: canonical.display().to_string(),
             });
@@ -969,6 +1019,61 @@ mod tests {
             !sentinel.exists(),
             "child was not reaped on drop — sentinel was created"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // SC-13 — read-everywhere / write-scoped (write_root)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn write_root_allows_read_everywhere_but_scopes_writes() {
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let out = root.join("out");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(root.join("secret.txt"), "s").unwrap();
+        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig {
+            write_root: Some(out.clone()),
+            ..WorkspaceConfig::scoped(root.clone())
+        })
+        .unwrap();
+
+        // Read-everywhere: a file under `root` but outside `write_root` resolves.
+        sb.resolve_path("secret.txt", Operation::Read)
+            .await
+            .unwrap();
+        // Write-scoped: writing that same file is a PathEscape.
+        let err = sb
+            .resolve_path("secret.txt", Operation::Write)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SandboxViolation::PathEscape { .. }));
+        // A write under `write_root` (path strings stay root-relative) is OK.
+        sb.resolve_path("out/result.txt", Operation::Write)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_write_root_gates_writes_by_root() {
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        let sb = WorkspaceScopedSandbox::new(cfg(&root)).unwrap();
+        // With write_root unset, writes resolve anywhere under `root` (legacy).
+        sb.resolve_path("a.txt", Operation::Write).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn build_fails_when_write_root_missing() {
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let err = WorkspaceScopedSandbox::new(WorkspaceConfig {
+            write_root: Some(root.join("does-not-exist")),
+            ..WorkspaceConfig::scoped(root)
+        })
+        .unwrap_err();
+        assert!(matches!(err, BuildError::WriteRootNotFound { .. }));
     }
 
     #[tokio::test]
