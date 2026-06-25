@@ -8,12 +8,14 @@
 package sporecore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -26,8 +28,10 @@ import (
 type BuildErrorKind string
 
 const (
-	BuildErrRootNotFound BuildErrorKind = "root_not_found"
-	BuildErrRootIO       BuildErrorKind = "root_io"
+	BuildErrRootNotFound      BuildErrorKind = "root_not_found"
+	BuildErrRootIO            BuildErrorKind = "root_io"
+	BuildErrWriteRootNotFound BuildErrorKind = "write_root_not_found"
+	BuildErrWriteRootIO       BuildErrorKind = "write_root_io"
 )
 
 // BuildError is the construction-time error type for WorkspaceScopedSandbox.
@@ -43,6 +47,10 @@ func (e *BuildError) Error() string {
 		return fmt.Sprintf("workspace root does not exist: %s", e.Path)
 	case BuildErrRootIO:
 		return fmt.Sprintf("workspace root io error: %s: %s", e.Path, e.Err)
+	case BuildErrWriteRootNotFound:
+		return fmt.Sprintf("workspace write_root does not exist: %s", e.Path)
+	case BuildErrWriteRootIO:
+		return fmt.Sprintf("workspace write_root io error: %s: %s", e.Path, e.Err)
 	default:
 		return fmt.Sprintf("workspace build error: %s", e.Path)
 	}
@@ -99,6 +107,25 @@ func NewWorkspaceScopedSandboxWithMode(cfg WorkspaceConfig, mode IsolationMode) 
 		return nil, &BuildError{Kind: BuildErrRootIO, Path: cfg.Root, Err: fmt.Errorf("not a directory")}
 	}
 	cfg.Root = canonical
+
+	// SC-13: canonicalize the optional write_root the same way so the write
+	// boundary check compares canonical paths. It must exist (typically a
+	// subdirectory of root). The path strings callers pass stay root-relative;
+	// write_root only narrows the boundary, it is not a second join base.
+	if cfg.WriteRoot != "" {
+		wrAbs, err := filepath.Abs(cfg.WriteRoot)
+		if err != nil {
+			return nil, &BuildError{Kind: BuildErrWriteRootIO, Path: cfg.WriteRoot, Err: err}
+		}
+		wrCanonical, err := filepath.EvalSymlinks(wrAbs)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, &BuildError{Kind: BuildErrWriteRootNotFound, Path: cfg.WriteRoot}
+			}
+			return nil, &BuildError{Kind: BuildErrWriteRootIO, Path: cfg.WriteRoot, Err: err}
+		}
+		cfg.WriteRoot = wrCanonical
+	}
 
 	if warnIfDangerousIsolation != nil {
 		warnIfDangerousIsolation(mode)
@@ -160,8 +187,17 @@ func (s *WorkspaceScopedSandbox) ResolvePath(_ context.Context, raw string, op O
 		}
 	}
 
-	// 3. Boundary check.
-	if !pathHasPrefix(canonical, s.config.Root) {
+	// 3. Boundary check. Reads and execute must stay under the read Root;
+	//    writes must stay under WriteRoot when set (SC-13: read-everywhere,
+	//    write-scoped). The path string was already joined onto Root above —
+	//    WriteRoot only narrows where a resolved write target may land, it is
+	//    NOT a separate join base — so a write outside WriteRoot is a PathEscape
+	//    even though it lives under Root.
+	boundary := s.config.Root
+	if op == OperationWrite && s.config.WriteRoot != "" {
+		boundary = s.config.WriteRoot
+	}
+	if !pathHasPrefix(canonical, boundary) {
 		return "", &SandboxViolation{Kind: SandboxPathEscape, Path: canonical}
 	}
 
@@ -299,17 +335,51 @@ func (s *WorkspaceScopedSandbox) ExecuteCommand(
 		// IsolationNone) proceed directly.
 	}
 
+	// SC-12: apply exec-hardening knobs when configured. The per-call timeout
+	// always wins; DefaultTimeout is the floor for callers that pass none (0).
+	effectiveTimeout := timeout
+	if effectiveTimeout == 0 && s.config.ExecConfig != nil {
+		effectiveTimeout = s.config.ExecConfig.DefaultTimeout
+	}
+
 	runCtx := ctx
 	var cancel context.CancelFunc
-	if timeout > 0 {
-		runCtx, cancel = context.WithTimeout(ctx, timeout)
+	if effectiveTimeout > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, effectiveTimeout)
 		defer cancel()
 	}
+	// KillOnDrop is satisfied by construction: exec.CommandContext kills the
+	// child when runCtx is cancelled (the timeout firing, or an outer cancel),
+	// which is Go's native kill-on-drop. No extra wiring is needed.
 	cmd := exec.CommandContext(runCtx, command, args...)
 	if workingDir != "" {
 		cmd.Dir = workingDir
 	} else {
 		cmd.Dir = s.config.Root
+	}
+
+	// SC-12: CloseStdin and NonInteractiveEnv are gated on ExecConfig so the
+	// legacy (nil) path is byte-identical (inherited stdin, inherited env).
+	if ec := s.config.ExecConfig; ec != nil {
+		if ec.CloseStdin {
+			// An empty reader yields immediate EOF, so input-blocked commands
+			// fail fast instead of hanging on the inherited terminal.
+			cmd.Stdin = bytes.NewReader(nil)
+		}
+		if len(ec.NonInteractiveEnv) > 0 {
+			// Force vars onto the inherited environment in sorted key order
+			// (deterministic), matching the Rust reference's BTreeMap.
+			env := os.Environ()
+			keys := make([]string, 0, len(ec.NonInteractiveEnv))
+			for k := range ec.NonInteractiveEnv {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				env = append(env, k+"="+ec.NonInteractiveEnv[k])
+			}
+			cmd.Env = env
+		}
 	}
 
 	stdout, err := cmd.Output()
@@ -322,7 +392,7 @@ func (s *WorkspaceScopedSandbox) ExecuteCommand(
 		if runCtx.Err() == context.DeadlineExceeded {
 			return CommandOutput{
 				Stdout:   "",
-				Stderr:   fmt.Sprintf("command timed out after %s", timeout),
+				Stderr:   fmt.Sprintf("command timed out after %s", effectiveTimeout),
 				ExitCode: -1,
 				TimedOut: true,
 			}, nil
@@ -330,11 +400,16 @@ func (s *WorkspaceScopedSandbox) ExecuteCommand(
 		if ee, ok := err.(*exec.ExitError); ok {
 			exitCode = ee.ExitCode()
 		} else {
-			return CommandOutput{
-				Stdout:   "",
-				Stderr:   fmt.Sprintf("spawn failed: %s", err),
-				ExitCode: -1,
-			}, nil
+			// SC-15: a failed spawn is a typed violation, not a fake
+			// CommandOutput{ExitCode: -1}. Callers already handle the
+			// *SandboxViolation arm. Timeout (handled above) keeps its
+			// CommandOutput{ExitCode: -1, TimedOut: true} — a real run that
+			// exceeded the clock, not a spawn failure.
+			return CommandOutput{}, &SandboxViolation{
+				Kind:    SandboxExecSpawnFailed,
+				Command: command,
+				Message: err.Error(),
+			}
 		}
 	}
 	return CommandOutput{

@@ -47,6 +47,16 @@ type VcsProvider interface {
 
 	// Status returns the working-tree status (e.g. git status stdout), verbatim.
 	Status(ctx context.Context) (string, error)
+
+	// Revert discards the working tree's uncommitted changes, returning it to
+	// the last known-good state (SC-14). Called by the HillClimbing loop to undo
+	// a no-improvement iteration's edits. Go has no default interface methods, so
+	// — unlike the Rust reference where Revert defaults to a no-op — every
+	// implementer must define it; the no-op stand-in lives on FixtureVcsProvider
+	// (a provider whose workspace is not under version control simply leaves the
+	// tree as-is). GitVcsProvider runs git reset --hard HEAD through the sandbox.
+	// Best-effort: the HillClimbing loop swallows any error and continues.
+	Revert(ctx context.Context) error
 }
 
 // VcsLogArgs shapes a VcsProvider.Log read. Each field maps to a git log flag in
@@ -139,6 +149,14 @@ func (g *GitVcsProvider) Status(ctx context.Context) (string, error) {
 	return g.run(ctx, []string{"status"})
 }
 
+// Revert runs git reset --hard HEAD THROUGH the sandbox, discarding the working
+// tree's uncommitted changes (SC-14). The behavior is relocated here from the
+// HillClimbing loop's former hardcoded revert; it never spawns git directly.
+func (g *GitVcsProvider) Revert(ctx context.Context) error {
+	_, err := g.run(ctx, []string{"reset", "--hard", "HEAD"})
+	return err
+}
+
 // run executes git with argv through the wrapped sandbox, mapping a sandbox
 // violation or a non-zero exit to a *VcsError.
 func (g *GitVcsProvider) run(ctx context.Context, argv []string) (string, error) {
@@ -177,6 +195,14 @@ func (f FixtureVcsProvider) Log(_ context.Context, _ VcsLogArgs) (string, error)
 // Status returns the seeded StatusOutput verbatim.
 func (f FixtureVcsProvider) Status(_ context.Context) (string, error) {
 	return f.StatusOutput, nil
+}
+
+// Revert is a no-op (SC-14). Go lacks default interface methods, so this trivial
+// method stands in for the Rust reference's default no-op revert: a fixture
+// double has no working tree to reset, and a non-VCS workspace leaves the tree
+// as-is. Always succeeds.
+func (f FixtureVcsProvider) Revert(_ context.Context) error {
+	return nil
 }
 
 var _ VcsProvider = FixtureVcsProvider{}

@@ -96,9 +96,16 @@ func TestExecInvalidParams(t *testing.T) {
 	sb := sporecore.AllowAllSandbox{}
 	r := NewExecTool().Execute(context.Background(),
 		sporecore.ToolCall{ID: "c1", Name: "exec", Input: json.RawMessage(`{}`)}, sb, nil)
-	// Empty command produces an exec error from the sandbox -> recoverable error.
-	if r.Kind != sporecore.ToolOutputError {
-		t.Fatalf("%+v", r)
+	// SC-15: an empty command can't be spawned, so the sandbox returns a typed
+	// SandboxExecSpawnFailed violation. The tool carries it to the harness as a
+	// ToolOutputSandboxViolation (issue #150) — the harness applies its
+	// SandboxViolationPolicy (recoverable feedback by default), rather than the
+	// tool flattening the former fake exit_code -1 into a plain Error here.
+	if r.Kind != sporecore.ToolOutputSandboxViolation {
+		t.Fatalf("expected ToolOutputSandboxViolation, got %+v", r)
+	}
+	if r.Violation == nil || r.Violation.Kind != sporecore.SandboxExecSpawnFailed {
+		t.Fatalf("expected SandboxExecSpawnFailed violation, got %+v", r.Violation)
 	}
 }
 

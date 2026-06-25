@@ -29,8 +29,10 @@ import (
 type DefaultSandbox struct{}
 
 // ExecuteCommand runs a subprocess via os/exec.CommandContext. A non-zero
-// timeout bounds execution; on expiry, TimedOut is set and ExitCode is -1.
-// Never returns a SandboxViolation — failures land in CommandOutput.
+// timeout bounds execution; on expiry, TimedOut is set and ExitCode is -1. A
+// spawn failure (missing binary, OS refusal) returns a typed
+// SandboxExecSpawnFailed violation (SC-15) — never started is no longer
+// conflated with ran-and-exited -1; timeouts still land in CommandOutput.
 func (DefaultSandbox) ExecuteCommand(
 	ctx context.Context,
 	command string,
@@ -67,12 +69,13 @@ func (DefaultSandbox) ExecuteCommand(
 		if ee, ok := err.(*exec.ExitError); ok {
 			exitCode = ee.ExitCode()
 		} else {
-			return CommandOutput{
-				Stdout:   "",
-				Stderr:   fmt.Sprintf("spawn failed: %s", err),
-				ExitCode: -1,
-				TimedOut: timedOut,
-			}, nil
+			// SC-15: a failed spawn is a typed violation, not a fake
+			// CommandOutput{ExitCode: -1}. Callers already handle the arm.
+			return CommandOutput{}, &SandboxViolation{
+				Kind:    SandboxExecSpawnFailed,
+				Command: command,
+				Message: err.Error(),
+			}
 		}
 	}
 	return CommandOutput{

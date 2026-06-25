@@ -161,12 +161,20 @@ func hillClimbShouldKeep(newValue, currentBest float64, direction OptimizationDi
 	return delta > threshold
 }
 
-// hillClimbingRevert reverts the working tree to current HEAD for a
-// no-improvement iteration (issue #60, Decision 1). Runs `git reset --hard HEAD`
-// THROUGH the sandbox; the harness NEVER spawns git directly. A sandbox
-// rejection / non-zero exit is best-effort: the loop continues (the next agent
-// turn re-derives state).
+// hillClimbingRevert reverts the working tree for a no-improvement iteration
+// (issue #60, Decision 1). SC-14: when a VcsProvider is wired it owns the revert
+// (e.g. GitVcsProvider runs `git reset --hard HEAD`, a custom provider does
+// whatever its workspace needs); with no provider (the default) the harness
+// falls back to the original hardcoded `git reset --hard HEAD` THROUGH the
+// sandbox — byte-identical to the pre-SC-14 behavior. Either way the harness
+// NEVER spawns git directly, and the revert is best-effort: an error / non-zero
+// exit is swallowed and the loop continues (the next agent turn re-derives
+// state).
 func (h *StandardHarness) hillClimbingRevert(ctx context.Context) {
+	if h.config.VcsProvider != nil {
+		_ = h.config.VcsProvider.Revert(ctx)
+		return
+	}
 	_, _ = h.config.Sandbox.ExecuteCommand(ctx, "git", []string{"reset", "--hard", "HEAD"}, "", 0)
 }
 

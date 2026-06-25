@@ -963,6 +963,12 @@ const (
 	SandboxExtensionDenied   SandboxViolationKind = "extension_denied"
 	SandboxFileSizeExceeded  SandboxViolationKind = "file_size_exceeded"
 	SandboxDisallowedCommand SandboxViolationKind = "disallowed_command"
+	// SandboxExecSpawnFailed (SC-15) means the process could not be spawned at
+	// all (e.g. the command binary does not exist, or the OS refused the spawn).
+	// Reported as a typed violation rather than a fake CommandOutput{ExitCode:
+	// -1}, so "ran and exited -1" and "never started" are no longer conflated.
+	// Layer-2: always recoverable (never halt-eligible).
+	SandboxExecSpawnFailed SandboxViolationKind = "exec_spawn_failed"
 )
 
 // SandboxViolation is a sandbox-side rejection. Issue #6 expands the variant
@@ -976,6 +982,7 @@ const (
 //   - file_size_exceeded:  Path, Size, Limit
 //   - disallowed_command:  Command
 //   - network_violation:   Host
+//   - exec_spawn_failed:    Command, Message
 type SandboxViolation struct {
 	Kind        SandboxViolationKind `json:"kind"`
 	Path        string               `json:"-"`
@@ -985,6 +992,7 @@ type SandboxViolation struct {
 	Size        uint64               `json:"-"`
 	Limit       uint64               `json:"-"`
 	Command     string               `json:"-"`
+	Message     string               `json:"-"`
 }
 
 // MarshalJSON serialises as a flat tagged object.
@@ -1019,6 +1027,12 @@ func (s SandboxViolation) MarshalJSON() ([]byte, error) {
 			Kind    SandboxViolationKind `json:"kind"`
 			Command string               `json:"command"`
 		}{s.Kind, s.Command})
+	case SandboxExecSpawnFailed:
+		return json.Marshal(struct {
+			Kind    SandboxViolationKind `json:"kind"`
+			Command string               `json:"command"`
+			Message string               `json:"message"`
+		}{s.Kind, s.Command, s.Message})
 	case SandboxNetworkViolation:
 		return json.Marshal(struct {
 			Kind SandboxViolationKind `json:"kind"`
@@ -1040,6 +1054,7 @@ func (s *SandboxViolation) UnmarshalJSON(data []byte) error {
 		Size        uint64               `json:"size"`
 		Limit       uint64               `json:"limit"`
 		Command     string               `json:"command"`
+		Message     string               `json:"message"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return err
@@ -1052,6 +1067,7 @@ func (s *SandboxViolation) UnmarshalJSON(data []byte) error {
 	s.Size = probe.Size
 	s.Limit = probe.Limit
 	s.Command = probe.Command
+	s.Message = probe.Message
 	return nil
 }
 
@@ -1072,6 +1088,8 @@ func (s *SandboxViolation) Error() string {
 		return fmt.Sprintf("sandbox: file size exceeded: %s (%d > %d)", s.Path, s.Size, s.Limit)
 	case SandboxDisallowedCommand:
 		return fmt.Sprintf("sandbox: disallowed command: %s", s.Command)
+	case SandboxExecSpawnFailed:
+		return fmt.Sprintf("sandbox: exec spawn failed: %s: %s", s.Command, s.Message)
 	default:
 		return fmt.Sprintf("sandbox violation: %s", s.Kind)
 	}
@@ -1133,6 +1151,38 @@ const (
 // WorkspaceConfig — sandbox construction inputs
 // ============================================================================
 
+// ExecConfig holds process-execution hardening knobs for
+// WorkspaceScopedSandbox.ExecuteCommand (SC-12). A nil *ExecConfig on
+// WorkspaceConfig.ExecConfig keeps the legacy behavior byte-identical: the
+// child inherits the parent's stdin and full environment, no implicit timeout
+// is applied, and a cancelled execute leaks nothing extra beyond what
+// exec.CommandContext already reaps. Setting it tightens subprocess execution —
+// the hardening the looper coding agent needs so build/test commands fail fast
+// on a prompt instead of hanging, and orphaned processes are reaped.
+type ExecConfig struct {
+	// DefaultTimeout is applied only when the per-call timeout argument is unset
+	// (zero). The per-call value always wins; this is the floor for callers that
+	// pass no timeout. Zero leaves such commands un-timed (legacy). Matches the
+	// per-call exec timeout convention (a time.Duration where > 0 means set).
+	DefaultTimeout time.Duration `json:"default_timeout,omitempty"`
+	// CloseStdin redirects the child's stdin from an empty reader so a command
+	// that blocks reading input fails fast (EOF) instead of hanging on the
+	// inherited terminal.
+	CloseStdin bool `json:"close_stdin,omitempty"`
+	// NonInteractiveEnv is environment variables forced onto every child (e.g.
+	// GIT_TERMINAL_PROMPT=0, DEBIAN_FRONTEND=noninteractive, CI=1) on top of the
+	// inherited environment, so would-be interactive prompts turn into
+	// non-interactive failures. Applied in sorted key order (deterministic),
+	// matching the Rust reference's BTreeMap.
+	NonInteractiveEnv map[string]string `json:"non_interactive_env,omitempty"`
+	// KillOnDrop kills the child if the execute is cancelled (e.g. an outer
+	// cancellation, or the timeout firing) instead of orphaning it. Go's
+	// exec.CommandContext already kills the child on context cancellation, so
+	// this knob is satisfied by construction; it is retained for parity and to
+	// document the intent.
+	KillOnDrop bool `json:"kill_on_drop,omitempty"`
+}
+
 // WorkspaceConfig is the input to NewWorkspaceScopedSandbox. Paths are kept
 // as strings to stay portable across the cross-language fixtures; the
 // canonical, OS-specific resolution happens inside the sandbox.
@@ -1144,6 +1194,17 @@ type WorkspaceConfig struct {
 	DeniedExtensions  []string `json:"denied_extensions,omitempty"`
 	ReadOnly          bool     `json:"read_only,omitempty"`
 	MaxFileSize       uint64   `json:"max_file_size,omitempty"`
+	// ExecConfig is optional process-execution hardening (SC-12). Nil keeps the
+	// legacy inherit-stdin / no-timeout / inherit-env behavior.
+	ExecConfig *ExecConfig `json:"exec_config,omitempty"`
+	// WriteRoot is an optional narrower boundary for OperationWrite (SC-13).
+	// When non-empty, writes must resolve under WriteRoot while reads (and
+	// execute) may range over the wider Root — "read-everywhere, write-scoped".
+	// Empty gates writes by Root exactly like reads (the legacy single-root
+	// behavior). Path strings stay root-relative for both reads and writes; only
+	// the write boundary check tightens. Canonicalized at construction and must
+	// exist; typically a subdirectory of Root.
+	WriteRoot string `json:"write_root,omitempty"`
 }
 
 // ============================================================================

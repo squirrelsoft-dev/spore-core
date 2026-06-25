@@ -251,6 +251,69 @@ func TestSandboxReadOfExistingInWorkspaceFileResolves(t *testing.T) {
 	}
 }
 
+// ============================================================================
+// SC-13 — read-everywhere / write-scoped (write_root)
+// ============================================================================
+
+func TestWriteRootAllowsReadEverywhereButScopesWrites(t *testing.T) {
+	dir := t.TempDir()
+	root, _ := filepath.EvalSymlinks(dir)
+	out := filepath.Join(root, "out")
+	if err := os.Mkdir(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "secret.txt"), []byte("s"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := cfg(root)
+	c.WriteRoot = out
+	sb, err := NewWorkspaceScopedSandbox(c)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	// Read-everywhere: a file under root but outside write_root resolves.
+	if _, v := sb.ResolvePath(context.Background(), "secret.txt", OperationRead); v != nil {
+		t.Fatalf("read under root must succeed, got %v", v)
+	}
+	// Write-scoped: writing that same file is a PathEscape.
+	_, v := sb.ResolvePath(context.Background(), "secret.txt", OperationWrite)
+	if v == nil || v.Kind != SandboxPathEscape {
+		t.Fatalf("write outside write_root must be PathEscape, got %v", v)
+	}
+	// A write under write_root (path strings stay root-relative) is OK.
+	if _, v := sb.ResolvePath(context.Background(), "out/result.txt", OperationWrite); v != nil {
+		t.Fatalf("write under write_root must succeed, got %v", v)
+	}
+}
+
+func TestNoWriteRootGatesWritesByRoot(t *testing.T) {
+	dir := t.TempDir()
+	root, _ := filepath.EvalSymlinks(dir)
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sb, _ := NewWorkspaceScopedSandbox(cfg(root))
+	// With write_root unset, writes resolve anywhere under root (legacy).
+	if _, v := sb.ResolvePath(context.Background(), "a.txt", OperationWrite); v != nil {
+		t.Fatalf("legacy write under root must succeed, got %v", v)
+	}
+}
+
+func TestBuildFailsWhenWriteRootMissing(t *testing.T) {
+	dir := t.TempDir()
+	root, _ := filepath.EvalSymlinks(dir)
+	c := cfg(root)
+	c.WriteRoot = filepath.Join(root, "does-not-exist")
+	_, err := NewWorkspaceScopedSandbox(c)
+	if err == nil {
+		t.Fatalf("expected a build error for a missing write_root")
+	}
+	be, ok := err.(*BuildError)
+	if !ok || be.Kind != BuildErrWriteRootNotFound {
+		t.Fatalf("expected WriteRootNotFound, got %v", err)
+	}
+}
+
 func TestSandboxViolationsRoundTripJSON(t *testing.T) {
 	cases := []SandboxViolation{
 		{Kind: SandboxPathEscape, Path: "/p"},
@@ -260,6 +323,7 @@ func TestSandboxViolationsRoundTripJSON(t *testing.T) {
 		{Kind: SandboxFileSizeExceeded, Path: "/p", Size: 1024, Limit: 100},
 		{Kind: SandboxDisallowedCommand, Command: "rm"},
 		{Kind: SandboxNetworkViolation, Host: "evil"},
+		{Kind: SandboxExecSpawnFailed, Command: "no-such-bin", Message: "exec: \"no-such-bin\": executable file not found in $PATH"},
 	}
 	for _, v := range cases {
 		raw, err := json.Marshal(v)
@@ -306,6 +370,140 @@ func TestSandboxExecuteCommandBubblewrapDisallowed(t *testing.T) {
 	_, v := sb.ExecuteCommand(context.Background(), "echo", nil, "", 0)
 	if v == nil || v.Kind != SandboxDisallowedCommand {
 		t.Fatalf("expected DisallowedCommand, got %v", v)
+	}
+}
+
+// ============================================================================
+// SC-15 — typed spawn failure
+// ============================================================================
+
+func TestSandboxExecuteCommandSpawnFailureIsTypedViolation(t *testing.T) {
+	dir := t.TempDir()
+	sb, _ := NewWorkspaceScopedSandbox(cfg(dir))
+	_, v := sb.ExecuteCommand(context.Background(), "spore-definitely-no-such-binary-xyz", nil, "", 0)
+	if v == nil {
+		t.Fatalf("expected a SandboxViolation for a missing binary, got nil")
+	}
+	if v.Kind != SandboxExecSpawnFailed {
+		t.Fatalf("expected SandboxExecSpawnFailed, got %v", v)
+	}
+	if v.Command != "spore-definitely-no-such-binary-xyz" {
+		t.Fatalf("command = %q, want the passed command", v.Command)
+	}
+	// Layer-2: a spawn failure is always recoverable, never halt-eligible.
+	if v.IsAlwaysHalt() {
+		t.Fatalf("exec_spawn_failed must not be halt-eligible")
+	}
+}
+
+// ============================================================================
+// SC-12 — ExecConfig exec-hardening knobs
+// ============================================================================
+
+// execCfg returns a WorkspaceConfig rooted at root with ec wired in.
+func execCfg(root string, ec *ExecConfig) WorkspaceConfig {
+	c := cfg(root)
+	c.ExecConfig = ec
+	return c
+}
+
+func TestExecConfigDefaultTimeoutAppliesWhenCallPassesNone(t *testing.T) {
+	dir := t.TempDir()
+	sb, _ := NewWorkspaceScopedSandbox(execCfg(dir, &ExecConfig{DefaultTimeout: 50 * time.Millisecond}))
+	// No per-call timeout (0) — the ExecConfig floor must still fire.
+	out, v := sb.ExecuteCommand(context.Background(), "sleep", []string{"5"}, "", 0)
+	if v != nil {
+		t.Fatalf("violation: %v", v)
+	}
+	if !out.TimedOut {
+		t.Fatalf("default_timeout did not apply: %+v", out)
+	}
+}
+
+func TestExecConfigPerCallTimeoutOverridesDefault(t *testing.T) {
+	dir := t.TempDir()
+	// A generous default that must NOT veto the tight per-call timeout.
+	sb, _ := NewWorkspaceScopedSandbox(execCfg(dir, &ExecConfig{DefaultTimeout: 30 * time.Second}))
+	out, v := sb.ExecuteCommand(context.Background(), "sleep", []string{"5"}, "", 50*time.Millisecond)
+	if v != nil {
+		t.Fatalf("violation: %v", v)
+	}
+	if !out.TimedOut {
+		t.Fatalf("per-call timeout should win over default: %+v", out)
+	}
+}
+
+func TestExecConfigNonInteractiveEnvIsInjected(t *testing.T) {
+	dir := t.TempDir()
+	sb, _ := NewWorkspaceScopedSandbox(execCfg(dir, &ExecConfig{
+		NonInteractiveEnv: map[string]string{"SPORE_SC12_ENV": "hardened"},
+	}))
+	out, v := sb.ExecuteCommand(context.Background(), "/bin/sh", []string{"-c", "echo $SPORE_SC12_ENV"}, "", 0)
+	if v != nil {
+		t.Fatalf("violation: %v", v)
+	}
+	if out.ExitCode != 0 {
+		t.Fatalf("exit code %d, want 0", out.ExitCode)
+	}
+	if !strings.Contains(out.Stdout, "hardened") {
+		t.Fatalf("env var not injected; stdout=%q", out.Stdout)
+	}
+}
+
+func TestExecConfigCloseStdinYieldsEOF(t *testing.T) {
+	dir := t.TempDir()
+	sb, _ := NewWorkspaceScopedSandbox(execCfg(dir, &ExecConfig{CloseStdin: true}))
+	// `cat` with no args reads stdin to EOF; with stdin closed it returns
+	// immediately with exit 0 and empty output. A generous per-call timeout
+	// guards against a hang if the knob regressed.
+	out, v := sb.ExecuteCommand(context.Background(), "cat", nil, "", 5*time.Second)
+	if v != nil {
+		t.Fatalf("violation: %v", v)
+	}
+	if out.TimedOut {
+		t.Fatalf("cat hung — stdin was not closed")
+	}
+	if out.ExitCode != 0 {
+		t.Fatalf("exit code %d, want 0", out.ExitCode)
+	}
+	if out.Stdout != "" {
+		t.Fatalf("expected empty stdout, got %q", out.Stdout)
+	}
+}
+
+func TestExecConfigKillOnDropReapsChildOnTimeout(t *testing.T) {
+	dir := t.TempDir()
+	root, _ := filepath.EvalSymlinks(dir)
+	sb, _ := NewWorkspaceScopedSandbox(execCfg(root, &ExecConfig{KillOnDrop: true}))
+	sentinel := filepath.Join(root, "kod_sentinel")
+	// The shell sleeps, then would `touch` the sentinel. The 100ms timeout
+	// cancels the context; exec.CommandContext kills the shell (Go's native
+	// kill-on-drop) before it can run `touch`, so the sentinel never appears.
+	script := "sleep 1; touch " + sentinel
+	out, v := sb.ExecuteCommand(context.Background(), "/bin/sh", []string{"-c", script}, "", 100*time.Millisecond)
+	if v != nil {
+		t.Fatalf("violation: %v", v)
+	}
+	if !out.TimedOut {
+		t.Fatalf("expected timed out, got %+v", out)
+	}
+	// Wait past when the un-killed shell would have created the sentinel.
+	time.Sleep(1500 * time.Millisecond)
+	if _, err := os.Stat(sentinel); err == nil {
+		t.Fatalf("child was not reaped on drop — sentinel was created")
+	}
+}
+
+func TestExecConfigUnsetIsLegacyBehavior(t *testing.T) {
+	dir := t.TempDir()
+	// Nil ExecConfig: no implicit timeout, inherited env, inherited stdin.
+	sb, _ := NewWorkspaceScopedSandbox(cfg(dir))
+	out, v := sb.ExecuteCommand(context.Background(), "echo", []string{"legacy"}, "", 0)
+	if v != nil {
+		t.Fatalf("violation: %v", v)
+	}
+	if out.ExitCode != 0 || !strings.Contains(out.Stdout, "legacy") {
+		t.Fatalf("unexpected legacy output: %+v", out)
 	}
 }
 

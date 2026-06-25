@@ -333,6 +333,66 @@ func TestHillClimbingRevertOnRegress(t *testing.T) {
 	}
 }
 
+// hcSpyVcs is a VcsProvider that counts Revert calls (SC-14), proving the
+// HillClimbing revert routes through a wired provider instead of the hardcoded
+// git-reset fallback. Log/Status return empty strings.
+type hcSpyVcs struct {
+	reverts int
+}
+
+func (s *hcSpyVcs) Log(_ context.Context, _ VcsLogArgs) (string, error) { return "", nil }
+func (s *hcSpyVcs) Status(_ context.Context) (string, error)            { return "", nil }
+func (s *hcSpyVcs) Revert(_ context.Context) error {
+	s.reverts++
+	return nil
+}
+
+var _ VcsProvider = (*hcSpyVcs)(nil)
+
+// SC-14: when a VcsProvider is wired, the revert routes THROUGH it and the
+// hardcoded git-reset fallback does NOT fire.
+func TestHillClimbingRevertRoutesThroughVcsProvider(t *testing.T) {
+	// minimize: baseline 2.0 kept, iter1 3.0 worse -> discard -> revert once.
+	eval := &scriptedMetricEvaluator{results: []*HillClimbMetricResult{res(2.0), res(3.0)}}
+	cfg, sb := hcConfig(t, eval)
+	vcs := &hcSpyVcs{}
+	cfg.VcsProvider = vcs
+	task := hcTask(OptimizationMinimize, u32(1), true, nil, nil)
+	h := NewStandardHarness(cfg)
+	r := h.Run(context.Background(), NewHarnessRunOptions(task))
+	if r.Kind != RunFailure || r.Reason.Kind != HaltStagnationLimitReached {
+		t.Fatalf("got %+v", r)
+	}
+	if vcs.reverts != 1 {
+		t.Fatalf("wired VcsProvider must own the revert: got %d reverts, want 1", vcs.reverts)
+	}
+	// The hardcoded git-reset fallback must NOT fire when a provider is wired.
+	for _, c := range sb.commands {
+		if len(c) >= 2 && c[0] == "git" && c[1] == "reset" {
+			t.Fatalf("hardcoded git-reset fallback fired despite a wired provider: %v", sb.commands)
+		}
+	}
+}
+
+// SC-14: GitVcsProvider.Revert issues `git reset --hard HEAD` through the
+// sandbox (the behavior relocated out of the harness).
+func TestGitVcsProviderRevertRunsGitResetHard(t *testing.T) {
+	sb := &hcRootedSandbox{root: t.TempDir()}
+	provider := NewGitVcsProvider(sb, sb.root)
+	if err := provider.Revert(context.Background()); err != nil {
+		t.Fatalf("revert: %v", err)
+	}
+	resets := 0
+	for _, c := range sb.commands {
+		if len(c) == 4 && c[0] == "git" && c[1] == "reset" && c[2] == "--hard" && c[3] == "HEAD" {
+			resets++
+		}
+	}
+	if resets != 1 {
+		t.Fatalf("expected exactly 1 git reset --hard HEAD, got %d (commands: %v)", resets, sb.commands)
+	}
+}
+
 func TestHillClimbingRevertOffRegress(t *testing.T) {
 	eval := &scriptedMetricEvaluator{results: []*HillClimbMetricResult{res(2.0), res(3.0)}}
 	cfg, sb := hcConfig(t, eval)
