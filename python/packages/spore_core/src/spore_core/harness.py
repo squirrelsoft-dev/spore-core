@@ -3805,6 +3805,18 @@ class SandboxDisallowedCommand(_Model):
     command: str
 
 
+class SandboxExecSpawnFailed(_Model):
+    """The process could not be spawned at all (e.g. the command binary does not
+    exist, or the OS refused the spawn). SC-15: this is reported as a typed
+    violation rather than a fake ``CommandOutput(exit_code=-1)``, so "the command
+    ran and exited -1" and "the command never started" are no longer conflated.
+    Always recoverable (never halt-eligible)."""
+
+    kind: Literal["exec_spawn_failed"] = "exec_spawn_failed"
+    command: str
+    message: str
+
+
 SandboxViolation = Annotated[
     SandboxPathEscape
     | SandboxNetworkViolation
@@ -3812,7 +3824,8 @@ SandboxViolation = Annotated[
     | SandboxReadOnlyViolation
     | SandboxExtensionDenied
     | SandboxFileSizeExceeded
-    | SandboxDisallowedCommand,
+    | SandboxDisallowedCommand
+    | SandboxExecSpawnFailed,
     Field(discriminator="kind"),
 ]
 
@@ -4446,6 +4459,34 @@ IsolationMode = Annotated[
 ]
 
 
+class ExecConfig(_Model):
+    """Process-execution hardening knobs for
+    :meth:`WorkspaceScopedSandbox.execute_command` (SC-12). ``None`` on
+    :attr:`WorkspaceConfig.exec_config` keeps the legacy behavior: the child
+    inherits the parent's stdin and full environment, no implicit timeout is
+    applied, and a dropped ``execute_command`` future leaks the child. Setting
+    it tightens subprocess execution — the hardening the looper coding agent
+    needs so build/test commands fail fast on a prompt instead of hanging, and
+    orphaned processes are reaped. Mirrors Rust's ``ExecConfig``."""
+
+    #: Timeout (SECONDS) applied when the per-call ``timeout`` argument is
+    #: ``None``. The per-call value always wins; this is the floor for callers
+    #: that pass no timeout. ``None`` leaves such commands un-timed (legacy).
+    default_timeout: float | None = None
+    #: Redirect the child's stdin from the null device so a command that blocks
+    #: reading input fails fast instead of hanging on the inherited terminal.
+    close_stdin: bool = False
+    #: Environment variables forced onto every child (e.g.
+    #: ``GIT_TERMINAL_PROMPT=0``, ``DEBIAN_FRONTEND=noninteractive``, ``CI=1``)
+    #: on top of the inherited environment, so would-be interactive prompts turn
+    #: into non-interactive failures. Applied in SORTED key order (deterministic,
+    #: matching Rust's ``BTreeMap``).
+    non_interactive_env: dict[str, str] = Field(default_factory=dict)
+    #: Kill the child if the ``execute_command`` future is cancelled (e.g. an
+    #: outer cancellation, or the timeout firing) instead of orphaning it.
+    kill_on_drop: bool = False
+
+
 class WorkspaceConfig(_Model):
     """Configuration injected at harness construction time.
 
@@ -4461,6 +4502,17 @@ class WorkspaceConfig(_Model):
     denied_extensions: list[str] = Field(default_factory=list)
     read_only: bool = False
     max_file_size: int = 0
+    #: Optional process-execution hardening (SC-12). ``None`` keeps the legacy
+    #: inherit-stdin / no-timeout / inherit-env / leak-on-drop behavior.
+    exec_config: ExecConfig | None = None
+    #: Optional narrower boundary for :data:`Operation` ``"write"`` (SC-13).
+    #: When set, writes must resolve under ``write_root`` while reads (and
+    #: execute) may range over the wider :attr:`root` — "read-everywhere,
+    #: write-scoped". ``None`` gates writes by ``root`` exactly like reads (the
+    #: legacy single-root behavior). Path strings stay root-relative for both
+    #: reads and writes; only the boundary check tightens. Canonicalized at
+    #: construction and must exist; typically a subdirectory of ``root``.
+    write_root: Path | None = None
 
 
 @runtime_checkable
@@ -4551,6 +4603,18 @@ class VcsProvider(Protocol):
         """Return the working-tree status (``git status`` stdout), verbatim."""
         ...
 
+    async def revert(self) -> None:
+        """Revert the working tree to the last known-good state (SC-14). Called
+        by the HillClimbing loop to discard a no-improvement iteration's changes.
+        The default is a NO-OP so a provider that has no concept of revert — or
+        whose workspace is not under version control — keeps satisfying the
+        Protocol and simply leaves the tree as-is. :class:`GitVcsProvider`
+        overrides it with ``git reset --hard HEAD``; a consumer climbing a
+        non-git workspace supplies its own. Like the HillClimbing loop's use of
+        it, this is best-effort: an error is surfaced but does not halt the
+        climb."""
+        return None
+
 
 class GitVcsProvider:
     """Real :class:`VcsProvider` that shells out to ``git`` THROUGH a
@@ -4593,6 +4657,12 @@ class GitVcsProvider:
     async def status(self) -> str:
         return await self._run(["status"])
 
+    async def revert(self) -> None:
+        # SC-14: ``git reset --hard HEAD`` THROUGH the sandbox — never spawned
+        # directly. Relocated from the harness's hardcoded revert. ``_run``
+        # raises :class:`VcsError` on a sandbox block or non-zero exit.
+        await self._run(["reset", "--hard", "HEAD"])
+
 
 class BaseSandboxProvider:
     """Concrete base class providing default implementations of
@@ -4624,12 +4694,13 @@ class BaseSandboxProvider:
                 cwd=str(working_dir) if working_dir is not None else None,
             )
         except (FileNotFoundError, OSError) as e:
-            return CommandOutput(
-                stdout="",
-                stderr=f"spawn failed: {e}",
-                exit_code=-1,
-                timed_out=False,
-            )
+            # SC-15: a failed spawn is a typed violation, not a fake
+            # exit_code: -1 success. Callers already handle the exception.
+            from .sandbox import SandboxViolationException
+
+            raise SandboxViolationException(
+                SandboxExecSpawnFailed(command=command, message=str(e))
+            ) from e
         try:
             if timeout is not None:
                 stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -8742,11 +8813,22 @@ class StandardHarness:
         return None
 
     async def _hill_climbing_revert(self) -> None:
-        """Revert the working tree to current HEAD for a no-improvement iteration
-        (issue #60, Decision 1). Runs ``git reset --hard HEAD`` THROUGH the
-        sandbox; the harness NEVER spawns git directly. A sandbox rejection /
-        non-zero exit is best-effort: the loop continues (the next agent turn
-        re-derives state). Mirrors Rust's ``hill_climbing_revert``."""
+        """Revert the working tree for a no-improvement iteration (issue #60,
+        Decision 1). SC-14: when a :class:`VcsProvider` is wired it owns the
+        revert (e.g. :class:`GitVcsProvider` runs ``git reset --hard HEAD``, a
+        custom provider does whatever its workspace needs); with no provider (the
+        default) the harness falls back to the original hardcoded
+        ``git reset --hard HEAD`` THROUGH the sandbox — byte-identical to the
+        pre-SC-14 behavior. Either way the harness NEVER spawns git directly, and
+        the revert is best-effort: an error/non-zero exit is swallowed and the
+        loop continues (the next agent turn re-derives state). Mirrors Rust's
+        ``hill_climbing_revert``."""
+        if self._config.vcs_provider is not None:
+            try:
+                await self._config.vcs_provider.revert()
+            except Exception:  # noqa: BLE001 — revert is best-effort; never abort the loop
+                pass
+            return
         try:
             await self._config.sandbox.execute_command("git", ["reset", "--hard", "HEAD"])
         except Exception:  # noqa: BLE001 — revert is best-effort; never abort the loop
@@ -11157,6 +11239,7 @@ __all__ = [
     "BudgetExhausted",
     "BudgetStack",
     "ErrorRun",
+    "ExecConfig",
     "ExecutionContext",
     "ExhaustedResolution",
     "ExhaustionCause",
@@ -11222,6 +11305,7 @@ __all__ = [
     "NetworkPolicyNone",
     "Operation",
     "SandboxDisallowedCommand",
+    "SandboxExecSpawnFailed",
     "SandboxExtensionDenied",
     "SandboxFileSizeExceeded",
     "SandboxNetworkViolation",

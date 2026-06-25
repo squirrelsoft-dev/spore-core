@@ -129,11 +129,30 @@ def _agent() -> MockAgent:
     return a
 
 
+class SpyVcs:
+    """A :class:`VcsProvider` that spies on ``revert()`` calls (SC-14). Used to
+    prove the HillClimbing revert routes through a wired provider instead of the
+    hardcoded git fallback. ``log``/``status`` return empty strings."""
+
+    def __init__(self) -> None:
+        self.revert_count = 0
+
+    async def log(self, args: Any) -> str:
+        return ""
+
+    async def status(self) -> str:
+        return ""
+
+    async def revert(self) -> None:
+        self.revert_count += 1
+
+
 def _config(
     *,
     sandbox: RecordingSandbox,
     evaluator: Any,
     observability: Any = None,
+    vcs_provider: Any = None,
 ) -> HarnessConfig:
     from spore_core import AlwaysContinuePolicy, EscalationModeAutonomous, ScriptedToolRegistry
 
@@ -145,6 +164,7 @@ def _config(
         termination_policy=AlwaysContinuePolicy(),
         metric_evaluator=evaluator,
         observability=observability,
+        vcs_provider=vcs_provider,
         # #130: pin Autonomous so a budget exhaustion PROPAGATES (the #125 path
         # these tests assert) rather than pausing under the default SurfaceToHuman.
         escalation_mode=EscalationModeAutonomous(),
@@ -330,6 +350,38 @@ async def test_revert_off_regress(tmp_path: Path) -> None:
     r = await h.run(HarnessRunOptions(task))
     assert isinstance(r, RunResultFailure)
     assert sb.revert_count == 0
+
+
+# ---------------------------------------------------------------------------
+# SC-14: pluggable VcsProvider revert.
+# ---------------------------------------------------------------------------
+
+
+async def test_revert_routes_through_vcs_provider(tmp_path: Path) -> None:
+    # SC-14: when a VcsProvider is wired, the revert routes THROUGH it and the
+    # hardcoded git-reset fallback does NOT fire.
+    sb = RecordingSandbox(tmp_path)
+    ev = ScriptedEvaluator([2.0, 3.0], direction="minimize")
+    vcs = SpyVcs()
+    task = _task(direction="minimize", max_stagnation=1, revert=True)
+    h = StandardHarness(_config(sandbox=sb, evaluator=ev, vcs_provider=vcs))
+    r = await h.run(HarnessRunOptions(task))
+    assert isinstance(r, RunResultFailure)
+    assert vcs.revert_count == 1, "wired VcsProvider owns the revert"
+    assert sb.revert_count == 0, (
+        "hardcoded git-reset fallback must NOT fire when a provider is wired"
+    )
+
+
+async def test_git_vcs_provider_revert_runs_git_reset_hard(tmp_path: Path) -> None:
+    # SC-14: GitVcsProvider.revert issues `git reset --hard HEAD` through the
+    # sandbox (the behavior relocated out of the harness).
+    from spore_core import GitVcsProvider
+
+    sb = RecordingSandbox(tmp_path)
+    provider = GitVcsProvider(sb, tmp_path)
+    await provider.revert()
+    assert sb.revert_count == 1
 
 
 # ---------------------------------------------------------------------------

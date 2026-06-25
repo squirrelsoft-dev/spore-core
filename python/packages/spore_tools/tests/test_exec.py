@@ -10,7 +10,12 @@ from pathlib import Path
 
 import pytest
 
-from spore_core.harness import ToolOutputError, ToolOutputSuccess
+from spore_core.harness import (
+    SandboxExecSpawnFailed,
+    ToolOutputError,
+    ToolOutputSandboxViolation,
+    ToolOutputSuccess,
+)
 from spore_core.model import ToolCall
 from spore_core.tool_registry import AllowAllSandbox, make_test_ctx
 from spore_tools.tools.exec import BashCommandTool, ExecTool, _truncate_for_message
@@ -79,6 +84,20 @@ async def test_exec_invalid_params_returns_recoverable_error() -> None:
     assert r.recoverable is True
 
 
+async def test_exec_missing_binary_surfaces_typed_spawn_violation() -> None:
+    # SC-15: a missing binary no longer returns a fake exit_code=-1. The sandbox
+    # raises SandboxViolationException(SandboxExecSpawnFailed), which the tool
+    # carries to the harness as a typed ToolOutputSandboxViolation (recoverable
+    # feedback by default, since exec_spawn_failed is Layer-2 / never halt).
+    sb = AllowAllSandbox()
+    r = await ExecTool().execute(
+        _call("exec", {"command": "spore-definitely-no-such-binary-xyz"}), sb, _CTX
+    )
+    assert isinstance(r, ToolOutputSandboxViolation)
+    assert isinstance(r.violation, SandboxExecSpawnFailed)
+    assert r.violation.command == "spore-definitely-no-such-binary-xyz"
+
+
 # ---------------- BashCommandTool (real shell) ----------------
 
 
@@ -138,7 +157,7 @@ async def test_bash_command_large_stderr_is_truncated_in_error_message() -> None
     r = await BashCommandTool().execute(
         _call(
             "bash_command",
-            {"script": "awk 'BEGIN{for(i=0;i<10240;i++)printf \"x\" > \"/dev/stderr\"; exit 1}'"},
+            {"script": 'awk \'BEGIN{for(i=0;i<10240;i++)printf "x" > "/dev/stderr"; exit 1}\''},
         ),
         sb,
         _CTX,

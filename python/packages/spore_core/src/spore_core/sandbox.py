@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import warnings
 from pathlib import Path
 
@@ -28,6 +29,7 @@ from .harness import (
     IsolationModeWorkspaceScoped,
     Operation,
     SandboxDisallowedCommand,
+    SandboxExecSpawnFailed,
     SandboxExtensionDenied,
     SandboxFileSizeExceeded,
     SandboxPathDenied,
@@ -85,6 +87,21 @@ class WorkspaceScopedSandbox:
         except OSError as e:
             raise SandboxBuildError(f"workspace root io error: {config.root}: {e}") from e
 
+        # SC-13: canonicalize the optional write_root the same way so the
+        # boundary check compares canonical paths. It must already exist.
+        canonical_write_root: Path | None = None
+        if config.write_root is not None:
+            try:
+                canonical_write_root = config.write_root.resolve(strict=True)
+            except FileNotFoundError as e:
+                raise SandboxBuildError(
+                    f"workspace write_root does not exist: {config.write_root}"
+                ) from e
+            except OSError as e:
+                raise SandboxBuildError(
+                    f"workspace write_root io error: {config.write_root}: {e}"
+                ) from e
+
         self._config = config.model_copy(
             update={
                 "root": canonical,
@@ -92,6 +109,7 @@ class WorkspaceScopedSandbox:
                     self._normalize_under(canonical, p) for p in config.allowed_paths
                 ],
                 "denied_paths": [self._normalize_under(canonical, p) for p in config.denied_paths],
+                "write_root": canonical_write_root,
             }
         )
         self._mode: IsolationMode = mode or IsolationModeWorkspaceScoped()
@@ -184,9 +202,19 @@ class WorkspaceScopedSandbox:
         except OSError:
             return SandboxPathEscape(path=raw)
 
-        # 3. Boundary check.
+        # 3. Boundary check. Reads and execute must stay under the read `root`;
+        #    writes must stay under `write_root` when set (SC-13:
+        #    read-everywhere, write-scoped). The path string was already joined
+        #    onto `root` above — `write_root` only narrows where the resolved
+        #    target is allowed to land, it is NOT a separate join base — so a
+        #    write outside `write_root` is a PathEscape even though it lives
+        #    under `root`.
+        if operation == "write" and self._config.write_root is not None:
+            boundary = self._config.write_root
+        else:
+            boundary = root
         try:
-            canonical.relative_to(root)
+            canonical.relative_to(boundary)
         except ValueError:
             return SandboxPathEscape(path=str(canonical))
 
@@ -261,6 +289,29 @@ class WorkspaceScopedSandbox:
             )
 
         cwd = str(working_dir) if working_dir is not None else str(self._config.root)
+
+        # SC-12: apply exec-hardening knobs when configured. The per-call
+        # `timeout` always wins; `default_timeout` is the floor for callers that
+        # pass `None`. `None` exec_config keeps the legacy spawn byte-identical.
+        ec = self._config.exec_config
+        spawn_kwargs: dict[str, object] = {}
+        effective_timeout = timeout
+        kill_on_drop = False
+        if ec is not None:
+            if ec.close_stdin:
+                spawn_kwargs["stdin"] = asyncio.subprocess.DEVNULL
+            if ec.non_interactive_env:
+                # `env=` REPLACES the environment, so merge the forced vars on top
+                # of the inherited one. Applied in SORTED key order (deterministic,
+                # matching Rust's BTreeMap).
+                merged_env = dict(os.environ)
+                for k in sorted(ec.non_interactive_env):
+                    merged_env[k] = ec.non_interactive_env[k]
+                spawn_kwargs["env"] = merged_env
+            kill_on_drop = ec.kill_on_drop
+            if timeout is None:
+                effective_timeout = ec.default_timeout
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 command,
@@ -268,19 +319,20 @@ class WorkspaceScopedSandbox:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
+                **spawn_kwargs,  # type: ignore[arg-type]
             )
         except (FileNotFoundError, OSError) as e:
-            return CommandOutput(
-                stdout="",
-                stderr=f"spawn failed: {e}",
-                exit_code=-1,
-                timed_out=False,
-                truncated=False,
-            )
+            # SC-15: a failed spawn is a typed violation, not a fake
+            # exit_code: -1 success. Callers already handle the exception.
+            raise SandboxViolationException(
+                SandboxExecSpawnFailed(command=command, message=str(e))
+            ) from e
 
         try:
-            if timeout is not None:
-                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if effective_timeout is not None:
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    proc.communicate(), timeout=effective_timeout
+                )
             else:
                 stdout_b, stderr_b = await proc.communicate()
         except asyncio.TimeoutError:
@@ -292,7 +344,7 @@ class WorkspaceScopedSandbox:
                 await proc.wait()
             except (ProcessLookupError, asyncio.CancelledError):
                 pass
-            secs = int(timeout) if timeout is not None else 0
+            secs = int(effective_timeout) if effective_timeout is not None else 0
             return CommandOutput(
                 stdout="",
                 stderr=f"command timed out after {secs}s",
@@ -300,6 +352,17 @@ class WorkspaceScopedSandbox:
                 timed_out=True,
                 truncated=False,
             )
+        except asyncio.CancelledError:
+            # SC-12 kill_on_drop: the execute_command future was cancelled. Reap
+            # the child instead of orphaning it, then re-raise so cancellation
+            # still propagates. Without the knob the child is left running
+            # (legacy leak-on-drop behavior).
+            if kill_on_drop:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            raise
 
         return CommandOutput(
             stdout=stdout_b.decode("utf-8", errors="replace"),

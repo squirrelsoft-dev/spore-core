@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -10,17 +11,21 @@ import pytest
 
 from spore_core.dangerous import IsolationModeNone
 from spore_core.harness import (
+    ExecConfig,
     IsolationModeBubblewrap,
     IsolationModeDocker,
     IsolationModeWorkspaceScoped,
     NetworkPolicyNone,
     SandboxDisallowedCommand,
+    SandboxExecSpawnFailed,
     SandboxExtensionDenied,
     SandboxFileSizeExceeded,
     SandboxPathDenied,
     SandboxPathEscape,
     SandboxReadOnlyViolation,
+    SandboxViolation,
     WorkspaceConfig,
+    sandbox_violation_is_always_halt,
 )
 from spore_core.sandbox import (
     SandboxBuildError,
@@ -219,6 +224,142 @@ async def test_execute_command_docker_disallowed(tmp_path: Path) -> None:
     with pytest.raises(SandboxViolationException) as ei:
         await sb.execute_command("echo", ["hi"], None, None)
     assert isinstance(ei.value.violation, SandboxDisallowedCommand)
+
+
+# ----- SC-12: ExecConfig exec-hardening knobs ------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX tools only")
+async def test_exec_config_default_timeout_applies_when_call_passes_none(tmp_path: Path) -> None:
+    # No per-call timeout — the exec_config floor must still fire.
+    sb = WorkspaceScopedSandbox(_cfg(tmp_path, exec_config=ExecConfig(default_timeout=0.05)))
+    out = await sb.execute_command("sleep", ["5"], None, None)
+    assert out.timed_out is True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX tools only")
+async def test_exec_config_per_call_timeout_overrides_default(tmp_path: Path) -> None:
+    # A generous default that must NOT veto the tight per-call one.
+    sb = WorkspaceScopedSandbox(_cfg(tmp_path, exec_config=ExecConfig(default_timeout=30.0)))
+    out = await sb.execute_command("sleep", ["5"], None, 0.05)
+    assert out.timed_out is True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX tools only")
+async def test_exec_config_non_interactive_env_is_injected(tmp_path: Path) -> None:
+    sb = WorkspaceScopedSandbox(
+        _cfg(tmp_path, exec_config=ExecConfig(non_interactive_env={"SPORE_SC12_ENV": "hardened"}))
+    )
+    out = await sb.execute_command("/bin/sh", ["-c", "echo $SPORE_SC12_ENV"], None, None)
+    assert out.exit_code == 0
+    assert "hardened" in out.stdout
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX tools only")
+async def test_exec_config_close_stdin_yields_eof(tmp_path: Path) -> None:
+    # `cat` with no args reads stdin to EOF; with stdin redirected to the null
+    # device it returns immediately with exit 0 and empty output. A generous
+    # per-call timeout guards the test against a hang if the knob regressed.
+    sb = WorkspaceScopedSandbox(_cfg(tmp_path, exec_config=ExecConfig(close_stdin=True)))
+    out = await sb.execute_command("cat", [], None, 5.0)
+    assert out.timed_out is False
+    assert out.exit_code == 0
+    assert out.stdout == ""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX tools only")
+async def test_exec_config_kill_on_drop_reaps_child_on_cancel(tmp_path: Path) -> None:
+    # SC-12: cancelling the execute_command future reaps the child instead of
+    # orphaning it. The shell sleeps, then would `touch` a sentinel; cancelling
+    # before the sleep elapses kills the shell so the sentinel never appears.
+    root = tmp_path.resolve()
+    sentinel = root / "kod_sentinel"
+    sb = WorkspaceScopedSandbox(_cfg(root, exec_config=ExecConfig(kill_on_drop=True)))
+    script = f"sleep 1; touch {sentinel}"
+    task = asyncio.ensure_future(sb.execute_command("/bin/sh", ["-c", script], None, None))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # Wait past when the un-killed shell would have created the sentinel.
+    await asyncio.sleep(1.5)
+    assert not sentinel.exists(), "child was not reaped on cancel — sentinel was created"
+
+
+async def test_exec_config_unset_keeps_legacy_behavior(tmp_path: Path) -> None:
+    # Unset exec_config: no implicit timeout, inherited stdin/env (byte-identical
+    # legacy). A quick echo just confirms the unset path still runs.
+    sb = WorkspaceScopedSandbox(_cfg(tmp_path))
+    assert sb.config.exec_config is None
+    out = await sb.execute_command("echo", ["legacy"], None, None)
+    assert out.exit_code == 0
+    assert "legacy" in out.stdout
+
+
+# ----- SC-13: read-everywhere / write-scoped (write_root) ------------------
+
+
+async def test_write_root_allows_read_everywhere_but_scopes_writes(tmp_path: Path) -> None:
+    root = tmp_path.resolve()
+    out = root / "out"
+    out.mkdir()
+    (root / "secret.txt").write_text("s")
+    sb = WorkspaceScopedSandbox(_cfg(root, write_root=out))
+
+    # Read-everywhere: a file under `root` but outside `write_root` resolves.
+    await sb.resolve_path("secret.txt", "read")
+    # Write-scoped: writing that same file is a PathEscape.
+    with pytest.raises(SandboxViolationException) as ei:
+        await sb.resolve_path("secret.txt", "write")
+    assert isinstance(ei.value.violation, SandboxPathEscape)
+    # A write under `write_root` (path strings stay root-relative) is OK.
+    resolved = await sb.resolve_path("out/result.txt", "write")
+    assert resolved == out / "result.txt"
+
+
+async def test_no_write_root_gates_writes_by_root(tmp_path: Path) -> None:
+    root = tmp_path.resolve()
+    (root / "a.txt").write_text("x")
+    sb = WorkspaceScopedSandbox(_cfg(root))
+    # With write_root unset, writes resolve anywhere under `root` (legacy).
+    await sb.resolve_path("a.txt", "write")
+
+
+def test_build_fails_when_write_root_missing(tmp_path: Path) -> None:
+    root = tmp_path.resolve()
+    with pytest.raises(SandboxBuildError):
+        WorkspaceScopedSandbox(_cfg(root, write_root=root / "does-not-exist"))
+
+
+# ----- SC-15: typed spawn failure ------------------------------------------
+
+
+async def test_execute_command_spawn_failure_is_typed_violation(tmp_path: Path) -> None:
+    # SC-15: a command that cannot be spawned raises SandboxViolationException
+    # wrapping SandboxExecSpawnFailed, not a fake Ok(exit_code=-1).
+    sb = WorkspaceScopedSandbox(_cfg(tmp_path))
+    with pytest.raises(SandboxViolationException) as ei:
+        await sb.execute_command("spore-definitely-no-such-binary-xyz", [], None, None)
+    violation = ei.value.violation
+    assert isinstance(violation, SandboxExecSpawnFailed)
+    assert violation.command == "spore-definitely-no-such-binary-xyz"
+    # And it is never halt-eligible (always recoverable feedback).
+    assert sandbox_violation_is_always_halt(violation) is False
+
+
+def test_exec_spawn_failed_round_trips() -> None:
+    # SC-15: the new variant model_dump/model_validate round-trips through the
+    # discriminated SandboxViolation union, byte-stable on the `kind` tag.
+    from pydantic import TypeAdapter
+
+    adapter: TypeAdapter[object] = TypeAdapter(SandboxViolation)
+    v = SandboxExecSpawnFailed(command="no-such-bin", message="No such file or directory")
+    dumped = v.model_dump()
+    assert dumped["kind"] == "exec_spawn_failed"
+    back = adapter.validate_python(dumped)
+    assert isinstance(back, SandboxExecSpawnFailed)
+    assert back.command == "no-such-bin"
+    assert back.message == "No such file or directory"
 
 
 # ----- handle_large_output ------------------------------------------------

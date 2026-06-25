@@ -31,6 +31,13 @@ from ._common import finish_with_possible_truncation
 from .error import InvalidParameters, SandboxViolationError, ToolExecutionError
 from .params import ExecParams, RunTestsParams, ShellCommandParams, parse_params
 
+# SC-15: a spawn failure surfaces from ``execute_command`` as a typed
+# ``SandboxViolationException`` (wrapping ``SandboxExecSpawnFailed``) rather than
+# a fake ``exit_code: -1``. Carry the typed violation to the harness, which
+# applies its ``SandboxViolationPolicy`` — recoverable feedback by default, since
+# ``exec_spawn_failed`` is Layer-2 (never halt-eligible). Mirrors Rust's
+# ``Err(v) => ToolExecutionError::SandboxViolation(v).into()``.
+
 _STDERR_TRUNCATION_THRESHOLD = 8 * 1024
 _STDERR_HEAD = 2 * 1024
 _STDERR_TAIL = 2 * 1024
@@ -45,7 +52,7 @@ def _truncate_for_message(s: str) -> str:
     if len(s) <= _STDERR_TRUNCATION_THRESHOLD:
         return s
     head = s[:_STDERR_HEAD]
-    tail = s[len(s) - _STDERR_TAIL:]
+    tail = s[len(s) - _STDERR_TAIL :]
     elided = len(s) - _STDERR_HEAD - _STDERR_TAIL
     return f"{head}\n... [{elided} bytes elided] ...\n{tail}"
 
@@ -96,7 +103,10 @@ class ExecTool:
         except ToolExecutionError as e:
             return e.to_tool_output()
         timeout = float(params.timeout) if params.timeout is not None else None
-        out = await sandbox.execute_command(params.command, params.args, None, timeout)
+        try:
+            out = await sandbox.execute_command(params.command, params.args, None, timeout)
+        except SandboxViolationException as e:
+            return SandboxViolationError(violation=e.violation).to_tool_output()
         if out.timed_out:
             secs = int(timeout) if timeout is not None else 0
             return ToolOutputError(message=f"command timed out after {secs}s", recoverable=True)
@@ -170,7 +180,10 @@ class BashCommandTool:
                 working = await sandbox.resolve_path(params.working_dir, "read")
             except SandboxViolationException as e:
                 return SandboxViolationError(violation=e.violation).to_tool_output()
-        out = await sandbox.execute_command("/bin/sh", ["-c", params.script], working, timeout)
+        try:
+            out = await sandbox.execute_command("/bin/sh", ["-c", params.script], working, timeout)
+        except SandboxViolationException as e:
+            return SandboxViolationError(violation=e.violation).to_tool_output()
         if out.timed_out:
             secs = int(timeout) if timeout is not None else 0
             return ToolOutputError(message=f"command timed out after {secs}s", recoverable=True)
@@ -224,7 +237,10 @@ class RunTestsTool:
             return InvalidParameters(reason="command must not be empty").to_tool_output()
         program, *args = parts
         timeout = float(params.timeout) if params.timeout is not None else None
-        out = await sandbox.execute_command(program, args, working, timeout)
+        try:
+            out = await sandbox.execute_command(program, args, working, timeout)
+        except SandboxViolationException as e:
+            return SandboxViolationError(violation=e.violation).to_tool_output()
         if out.timed_out:
             secs = int(timeout) if timeout is not None else 0
             return ToolOutputError(message=f"tests timed out after {secs}s", recoverable=True)

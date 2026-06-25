@@ -10,10 +10,11 @@ from spore_core.harness import (
     ToolOutputSuccess,
 )
 from spore_core.model import ToolCall
+from spore_core.sandbox import SandboxViolationException
 from spore_core.tool_registry import ToolAnnotations, ToolContext, ToolSchema
 
 from ._common import finish_with_possible_truncation
-from .error import ToolExecutionError
+from .error import SandboxViolationError, ToolExecutionError
 from .params import (
     GitCommitParams,
     GitDiffParams,
@@ -26,7 +27,18 @@ from .params import (
 
 
 async def _run_git(args: list[str], sandbox: SandboxProvider) -> CommandOutput:
-    return await sandbox.execute_command("git", args, None, None)
+    # SC-15: a git spawn failure surfaces from ``execute_command`` as a typed
+    # ``SandboxViolationException`` (wrapping ``SandboxExecSpawnFailed``) rather
+    # than a fake ``exit_code: -1``. Re-raise it as a ``SandboxViolationError``
+    # (a ``ToolExecutionError``) so each tool's existing ``except
+    # ToolExecutionError`` arm carries the typed violation to the harness, which
+    # applies its ``SandboxViolationPolicy`` — recoverable feedback by default,
+    # since ``exec_spawn_failed`` is Layer-2 (never halt-eligible). Mirrors
+    # Rust's ``run_git`` → ``.map_err(ToolExecutionError::SandboxViolation)``.
+    try:
+        return await sandbox.execute_command("git", args, None, None)
+    except SandboxViolationException as e:
+        raise SandboxViolationError(violation=e.violation) from e
 
 
 def _classify(out: CommandOutput) -> tuple[bool, str]:
@@ -69,14 +81,14 @@ class GitLogTool:
     ) -> ToolOutput:
         try:
             params = parse_params(GitLogParams, call)
+            args = ["log", "-n", str(params.n)]
+            if params.format == "oneline":
+                args.append("--oneline")
+            else:
+                args.append(f"--format={params.format}")
+            out = await _run_git(args, sandbox)
         except ToolExecutionError as e:
             return e.to_tool_output()
-        args = ["log", "-n", str(params.n)]
-        if params.format == "oneline":
-            args.append("--oneline")
-        else:
-            args.append(f"--format={params.format}")
-        out = await _run_git(args, sandbox)
         is_err, body = _classify(out)
         if is_err:
             return ToolOutputError(message=body, recoverable=True)
@@ -115,14 +127,14 @@ class GitDiffTool:
     ) -> ToolOutput:
         try:
             params = parse_params(GitDiffParams, call)
+            args = ["diff"]
+            if params.from_ is not None:
+                args.append(params.from_)
+            if params.to is not None:
+                args.append(params.to)
+            out = await _run_git(args, sandbox)
         except ToolExecutionError as e:
             return e.to_tool_output()
-        args = ["diff"]
-        if params.from_ is not None:
-            args.append(params.from_)
-        if params.to is not None:
-            args.append(params.to)
-        out = await _run_git(args, sandbox)
         is_err, body = _classify(out)
         if is_err:
             return ToolOutputError(message=body, recoverable=True)
@@ -162,16 +174,16 @@ class GitCommitTool:
     ) -> ToolOutput:
         try:
             params = parse_params(GitCommitParams, call)
+            combined = ""
+            if params.files:
+                add_out = await _run_git(["add", *params.files], sandbox)
+                is_err, body = _classify(add_out)
+                if is_err:
+                    return ToolOutputError(message=body, recoverable=True)
+                combined += body
+            out = await _run_git(["commit", "-m", params.message], sandbox)
         except ToolExecutionError as e:
             return e.to_tool_output()
-        combined = ""
-        if params.files:
-            out = await _run_git(["add", *params.files], sandbox)
-            is_err, body = _classify(out)
-            if is_err:
-                return ToolOutputError(message=body, recoverable=True)
-            combined += body
-        out = await _run_git(["commit", "-m", params.message], sandbox)
         is_err, body = _classify(out)
         if is_err:
             return ToolOutputError(message=body, recoverable=True)
@@ -209,7 +221,10 @@ class GitStatusTool:
         except ToolExecutionError:
             # status takes no params — be lenient like the Rust reference.
             pass
-        out = await _run_git(["status", "--porcelain"], sandbox)
+        try:
+            out = await _run_git(["status", "--porcelain"], sandbox)
+        except ToolExecutionError as e:
+            return e.to_tool_output()
         is_err, body = _classify(out)
         if is_err:
             return ToolOutputError(message=body, recoverable=True)
@@ -252,14 +267,14 @@ class GitResetTool:
     ) -> ToolOutput:
         try:
             params = parse_params(GitResetParams, call)
+            flag = {
+                GitResetMode.HARD: "--hard",
+                GitResetMode.SOFT: "--soft",
+                GitResetMode.MIXED: "--mixed",
+            }[params.mode]
+            out = await _run_git(["reset", flag, params.target], sandbox)
         except ToolExecutionError as e:
             return e.to_tool_output()
-        flag = {
-            GitResetMode.HARD: "--hard",
-            GitResetMode.SOFT: "--soft",
-            GitResetMode.MIXED: "--mixed",
-        }[params.mode]
-        out = await _run_git(["reset", flag, params.target], sandbox)
         is_err, body = _classify(out)
         if is_err:
             return ToolOutputError(message=body, recoverable=True)
