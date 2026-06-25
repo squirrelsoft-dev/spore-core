@@ -5079,6 +5079,19 @@ pub trait VcsProvider: Send + Sync {
 
     /// Return the working-tree status (e.g. `git status` stdout), verbatim.
     fn status<'a>(&'a self) -> BoxFut<'a, Result<String, VcsError>>;
+
+    /// Revert the working tree to the last known-good state (SC-14). Called by
+    /// the HillClimbing loop to discard a no-improvement iteration's changes.
+    /// The default is a NO-OP (`Ok(())`) so a provider that has no concept of
+    /// revert — or whose workspace is not under version control — keeps
+    /// compiling and simply leaves the tree as-is. [`GitVcsProvider`] overrides
+    /// it with `git reset --hard HEAD`; a consumer climbing a non-git workspace
+    /// (or one whose "checkpoint" means something else) supplies its own. Like
+    /// the HillClimbing loop's use of it, this is best-effort: an error is
+    /// surfaced but does not halt the climb.
+    fn revert<'a>(&'a self) -> BoxFut<'a, Result<(), VcsError>> {
+        Box::pin(async move { Ok(()) })
+    }
 }
 
 /// Parameters shaping a [`VcsProvider::log`] read. Each field maps to a
@@ -5186,6 +5199,29 @@ impl VcsProvider for GitVcsProvider {
                 });
             }
             Ok(out.stdout)
+        })
+    }
+
+    fn revert<'a>(&'a self) -> BoxFut<'a, Result<(), VcsError>> {
+        Box::pin(async move {
+            // `git reset --hard HEAD` THROUGH the sandbox — never spawned
+            // directly. Relocated from the harness's hardcoded revert (SC-14).
+            let argv = vec![
+                "reset".to_string(),
+                "--hard".to_string(),
+                "HEAD".to_string(),
+            ];
+            let out = self
+                .sandbox
+                .execute_command("git", &argv, Some(self.workspace_root.as_path()), None)
+                .await
+                .map_err(VcsError::Sandbox)?;
+            if out.exit_code != 0 {
+                return Err(VcsError::CommandFailed {
+                    message: out.stderr,
+                });
+            }
+            Ok(())
         })
     }
 }
@@ -10332,11 +10368,20 @@ tool. Use the provided tool-call format to actually invoke the tool."
     //
     // No `// SPEC QUESTION:` markers — all six decisions are resolved.
 
-    /// Revert the working tree to current HEAD for a no-improvement iteration
-    /// (issue #60, Decision 1). Runs `git reset --hard HEAD` THROUGH the sandbox;
-    /// the harness NEVER spawns git directly. A sandbox rejection / non-zero exit
-    /// is best-effort: the loop continues (the next agent turn re-derives state).
+    /// Revert the working tree for a no-improvement iteration (issue #60,
+    /// Decision 1). SC-14: when a [`VcsProvider`] is wired it owns the revert
+    /// (e.g. [`GitVcsProvider`] runs `git reset --hard HEAD`, a custom provider
+    /// does whatever its workspace needs); with no provider (the default) the
+    /// harness falls back to the original hardcoded `git reset --hard HEAD`
+    /// THROUGH the sandbox — byte-identical to the pre-SC-14 behavior. Either
+    /// way the harness NEVER spawns git directly, and the revert is best-effort:
+    /// an error/non-zero exit is swallowed and the loop continues (the next
+    /// agent turn re-derives state).
     async fn hill_climbing_revert(&self) {
+        if let Some(vcs) = &self.config.vcs_provider {
+            let _ = vcs.revert().await;
+            return;
+        }
         let args = [
             "reset".to_string(),
             "--hard".to_string(),
@@ -22477,6 +22522,36 @@ mod tests {
         }
     }
 
+    /// A `VcsProvider` that spies on `revert()` calls (SC-14). Used to prove the
+    /// HillClimbing revert routes through a wired provider instead of the
+    /// hardcoded git fallback. `log`/`status` return empty strings.
+    struct HcSpyVcs {
+        reverts: std::sync::atomic::AtomicUsize,
+    }
+    impl HcSpyVcs {
+        fn new() -> Self {
+            Self {
+                reverts: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn revert_count(&self) -> usize {
+            self.reverts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl VcsProvider for HcSpyVcs {
+        fn log<'a>(&'a self, _args: &'a VcsLogArgs) -> BoxFut<'a, Result<String, VcsError>> {
+            Box::pin(async { Ok(String::new()) })
+        }
+        fn status<'a>(&'a self) -> BoxFut<'a, Result<String, VcsError>> {
+            Box::pin(async { Ok(String::new()) })
+        }
+        fn revert<'a>(&'a self) -> BoxFut<'a, Result<(), VcsError>> {
+            self.reverts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     /// Build a HillClimbing config wired with the scripted evaluator and spy
     /// sandbox. The agent always finishes a turn immediately (one final response
     /// per iteration), so the loop is driven entirely by the metric sequence.
@@ -22684,6 +22759,8 @@ mod tests {
     }
 
     // revert ON: a no-improvement iteration triggers exactly one git reset.
+    // (No vcs_provider wired ⇒ the SC-14 fallback path runs the hardcoded
+    // `git reset --hard HEAD` through the sandbox, byte-identical to pre-SC-14.)
     #[tokio::test]
     async fn hill_climbing_reverts_on_no_improvement() {
         let sandbox = Arc::new(HcSpySandbox::new());
@@ -22695,6 +22772,39 @@ mod tests {
         let t = hill_task(HillClimbingDirection::Minimize, Some(1), true, None);
         let _ = h_run(&cfg, t).await;
         assert_eq!(sandbox.revert_count(), 1, "revert ON must git reset once");
+    }
+
+    // SC-14: when a VcsProvider is wired, the revert routes THROUGH it and the
+    // hardcoded git-reset fallback does NOT fire.
+    #[tokio::test]
+    async fn hill_climbing_revert_routes_through_vcs_provider() {
+        let sandbox = Arc::new(HcSpySandbox::new());
+        let eval = Arc::new(ScriptedMetricEvaluator::new(
+            vec![Ok(2.0), Ok(3.0)], // minimize: baseline 2.0, then 3.0 (worse)
+            HillClimbingDirection::Minimize,
+        ));
+        let mut cfg = hc_config(eval, sandbox.clone());
+        let vcs = Arc::new(HcSpyVcs::new());
+        cfg.vcs_provider = Some(vcs.clone() as Arc<dyn VcsProvider>);
+        let t = hill_task(HillClimbingDirection::Minimize, Some(1), true, None);
+        let _ = h_run(&cfg, t).await;
+        assert_eq!(vcs.revert_count(), 1, "wired VcsProvider owns the revert");
+        assert_eq!(
+            sandbox.revert_count(),
+            0,
+            "hardcoded git-reset fallback must NOT fire when a provider is wired"
+        );
+    }
+
+    // SC-14: GitVcsProvider::revert issues `git reset --hard HEAD` through the
+    // sandbox (the behavior relocated out of the harness).
+    #[tokio::test]
+    async fn git_vcs_provider_revert_runs_git_reset_hard() {
+        let sandbox = Arc::new(HcSpySandbox::new());
+        let root = sandbox.root.path().to_path_buf();
+        let provider = GitVcsProvider::new(sandbox.clone() as Arc<dyn SandboxProvider>, root);
+        provider.revert().await.unwrap();
+        assert_eq!(sandbox.revert_count(), 1);
     }
 
     // strict min_delta boundary: an improvement of exactly min_delta is NOT
