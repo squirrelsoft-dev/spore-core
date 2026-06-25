@@ -481,12 +481,11 @@ impl SandboxProvider for WorkspaceScopedSandbox {
                     timed_out: false,
                     truncated: false,
                 }),
-                Err(e) => Ok(CommandOutput {
-                    stdout: String::new(),
-                    stderr: format!("spawn failed: {e}"),
-                    exit_code: -1,
-                    timed_out: false,
-                    truncated: false,
+                // SC-15: a failed spawn is a typed violation, not a fake
+                // exit_code: -1 success. Callers already handle `Err`.
+                Err(e) => Err(SandboxViolation::ExecSpawnFailed {
+                    command: command.to_string(),
+                    message: e.to_string(),
                 }),
             }
         })
@@ -842,11 +841,44 @@ mod tests {
             SandboxViolation::NetworkViolation {
                 host: "evil".into(),
             },
+            SandboxViolation::ExecSpawnFailed {
+                command: "no-such-bin".into(),
+                message: "No such file or directory (os error 2)".into(),
+            },
         ] {
             let s = serde_json::to_string(&v).unwrap();
             let back: SandboxViolation = serde_json::from_str(&s).unwrap();
             assert_eq!(v, back, "round-trip failed for {v:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn execute_command_spawn_failure_is_typed_err() {
+        // SC-15: a command that cannot be spawned yields Err(ExecSpawnFailed),
+        // not a fake Ok { exit_code: -1 }.
+        let dir = TempDir::new().unwrap();
+        let sb = WorkspaceScopedSandbox::new(cfg(dir.path())).unwrap();
+        let err = sb
+            .execute_command(
+                "spore-definitely-no-such-binary-xyz",
+                &[],
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        match err {
+            SandboxViolation::ExecSpawnFailed { command, .. } => {
+                assert_eq!(command, "spore-definitely-no-such-binary-xyz");
+            }
+            other => panic!("expected ExecSpawnFailed, got {other:?}"),
+        }
+        // And it is never halt-eligible (always recoverable feedback).
+        assert!(!SandboxViolation::ExecSpawnFailed {
+            command: "x".into(),
+            message: "y".into(),
+        }
+        .is_always_halt());
     }
 
     #[tokio::test]

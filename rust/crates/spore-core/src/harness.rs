@@ -4558,6 +4558,15 @@ pub enum SandboxViolation {
     DisallowedCommand {
         command: String,
     },
+    /// The process could not be spawned at all (e.g. the command binary does
+    /// not exist, or the OS refused the spawn). SC-15: this is reported as a
+    /// typed violation rather than a fake `CommandOutput { exit_code: -1 }`, so
+    /// "the command ran and exited -1" and "the command never started" are no
+    /// longer conflated. Always recoverable (never halt-eligible).
+    ExecSpawnFailed {
+        command: String,
+        message: String,
+    },
 }
 
 impl SandboxViolation {
@@ -4763,12 +4772,11 @@ pub trait SandboxProvider: Send + Sync {
                     timed_out: false,
                     truncated: false,
                 }),
-                Err(e) => Ok(CommandOutput {
-                    stdout: String::new(),
-                    stderr: format!("spawn failed: {e}"),
-                    exit_code: -1,
-                    timed_out: false,
-                    truncated: false,
+                // SC-15: a failed spawn is a typed violation, not a fake
+                // exit_code: -1 success. Callers already handle `Err`.
+                Err(e) => Err(SandboxViolation::ExecSpawnFailed {
+                    command: command.to_string(),
+                    message: e.to_string(),
                 }),
             }
         })
