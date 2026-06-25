@@ -4322,7 +4322,18 @@ export type ToolOutput =
    * `waiting_for_human`: the optional {@link ChildPausedState} keeps the common
    * (worker-emitted) case cheap. NOT appended to message history.
    */
-  | { kind: "consult"; child_state?: ChildPausedState; request: ConsultRequest };
+  | { kind: "consult"; child_state?: ChildPausedState; request: ConsultRequest }
+  /**
+   * A tool was denied by the sandbox (e.g. a path escaped the workspace root,
+   * or a command was disallowed). Carries the TYPED {@link SandboxViolation} so
+   * the harness — not the tool — decides whether it halts the run or is fed
+   * back to the model as a recoverable error, per
+   * {@link HarnessConfig.sandboxViolationPolicy}. Produced SOLELY by the
+   * {@link "@spore/tools".toolExecutionErrorToOutput} conversion; the harness
+   * normalizes it into a halt or a recoverable {@link ToolOutput} `error`
+   * immediately after dispatch, so it never reaches message history.
+   */
+  | { kind: "sandbox_violation"; violation: SandboxViolation };
 
 /**
  * Ergonomic constructors for the common {@link ToolOutput} cases. Mirrors Rust's
@@ -4386,9 +4397,36 @@ export type SandboxViolation =
   | { kind: "disallowed_command"; command: string }
   | { kind: "network_violation"; host: string };
 
+/**
+ * The halt-ELIGIBLE Layer-1 violations: a path escaping the workspace root or a
+ * blocked network host. Whether such a violation actually halts the run is
+ * governed by {@link SandboxViolationPolicy}; under the default (`recoverable`)
+ * even these are fed back to the model. The Layer-2 variants (`path_denied`,
+ * `read_only_violation`, …) are never halt-eligible — they are always
+ * recoverable regardless of policy.
+ */
 export function sandboxViolationIsAlwaysHalt(v: SandboxViolation): boolean {
   return v.kind === "path_escape" || v.kind === "network_violation";
 }
+
+/**
+ * How the harness treats a {@link SandboxViolation} surfaced by a tool (or the
+ * pre-dispatch {@link SandboxProvider.validate} check): coach the model and let
+ * it retry, or halt the run outright.
+ *
+ * This is the single switch for sandbox-violation handling, applied uniformly
+ * across every tool (filesystem, bash/exec, …) and both surfacing paths. The
+ * default is `"recoverable"`: a mis-targeted write or a blocked command is a
+ * benign mistake for an agent, so the violation is appended as a recoverable
+ * tool error and the model self-corrects (the boundary still holds — the access
+ * was refused). Opt into `"halt"` to restore the original Layer-1 always-halt
+ * behavior for path escapes / network violations (Layer-2 violations stay
+ * recoverable even under `"halt"`).
+ *
+ * Wire-compatible with the Rust `SandboxViolationPolicy` enum (`snake_case`
+ * variants). Set it via {@link "./standard.js".HarnessBuilder.sandboxViolationPolicy}.
+ */
+export type SandboxViolationPolicy = "recoverable" | "halt";
 
 // ============================================================================
 // Sandbox isolation modes — issue #6

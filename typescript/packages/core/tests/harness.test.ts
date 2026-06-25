@@ -172,11 +172,14 @@ describe("Harness — ReAct loop", () => {
     if (r.kind === "failure") expect(r.reason.kind).toBe("agent_error");
   });
 
-  it("rule: Layer-1 SandboxViolation::PathEscape halts unconditionally", async () => {
+  it("rule: validate-seam Layer-1 PathEscape halts under the opt-in Halt policy (#150)", async () => {
     const a = makeAgent();
     a.push(tcr(toolCall("c", "read")));
     const cfg = standardConfig(a);
     cfg.sandbox = new ScriptedSandbox().push({ kind: "path_escape", path: "/etc/passwd" });
+    // Halting on a path escape is now opt-in via the policy (default is
+    // recoverable). Opt in so this exercises the always-halt path.
+    cfg.sandboxViolationPolicy = "halt";
     const h = new StandardHarness(cfg);
     const r = await h.run({ task: react(5) });
     expect(r.kind).toBe("failure");
@@ -188,12 +191,84 @@ describe("Harness — ReAct loop", () => {
     }
   });
 
+  it("rule: validate-seam Layer-1 PathEscape is recoverable by default (#150)", async () => {
+    const a = makeAgent();
+    a.push(tcr(toolCall("c", "read")));
+    a.push(fr("ack"));
+    const cfg = standardConfig(a);
+    cfg.sandbox = new ScriptedSandbox().push({ kind: "path_escape", path: "/etc/passwd" });
+    // No opt-in: default policy is recoverable, so even a Layer-1 violation is
+    // appended as a tool error and the loop continues to completion.
+    const h = new StandardHarness(cfg);
+    const r = await h.run({ task: react(5) });
+    expect(r.kind).toBe("success");
+    if (r.kind === "success") expect(r.turns).toBe(2);
+  });
+
   it("rule: Layer-2 recoverable sandbox violation appended as tool error, loop continues", async () => {
     const a = makeAgent();
     a.push(tcr(toolCall("c", "read")));
     a.push(fr("ack"));
     const cfg = standardConfig(a);
     cfg.sandbox = new ScriptedSandbox().push({ kind: "path_denied", path: "/p" });
+    const h = new StandardHarness(cfg);
+    const r = await h.run({ task: react(5) });
+    expect(r.kind).toBe("success");
+    if (r.kind === "success") expect(r.turns).toBe(2);
+  });
+
+  // #150: a TOOL-surfaced sandbox violation is RECOVERABLE by default — the
+  // harness appends it as a tool error and the loop continues to completion.
+  it("rule: tool-surfaced sandbox violation is recoverable by default (#150)", async () => {
+    const a = makeAgent();
+    a.push(tcr(toolCall("c")));
+    a.push(fr("ack"));
+    const cfg = standardConfig(a);
+    cfg.toolRegistry = new ScriptedToolRegistry().push({
+      kind: "sandbox_violation",
+      violation: { kind: "path_escape", path: "/etc/passwd" },
+    });
+    // default policy is recoverable (no opt-in)
+    const h = new StandardHarness(cfg);
+    const r = await h.run({ task: react(5) });
+    expect(r.kind).toBe("success");
+    if (r.kind === "success") expect(r.turns).toBe(2);
+  });
+
+  // #150: opting into Halt makes a tool-surfaced always-halt violation end the
+  // run with a TYPED sandbox_violation halt reason (not unrecoverable_tool_error).
+  it("rule: tool-surfaced sandbox violation halts under the Halt policy (#150)", async () => {
+    const a = makeAgent();
+    a.push(tcr(toolCall("c")));
+    const cfg = standardConfig(a);
+    cfg.toolRegistry = new ScriptedToolRegistry().push({
+      kind: "sandbox_violation",
+      violation: { kind: "path_escape", path: "/etc/passwd" },
+    });
+    cfg.sandboxViolationPolicy = "halt";
+    const h = new StandardHarness(cfg);
+    const r = await h.run({ task: react(5) });
+    expect(r.kind).toBe("failure");
+    if (r.kind === "failure") {
+      expect(r.reason.kind).toBe("sandbox_violation");
+      if (r.reason.kind === "sandbox_violation") {
+        expect(r.reason.violation.kind).toBe("path_escape");
+      }
+    }
+  });
+
+  // #150: a Layer-2 (non-always-halt) violation stays recoverable even under
+  // Halt — only path_escape / network_violation are halt-eligible.
+  it("rule: tool-surfaced Layer-2 violation stays recoverable even under Halt (#150)", async () => {
+    const a = makeAgent();
+    a.push(tcr(toolCall("c")));
+    a.push(fr("ack"));
+    const cfg = standardConfig(a);
+    cfg.toolRegistry = new ScriptedToolRegistry().push({
+      kind: "sandbox_violation",
+      violation: { kind: "read_only_violation", path: "x" },
+    });
+    cfg.sandboxViolationPolicy = "halt";
     const h = new StandardHarness(cfg);
     const r = await h.run({ task: react(5) });
     expect(r.kind).toBe("success");

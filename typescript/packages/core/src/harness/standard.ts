@@ -189,6 +189,9 @@ import {
   type RunResult,
   type RunStrategy,
   type SandboxProvider,
+  type SandboxViolation,
+  type SandboxViolationPolicy,
+  sandboxViolationIsAlwaysHalt,
   type SessionState,
   type StreamSink,
   type Task,
@@ -258,6 +261,13 @@ export function memoryConfig(
 export interface HarnessConfig {
   toolRegistry: ToolRegistry;
   sandbox: SandboxProvider;
+  /**
+   * How a {@link SandboxViolation} surfaced by a tool (or the pre-dispatch
+   * {@link SandboxProvider.validate} check) is handled: fed back to the model as
+   * a recoverable error (the default) or halted on. See
+   * {@link SandboxViolationPolicy}. Optional; defaults to `"recoverable"`.
+   */
+  sandboxViolationPolicy?: SandboxViolationPolicy;
   contextManager: ContextManager;
   terminationPolicy: TerminationPolicy;
   middleware?: MiddlewareChain;
@@ -2049,7 +2059,10 @@ export class StandardHarness implements Harness, StrategyExecutor {
         await this.config.contextManager.appendToolResult(sessionState, tr);
       }
       for (const call of remaining) {
-        const output = await toolRegistry.dispatch(call, signal);
+        // #150: drain paths append to history but have no place to issue a typed
+        // halt — flatten any sandbox-violation output to a recoverable-or-not
+        // error per the policy (the main loop owns the typed halt).
+        const output = this.normalizeSandboxViolation(await toolRegistry.dispatch(call, signal));
         const tr: ToolResultRecord = { call_id: call.id, output };
         await this.config.contextManager.appendToolResult(sessionState, tr);
       }
@@ -2128,7 +2141,10 @@ export class StandardHarness implements Harness, StrategyExecutor {
 
       case "allow": {
         for (const call of pendingCalls) {
-          const output = await toolRegistry.dispatch(call, signal);
+          // #150: this approval-flush path has no place to issue a typed halt —
+          // flatten any sandbox-violation output to a recoverable-or-not error
+          // per the policy (the main loop owns the typed halt).
+          const output = this.normalizeSandboxViolation(await toolRegistry.dispatch(call, signal));
           const tr: ToolResultRecord = { call_id: call.id, output };
           await this.config.contextManager.appendToolResult(sessionState, tr);
         }
@@ -2137,7 +2153,10 @@ export class StandardHarness implements Harness, StrategyExecutor {
 
       case "allow_with_modification": {
         for (const call of response.calls) {
-          const output = await toolRegistry.dispatch(call, signal);
+          // #150: this approval-flush path has no place to issue a typed halt —
+          // flatten any sandbox-violation output to a recoverable-or-not error
+          // per the policy (the main loop owns the typed halt).
+          const output = this.normalizeSandboxViolation(await toolRegistry.dispatch(call, signal));
           const tr: ToolResultRecord = { call_id: call.id, output };
           await this.config.contextManager.appendToolResult(sessionState, tr);
         }
@@ -2276,7 +2295,10 @@ export class StandardHarness implements Harness, StrategyExecutor {
       await this.config.contextManager.appendToolResult(sessionState, tr);
     }
     for (const call of remaining) {
-      const output = await toolRegistry.dispatch(call, signal);
+      // #150: the consult-resume drain has no place to issue a typed halt —
+      // flatten any sandbox-violation output to a recoverable-or-not error per
+      // the policy (the main loop owns the typed halt).
+      const output = this.normalizeSandboxViolation(await toolRegistry.dispatch(call, signal));
       const tr: ToolResultRecord = { call_id: call.id, output };
       await this.config.contextManager.appendToolResult(sessionState, tr);
     }
@@ -2419,6 +2441,38 @@ export class StandardHarness implements Harness, StrategyExecutor {
     const path = input?.["path"];
     if (typeof path !== "string") return;
     if (!this.observedWrites.includes(path)) this.observedWrites.push(path);
+  }
+
+  /**
+   * Whether a sandbox violation should HALT the run under the configured
+   * {@link SandboxViolationPolicy} (#150): only when the policy is `"halt"` AND
+   * the violation is halt-eligible (`path_escape` / `network_violation`).
+   * Layer-2 violations are never halt-eligible, so they stay recoverable
+   * regardless. The default policy (`"recoverable"`) never halts.
+   */
+  private sandboxViolationHalts(violation: SandboxViolation): boolean {
+    return (
+      (this.config.sandboxViolationPolicy ?? "recoverable") === "halt" &&
+      sandboxViolationIsAlwaysHalt(violation)
+    );
+  }
+
+  /**
+   * Flatten a {@link ToolOutput} `sandbox_violation` into a plain `error` whose
+   * `recoverable` flag reflects the policy (#150). Used on tool-result drain
+   * paths (resume / human-approval flushes) that append results to history but
+   * have no place to issue a typed halt; the main loop handles the variant
+   * directly so it can return the typed {@link HaltReason} `sandbox_violation`.
+   * A non-violation output passes through unchanged. The message format matches
+   * the pre-dispatch validate-seam recoverable append (`sandbox: <kind>`).
+   */
+  private normalizeSandboxViolation(output: ToolOutput): ToolOutput {
+    if (output.kind !== "sandbox_violation") return output;
+    return {
+      kind: "error",
+      message: `sandbox: ${output.violation.kind}`,
+      recoverable: !this.sandboxViolationHalts(output.violation),
+    };
   }
 
   /** {@inheritDoc StrategyExecutor.takeObservedWrites} */
@@ -3706,10 +3760,13 @@ export class StandardHarness implements Harness, StrategyExecutor {
           const resultMsgIndices: number[] = [];
           for (let i = 0; i < calls.length; i++) {
             const call = calls[i]!;
-            // Sandbox validation
+            // Sandbox validation. The pre-dispatch `validate` seam honours the
+            // SAME policy as tool-surfaced violations (`sandboxViolationHalts`):
+            // halt only under `"halt"` for an always-halt-eligible violation;
+            // otherwise recoverable (#150).
             const violation = await this.config.sandbox.validate(call, signal);
             if (violation != null) {
-              if (violation.kind === "path_escape" || violation.kind === "network_violation") {
+              if (this.sandboxViolationHalts(violation)) {
                 return failure(
                   { kind: "sandbox_violation", violation },
                   sessionId,
@@ -3718,7 +3775,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
                   sessionState,
                 );
               }
-              // Layer-2 default: recoverable — append as tool error.
+              // Recoverable — append as tool error.
               const tr: ToolResultRecord = {
                 call_id: call.id,
                 output: {
@@ -3753,7 +3810,31 @@ export class StandardHarness implements Harness, StrategyExecutor {
             // PlanExecute DAG executor can attach HARNESS-OBSERVED `files_touched`
             // to a task's ledger entry — never model-self-reported.
             this.observeWriteCall(call);
-            const output: ToolOutput = await toolRegistry.dispatch(call, signal);
+            let output: ToolOutput = await toolRegistry.dispatch(call, signal);
+
+            // Tool-surfaced sandbox violation (#150): the HARNESS decides
+            // halt-vs-recoverable per `sandboxViolationPolicy`, not the tool.
+            // Under `"halt"` an always-halt-eligible violation ends the run with
+            // a typed `HaltReason` `sandbox_violation`; otherwise (the default)
+            // it becomes a recoverable error the model retries from — uniform
+            // across every tool. Handled BEFORE the error arms below so the
+            // rewritten recoverable error flows through the #137 breaker.
+            if (output.kind === "sandbox_violation") {
+              if (this.sandboxViolationHalts(output.violation)) {
+                return failure(
+                  { kind: "sandbox_violation", violation: output.violation },
+                  sessionId,
+                  usage,
+                  budgetUsed.turns,
+                  sessionState,
+                );
+              }
+              output = {
+                kind: "error",
+                message: `sandbox: ${output.violation.kind}`,
+                recoverable: true,
+              };
+            }
 
             // WaitingForHuman from subagent tool
             if (output.kind === "waiting_for_human") {
@@ -4426,6 +4507,8 @@ export class HarnessBuilder {
   private _hooks?: HookChain;
   private _maxStopBlocks = DEFAULT_MAX_STOP_BLOCKS;
   private _errorLoopThreshold = DEFAULT_ERROR_LOOP_THRESHOLD;
+  /** Sandbox-violation handling policy (#150). Defaults to `"recoverable"`. */
+  private _sandboxViolationPolicy: SandboxViolationPolicy = "recoverable";
   private _chunkProvider: ChunkProvider = new InMemoryChunkProvider();
   private _verifier?: Verifier;
   private _metricEvaluator?: MetricEvaluator;
@@ -4618,6 +4701,20 @@ export class HarnessBuilder {
    */
   errorLoopThreshold(n: number): this {
     this._errorLoopThreshold = n;
+    return this;
+  }
+
+  /**
+   * Set how a {@link SandboxViolation} surfaced by a tool (or the pre-dispatch
+   * {@link SandboxProvider.validate} check) is handled — recoverable feedback to
+   * the model (the default) or a hard halt. See {@link SandboxViolationPolicy}.
+   *
+   * Under `"halt"` an always-halt-eligible violation (path escape / network
+   * violation) ends the run with a typed {@link HaltReason} `sandbox_violation`;
+   * Layer-2 violations stay recoverable regardless. Defaults to `"recoverable"`.
+   */
+  sandboxViolationPolicy(policy: SandboxViolationPolicy): this {
+    this._sandboxViolationPolicy = policy;
     return this;
   }
 
@@ -5066,6 +5163,7 @@ export class HarnessBuilder {
     return {
       toolRegistry: this._toolRegistry,
       sandbox: this._sandbox,
+      sandboxViolationPolicy: this._sandboxViolationPolicy,
       contextManager: this._contextManager,
       terminationPolicy: this.terminationPolicy,
       middleware: this._middleware,

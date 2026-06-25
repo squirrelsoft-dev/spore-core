@@ -129,9 +129,13 @@ describe("filesystem tools", () => {
         sb,
         ctx,
       );
+      // #150: a sandbox violation now surfaces as the typed `sandbox_violation`
+      // variant, not a flattened `error` — so the regression is "none must be a
+      // sandbox_violation".
+      expect(rr.kind).not.toBe("sandbox_violation");
       if (rr.kind === "error") {
-        // A directory entry (e.g. `sub`) reads as an error but must NOT be a
-        // sandbox violation — that's the regression.
+        // A directory entry (e.g. `sub`) reads as a recoverable error but must
+        // NOT mention a sandbox/path_escape — that's the regression.
         const msg = rr.message.toLowerCase();
         expect(msg.includes("escape") || msg.includes("sandbox")).toBe(false);
       } else {
@@ -192,9 +196,11 @@ describe("filesystem tools", () => {
     expect(r.message).toContain("read failed");
   });
 
-  it("read of path outside root is a sandbox path_escape error", async () => {
+  it("read of path outside root surfaces the typed path_escape violation (#150)", async () => {
     // Counterpart: a path resolving outside the root is still a sandbox
-    // violation, even when the file does not exist.
+    // violation, even when the file does not exist. The tool surfaces the TYPED
+    // violation (`sandbox_violation`); the harness (not the tool) decides
+    // recoverable-vs-halt via SandboxViolationPolicy.
     const root = realpathSync(await tmp());
     const sb = new WorkspaceScopedSandbox({ root });
     const r = await new ReadFileTool().execute(
@@ -202,10 +208,9 @@ describe("filesystem tools", () => {
       sb,
       ctx,
     );
-    expect(r.kind).toBe("error");
-    if (r.kind !== "error") throw new Error("unreachable");
-    const msg = r.message.toLowerCase();
-    expect(msg.includes("escape") || msg.includes("sandbox")).toBe(true);
+    expect(r.kind).toBe("sandbox_violation");
+    if (r.kind !== "sandbox_violation") throw new Error("unreachable");
+    expect(r.violation.kind).toBe("path_escape");
   });
 });
 

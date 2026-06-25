@@ -326,6 +326,10 @@ function renderToolOutput(result: ToolResultRecord): string {
       return result.output.content;
     case "error":
       return result.output.message;
+    case "sandbox_violation":
+      // Normally normalized into an `error` by the harness before being
+      // appended; record the violation text defensively if it reaches here (#150).
+      return `sandbox violation: ${result.output.violation.kind}`;
     case "waiting_for_human":
       return "";
     case "escalate":

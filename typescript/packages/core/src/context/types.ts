@@ -559,6 +559,7 @@ export interface ToolResult {
   output:
     | { kind: "success"; content: string; truncated?: boolean }
     | { kind: "error"; message: string; recoverable?: boolean }
+    | { kind: "sandbox_violation"; violation: { kind: string; [k: string]: unknown } }
     | { kind: "waiting_for_human"; [k: string]: unknown }
     | { kind: "escalate"; [k: string]: unknown }
     | { kind: "awaiting_clarification"; [k: string]: unknown };

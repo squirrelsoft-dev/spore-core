@@ -29,14 +29,18 @@ describe("toolExecutionErrorToOutput", () => {
     expect(o.recoverable).toBe(false);
   });
 
-  it("sandbox_violation is not recoverable", () => {
+  it("sandbox_violation carries the typed violation (#150)", () => {
+    // The conversion does NOT pre-decide recoverability — it carries the typed
+    // violation through as `sandbox_violation` so the harness can apply its
+    // `SandboxViolationPolicy` (recoverable by default; halt on opt-in).
+    const violation = { kind: "path_escape", path: "/etc" } as const;
     const o = toolExecutionErrorToOutput({
       kind: "sandbox_violation",
-      violation: { kind: "path_escape", path: "/etc" },
+      violation,
     });
-    expect(o.kind).toBe("error");
-    if (o.kind !== "error") throw new Error("unreachable");
-    expect(o.recoverable).toBe(false);
+    expect(o.kind).toBe("sandbox_violation");
+    if (o.kind !== "sandbox_violation") throw new Error("unreachable");
+    expect(o.violation).toEqual(violation);
   });
 
   it("timeout is recoverable", () => {

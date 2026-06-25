@@ -77,6 +77,11 @@ export class NoopContextManager implements ContextManager {
       case "error":
         text = `[error] ${result.output.message}`;
         break;
+      case "sandbox_violation":
+        // Normally normalized into an `error` by the harness before append;
+        // defensive (#150).
+        text = `[error] sandbox violation: ${result.output.violation.kind}`;
+        break;
       case "waiting_for_human":
         text = "[waiting]";
         break;

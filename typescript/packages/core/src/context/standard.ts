@@ -424,6 +424,9 @@ function renderToolOutput(result: ToolResult): string {
       return result.output.content;
     case "error":
       return `[error] ${result.output.message}`;
+    case "sandbox_violation":
+      // Normally normalized into an `error` before append; defensive (#150).
+      return `[error] sandbox violation: ${result.output.violation.kind}`;
     case "waiting_for_human":
       return "[waiting]";
     case "escalate":
