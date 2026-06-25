@@ -24,6 +24,40 @@ use crate::harness::{
 use crate::model::ToolCall;
 
 // ============================================================================
+// ExecConfig
+// ============================================================================
+
+/// Process-execution hardening knobs for [`WorkspaceScopedSandbox::execute_command`]
+/// (SC-12). `None` on [`WorkspaceConfig::exec_config`] keeps the legacy
+/// behavior: the child inherits the parent's stdin and full environment, no
+/// implicit timeout is applied, and a dropped `execute_command` future leaks
+/// the child. Setting it tightens subprocess execution — the hardening the
+/// looper coding agent needs so build/test commands fail fast on a prompt
+/// instead of hanging, and orphaned processes are reaped.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExecConfig {
+    /// Timeout applied when the per-call `timeout` argument is `None`. The
+    /// per-call value always wins; this is the floor for callers that pass no
+    /// timeout. `None` leaves such commands un-timed (legacy).
+    #[serde(default)]
+    pub default_timeout: Option<Duration>,
+    /// Redirect the child's stdin from the null device so a command that blocks
+    /// reading input fails fast instead of hanging on the inherited terminal.
+    #[serde(default)]
+    pub close_stdin: bool,
+    /// Environment variables forced onto every child (e.g.
+    /// `GIT_TERMINAL_PROMPT=0`, `DEBIAN_FRONTEND=noninteractive`, `CI=1`) on top
+    /// of the inherited environment, so would-be interactive prompts turn into
+    /// non-interactive failures. Applied in `BTreeMap` order (deterministic).
+    #[serde(default)]
+    pub non_interactive_env: std::collections::BTreeMap<String, String>,
+    /// Kill the child if the `execute_command` future is dropped (e.g. an outer
+    /// cancellation, or the timeout firing) instead of orphaning it.
+    #[serde(default)]
+    pub kill_on_drop: bool,
+}
+
+// ============================================================================
 // WorkspaceConfig
 // ============================================================================
 
@@ -58,6 +92,10 @@ pub struct WorkspaceConfig {
     /// check.
     #[serde(default)]
     pub max_file_size: u64,
+    /// Optional process-execution hardening (SC-12). `None` keeps the legacy
+    /// inherit-stdin / no-timeout / inherit-env / leak-on-drop behavior.
+    #[serde(default)]
+    pub exec_config: Option<ExecConfig>,
 }
 
 impl WorkspaceConfig {
@@ -73,6 +111,7 @@ impl WorkspaceConfig {
             denied_extensions: vec![],
             read_only: false,
             max_file_size: 0,
+            exec_config: None,
         }
     }
 }
@@ -349,8 +388,26 @@ impl SandboxProvider for WorkspaceScopedSandbox {
             cmd.args(args);
             cmd.current_dir(working_dir.unwrap_or(&self.config.root));
 
+            // SC-12: apply exec-hardening knobs when configured. The per-call
+            // `timeout` always wins; `default_timeout` is the floor for callers
+            // that pass `None`.
+            let effective_timeout = if let Some(ec) = &self.config.exec_config {
+                if ec.close_stdin {
+                    cmd.stdin(std::process::Stdio::null());
+                }
+                for (k, v) in &ec.non_interactive_env {
+                    cmd.env(k, v);
+                }
+                if ec.kill_on_drop {
+                    cmd.kill_on_drop(true);
+                }
+                timeout.or(ec.default_timeout)
+            } else {
+                timeout
+            };
+
             let fut = cmd.output();
-            let result = match timeout {
+            let result = match effective_timeout {
                 Some(t) => match tokio::time::timeout(t, fut).await {
                     Ok(r) => r,
                     Err(_) => {
@@ -483,28 +540,14 @@ mod tests {
     use tempfile::TempDir;
 
     fn cfg(root: &Path) -> WorkspaceConfig {
-        WorkspaceConfig {
-            root: root.to_path_buf(),
-            allowed_paths: vec![],
-            denied_paths: vec![],
-            allowed_extensions: None,
-            denied_extensions: vec![],
-            read_only: false,
-            max_file_size: 0,
-        }
+        WorkspaceConfig::scoped(root.to_path_buf())
     }
 
     #[tokio::test]
     async fn build_fails_when_root_missing() {
-        let err = WorkspaceScopedSandbox::new(WorkspaceConfig {
-            root: PathBuf::from("/definitely/does/not/exist/spore-test"),
-            allowed_paths: vec![],
-            denied_paths: vec![],
-            allowed_extensions: None,
-            denied_extensions: vec![],
-            read_only: false,
-            max_file_size: 0,
-        })
+        let err = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(
+            "/definitely/does/not/exist/spore-test",
+        ))
         .unwrap_err();
         assert!(matches!(err, BuildError::RootNotFound { .. }));
     }
@@ -785,6 +828,149 @@ mod tests {
         assert!(out.timed_out);
     }
 
+    // ------------------------------------------------------------------
+    // SC-12 — ExecConfig exec-hardening knobs
+    // ------------------------------------------------------------------
+
+    fn exec_cfg(root: &Path, ec: ExecConfig) -> WorkspaceConfig {
+        WorkspaceConfig {
+            exec_config: Some(ec),
+            ..WorkspaceConfig::scoped(root.to_path_buf())
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_config_default_timeout_applies_when_call_passes_none() {
+        let dir = TempDir::new().unwrap();
+        let sb = WorkspaceScopedSandbox::new(exec_cfg(
+            dir.path(),
+            ExecConfig {
+                default_timeout: Some(Duration::from_millis(50)),
+                ..ExecConfig::default()
+            },
+        ))
+        .unwrap();
+        // No per-call timeout — the exec_config floor must still fire.
+        let out = sb
+            .execute_command("sleep", &["5".into()], None, None)
+            .await
+            .unwrap();
+        assert!(out.timed_out, "default_timeout did not apply");
+    }
+
+    #[tokio::test]
+    async fn exec_config_per_call_timeout_overrides_default() {
+        let dir = TempDir::new().unwrap();
+        let sb = WorkspaceScopedSandbox::new(exec_cfg(
+            dir.path(),
+            ExecConfig {
+                // A generous default that must NOT veto the tight per-call one.
+                default_timeout: Some(Duration::from_secs(30)),
+                ..ExecConfig::default()
+            },
+        ))
+        .unwrap();
+        let out = sb
+            .execute_command(
+                "sleep",
+                &["5".into()],
+                None,
+                Some(Duration::from_millis(50)),
+            )
+            .await
+            .unwrap();
+        assert!(out.timed_out, "per-call timeout should win over default");
+    }
+
+    #[tokio::test]
+    async fn exec_config_non_interactive_env_is_injected() {
+        let dir = TempDir::new().unwrap();
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("SPORE_SC12_ENV".to_string(), "hardened".to_string());
+        let sb = WorkspaceScopedSandbox::new(exec_cfg(
+            dir.path(),
+            ExecConfig {
+                non_interactive_env: env,
+                ..ExecConfig::default()
+            },
+        ))
+        .unwrap();
+        let out = sb
+            .execute_command(
+                "/bin/sh",
+                &["-c".into(), "echo $SPORE_SC12_ENV".into()],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert!(
+            out.stdout.contains("hardened"),
+            "env var not injected; stdout={:?}",
+            out.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_config_close_stdin_yields_eof() {
+        let dir = TempDir::new().unwrap();
+        let sb = WorkspaceScopedSandbox::new(exec_cfg(
+            dir.path(),
+            ExecConfig {
+                close_stdin: true,
+                ..ExecConfig::default()
+            },
+        ))
+        .unwrap();
+        // `cat` with no args reads stdin to EOF; with stdin redirected to the
+        // null device it returns immediately with exit 0 and empty output. A
+        // generous per-call timeout guards the test against a hang if the knob
+        // regressed (an inherited terminal would block `cat` forever).
+        let out = sb
+            .execute_command("cat", &[], None, Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert!(!out.timed_out, "cat hung — stdin was not closed");
+        assert_eq!(out.exit_code, 0);
+        assert!(out.stdout.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exec_config_kill_on_drop_reaps_child_on_timeout() {
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sentinel = root.join("kod_sentinel");
+        let sb = WorkspaceScopedSandbox::new(exec_cfg(
+            &root,
+            ExecConfig {
+                kill_on_drop: true,
+                ..ExecConfig::default()
+            },
+        ))
+        .unwrap();
+        // The shell sleeps, then would `touch` the sentinel. The 100ms timeout
+        // drops the `cmd.output()` future; with kill_on_drop the shell is killed
+        // before it can run `touch`, so the sentinel never appears.
+        let script = format!("sleep 1; touch {}", sentinel.display());
+        let out = sb
+            .execute_command(
+                "/bin/sh",
+                &["-c".into(), script],
+                None,
+                Some(Duration::from_millis(100)),
+            )
+            .await
+            .unwrap();
+        assert!(out.timed_out);
+        // Wait past when the un-killed shell would have created the sentinel.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !sentinel.exists(),
+            "child was not reaped on drop — sentinel was created"
+        );
+    }
+
     #[tokio::test]
     async fn handle_large_output_below_threshold_untouched() {
         let dir = TempDir::new().unwrap();
@@ -879,13 +1065,12 @@ mod tests {
             }
 
             let cfg = WorkspaceConfig {
-                root: root.clone(),
                 allowed_paths: sc.allowed_paths.iter().map(|s| root.join(s)).collect(),
                 denied_paths: sc.denied_paths.iter().map(|s| root.join(s)).collect(),
-                allowed_extensions: None,
                 denied_extensions: sc.denied_extensions.clone(),
                 read_only: sc.read_only,
                 max_file_size: sc.max_file_size,
+                ..WorkspaceConfig::scoped(root.clone())
             };
             let sb = WorkspaceScopedSandbox::new(cfg).unwrap();
             let op = parse_op(&sc.operation);

@@ -630,13 +630,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let sb = WorkspaceScopedSandbox::new(WorkspaceConfig {
-            root,
-            allowed_paths: vec![],
-            denied_paths: vec![],
-            allowed_extensions: None,
-            denied_extensions: vec![],
-            read_only: false,
             max_file_size: 8,
+            ..WorkspaceConfig::scoped(root)
         })
         .unwrap();
         // 9 bytes > 8-byte cap → rejected on the write path.
@@ -706,16 +701,7 @@ mod tests {
         tokio::fs::write(root.join("sub").join("c.txt"), "gamma")
             .await
             .unwrap();
-        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig {
-            root: root.clone(),
-            allowed_paths: vec![],
-            denied_paths: vec![],
-            allowed_extensions: None,
-            denied_extensions: vec![],
-            read_only: false,
-            max_file_size: 0,
-        })
-        .unwrap();
+        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(root.clone())).unwrap();
 
         // Recursive so we exercise both top-level files and a nested file.
         let r = ListDirTool::new()
@@ -856,16 +842,7 @@ mod tests {
         use crate::sandbox::{WorkspaceConfig, WorkspaceScopedSandbox};
         let dir = TempDir::new().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
-        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig {
-            root: root.clone(),
-            allowed_paths: vec![],
-            denied_paths: vec![],
-            allowed_extensions: None,
-            denied_extensions: vec![],
-            read_only: false,
-            max_file_size: 0,
-        })
-        .unwrap();
+        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(root.clone())).unwrap();
         let r = ReadFileTool::new()
             .execute(
                 &call("read_file", json!({"path": "output.txt"})),
@@ -895,16 +872,7 @@ mod tests {
         use crate::sandbox::{WorkspaceConfig, WorkspaceScopedSandbox};
         let dir = TempDir::new().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
-        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig {
-            root: root.clone(),
-            allowed_paths: vec![],
-            denied_paths: vec![],
-            allowed_extensions: None,
-            denied_extensions: vec![],
-            read_only: false,
-            max_file_size: 0,
-        })
-        .unwrap();
+        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(root.clone())).unwrap();
         let r = ReadFileTool::new()
             .execute(
                 &call("read_file", json!({"path": "../nonexistent_secret"})),
@@ -946,16 +914,7 @@ mod tests {
         use crate::sandbox::{WorkspaceConfig, WorkspaceScopedSandbox};
         let dir = TempDir::new().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
-        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig {
-            root: root.clone(),
-            allowed_paths: vec![],
-            denied_paths: vec![],
-            allowed_extensions: None,
-            denied_extensions: vec![],
-            read_only: false,
-            max_file_size: 0,
-        })
-        .unwrap();
+        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(root.clone())).unwrap();
         let r = WriteFileTool::new()
             .execute(
                 &call(
