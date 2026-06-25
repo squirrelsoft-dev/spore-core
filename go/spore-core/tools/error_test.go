@@ -21,11 +21,17 @@ func TestExecutionFailedPassesThroughFlag(t *testing.T) {
 	}
 }
 
-func TestSandboxViolationNotRecoverable(t *testing.T) {
+func TestSandboxViolationCarriesTypedViolation(t *testing.T) {
+	// issue #150: the conversion does NOT pre-decide recoverability — it carries
+	// the typed violation through as ToolOutputSandboxViolation so the harness can
+	// apply its SandboxViolationPolicy (recoverable by default; halt on opt-in).
 	v := &sporecore.SandboxViolation{Kind: sporecore.SandboxPathEscape, Path: "/etc"}
 	out := SandboxViolationError(v).ToToolOutput()
-	if out.Recoverable {
-		t.Fatalf("expected not recoverable")
+	if out.Kind != sporecore.ToolOutputSandboxViolation {
+		t.Fatalf("expected ToolOutputSandboxViolation, got %q", out.Kind)
+	}
+	if out.Violation == nil || out.Violation.Kind != sporecore.SandboxPathEscape || out.Violation.Path != "/etc" {
+		t.Fatalf("expected typed PathEscape violation carried through, got %+v", out.Violation)
 	}
 }
 

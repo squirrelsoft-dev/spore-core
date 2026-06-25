@@ -734,6 +734,13 @@ func (m *StandardContextManager) AppendToolResult(
 		text = result.Output.Content
 	case sporecore.ToolOutputError:
 		text = fmt.Sprintf("[error] %s", result.Output.Message)
+	case sporecore.ToolOutputSandboxViolation:
+		// Normally normalized into an Error before append; defensive (issue #150).
+		if result.Output.Violation != nil {
+			text = fmt.Sprintf("[error] sandbox violation: %s", result.Output.Violation.Error())
+		} else {
+			text = "[error] sandbox violation"
+		}
 	case sporecore.ToolOutputWaitingForHuman:
 		text = "[waiting]"
 	default:

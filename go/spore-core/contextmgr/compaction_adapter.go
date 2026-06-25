@@ -212,6 +212,13 @@ func renderToolResultText(result *sporecore.HarnessToolResult) string {
 		return result.Output.Content
 	case sporecore.ToolOutputError:
 		return result.Output.Message
+	case sporecore.ToolOutputSandboxViolation:
+		// Normally normalized into an Error by the harness before being appended;
+		// record the violation text defensively if it reaches here (issue #150).
+		if result.Output.Violation != nil {
+			return "sandbox violation: " + result.Output.Violation.Error()
+		}
+		return "sandbox violation"
 	}
 	return ""
 }

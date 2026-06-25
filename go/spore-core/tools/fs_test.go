@@ -160,7 +160,9 @@ func TestReadMissingInWorkspaceFileIsRecoverableNotFound(t *testing.T) {
 }
 
 // Regression for #63: a read_file of a path resolving *outside* the workspace
-// root must still be a (non-recoverable) sandbox path-escape violation.
+// root surfaces the TYPED sandbox path-escape violation (issue #150). The tool
+// does NOT decide recoverable-vs-halt — the harness does, via
+// SandboxViolationPolicy (see the harness-level policy tests).
 func TestReadOutsideRootIsPathEscape(t *testing.T) {
 	dir := t.TempDir()
 	root, _ := filepath.EvalSymlinks(dir)
@@ -170,8 +172,9 @@ func TestReadOutsideRootIsPathEscape(t *testing.T) {
 	}
 	r := NewReadFileTool().Execute(context.Background(),
 		call("read_file", "c1", map[string]any{"path": "../nonexistent_passwd"}), sb, nil)
-	if r.Kind != sporecore.ToolOutputError || r.Recoverable {
-		t.Fatalf("expected non-recoverable path-escape error, got %+v", r)
+	if r.Kind != sporecore.ToolOutputSandboxViolation ||
+		r.Violation == nil || r.Violation.Kind != sporecore.SandboxPathEscape {
+		t.Fatalf("expected typed PathEscape SandboxViolation, got %+v", r)
 	}
 }
 

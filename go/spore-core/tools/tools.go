@@ -98,14 +98,13 @@ func (e *ToolExecutionError) ToToolOutput() sporecore.ToolOutput {
 			Recoverable: e.Recoverable,
 		}
 	case ToolExecErrSandboxViolation:
-		msg := "sandbox violation"
-		if e.Violation != nil {
-			msg = "sandbox violation: " + e.Violation.Error()
-		}
+		// issue #150: carry the TYPED violation to the harness rather than
+		// flattening it into a non-recoverable Error here. The harness applies its
+		// SandboxViolationPolicy — recoverable feedback by default (the boundary
+		// still holds; the access was refused), halt only on opt-in.
 		return sporecore.ToolOutput{
-			Kind:        sporecore.ToolOutputError,
-			Message:     msg,
-			Recoverable: false,
+			Kind:      sporecore.ToolOutputSandboxViolation,
+			Violation: e.Violation,
 		}
 	case ToolExecErrTimeout:
 		return sporecore.ToolOutput{

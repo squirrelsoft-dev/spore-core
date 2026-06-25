@@ -447,8 +447,14 @@ type HarnessBuilder struct {
 	contextManager    sporecore.ContextManager
 	terminationPolicy sporecore.TerminationPolicy
 	middleware        sporecore.MiddlewareChain
-	provider          ObservabilityProvider
-	pricing           PricingTable
+	// sandboxViolationPolicy controls how a tool-surfaced (or pre-dispatch
+	// validate) SandboxViolation is handled (issue #150). The zero value (empty
+	// string) leaves HarnessConfig.SandboxViolationPolicy empty, which the harness
+	// reads as Recoverable — the cross-language default. Set via
+	// SandboxViolationPolicy.
+	sandboxViolationPolicy sporecore.SandboxViolationPolicy
+	provider               ObservabilityProvider
+	pricing                PricingTable
 	// content is the LLM-native content-capture config (issue #64). Defaults to
 	// ContentCaptureConfigFromEnv() (OFF unless SPORE_TRACE_CONTENT is set).
 	content ContentCaptureConfig
@@ -618,6 +624,16 @@ func (b *HarnessBuilder) ErrorLoopThreshold(n uint32) *HarnessBuilder {
 // Middleware injects a middleware chain.
 func (b *HarnessBuilder) Middleware(m sporecore.MiddlewareChain) *HarnessBuilder {
 	b.middleware = m
+	return b
+}
+
+// SandboxViolationPolicy sets how a SandboxViolation surfaced by a tool (or the
+// pre-dispatch validate check) is handled (issue #150): recoverable feedback to
+// the model (the default) or a hard halt for halt-eligible Layer-1 violations
+// (path escape / network violation). Layer-2 violations stay recoverable
+// regardless. Defaults to sporecore.SandboxViolationRecoverable when unset.
+func (b *HarnessBuilder) SandboxViolationPolicy(policy sporecore.SandboxViolationPolicy) *HarnessBuilder {
+	b.sandboxViolationPolicy = policy
 	return b
 }
 
@@ -951,28 +967,29 @@ func (b *HarnessBuilder) BuildConfig() sporecore.HarnessConfig {
 		runStore = sporecore.NewInMemoryToolRunStore()
 	}
 	cfg := sporecore.HarnessConfig{
-		Agent:                 b.agent,
-		ToolRegistry:          b.toolRegistry,
-		Sandbox:               b.sandbox,
-		ContextManager:        b.contextManager,
-		TerminationPolicy:     b.terminationPolicy,
-		Middleware:            b.middleware,
-		CompactionVerifier:    b.compactionVerifier,
-		MaxCompactionAttempts: b.maxCompactionAttempts,
-		ErrorLoopThreshold:    b.errorLoopThreshold,
-		CatalogueRegistry:     catalogue,
-		ToolsetCatalogues:     toolsetCatalogues,
-		ToolRunStore:          runStore,
-		ToolMemoryStore:       b.memStore,
-		SystemPrompt:          b.systemPrompt,
-		Guides:                b.guides,
-		Skills:                b.skills,
-		Memory:                b.memory,
-		ModelParams:           b.modelParams,
-		SessionStore:          b.sessionStore,
-		AutoPersistSessions:   b.autoPersistSessions,
-		PromptToolCallFlag:    b.promptToolCallFlag,
-		ProjectNamespace:      b.projectNamespace,
+		Agent:                  b.agent,
+		ToolRegistry:           b.toolRegistry,
+		Sandbox:                b.sandbox,
+		SandboxViolationPolicy: b.sandboxViolationPolicy,
+		ContextManager:         b.contextManager,
+		TerminationPolicy:      b.terminationPolicy,
+		Middleware:             b.middleware,
+		CompactionVerifier:     b.compactionVerifier,
+		MaxCompactionAttempts:  b.maxCompactionAttempts,
+		ErrorLoopThreshold:     b.errorLoopThreshold,
+		CatalogueRegistry:      catalogue,
+		ToolsetCatalogues:      toolsetCatalogues,
+		ToolRunStore:           runStore,
+		ToolMemoryStore:        b.memStore,
+		SystemPrompt:           b.systemPrompt,
+		Guides:                 b.guides,
+		Skills:                 b.skills,
+		Memory:                 b.memory,
+		ModelParams:            b.modelParams,
+		SessionStore:           b.sessionStore,
+		AutoPersistSessions:    b.autoPersistSessions,
+		PromptToolCallFlag:     b.promptToolCallFlag,
+		ProjectNamespace:       b.projectNamespace,
 	}
 	// #142: when a project namespace is pinned, also wire the harness-side durable
 	// RunStore (the PlanExecute task_list/plan checkpoint + the Ralph checkpoint)

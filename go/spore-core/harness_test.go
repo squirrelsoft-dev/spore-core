@@ -121,7 +121,9 @@ func TestAgentErrorTerminatesWithAgentErrorHaltReason(t *testing.T) {
 	}
 }
 
-// Rule: Layer-1 SandboxViolation PathEscape halts unconditionally.
+// Rule: Layer-1 SandboxViolation PathEscape halts at the pre-dispatch validate
+// seam under the opt-in Halt policy (issue #150: halting is no longer the
+// default; see TestPreDispatchPathEscapeRecoverableByDefault for the default).
 func TestLayer1PathEscapeHalts(t *testing.T) {
 	a := NewMockAgent("t")
 	a.Push(NewToolCallRequested([]ToolCall{
@@ -131,6 +133,9 @@ func TestLayer1PathEscapeHalts(t *testing.T) {
 	sb := NewScriptedSandbox()
 	sb.Push(&SandboxViolation{Kind: SandboxPathEscape, Path: "/etc/passwd"})
 	cfg.Sandbox = sb
+	// Halting on a path escape is now opt-in via the policy (default is
+	// Recoverable). Opt in so this exercises the always-halt path.
+	cfg.SandboxViolationPolicy = SandboxViolationHalt
 	h := NewStandardHarness(cfg)
 	r := h.Run(context.Background(), NewHarnessRunOptions(reactTask(5)))
 	if r.Kind != RunFailure || r.Reason.Kind != HaltSandboxViolation || r.Reason.Violation.Kind != SandboxPathEscape {
@@ -153,6 +158,123 @@ func TestLayer2PathDeniedContinuesAsToolError(t *testing.T) {
 	r := h.Run(context.Background(), NewHarnessRunOptions(reactTask(5)))
 	if r.Kind != RunSuccess || r.Turns != 2 {
 		t.Fatalf("got %+v", r)
+	}
+}
+
+// Policy (issue #150): a pre-dispatch validate-seam PathEscape is RECOVERABLE by
+// default — no opt-in to Halt, so the loop appends it as a tool error and
+// continues to completion rather than halting.
+func TestPreDispatchPathEscapeRecoverableByDefault(t *testing.T) {
+	a := NewMockAgent("t")
+	a.Push(NewToolCallRequested([]ToolCall{
+		{ID: "c", Name: "read", Input: json.RawMessage(`{}`)},
+	}, turnUsage()))
+	a.Push(NewFinalResponse("ack", turnUsage()))
+	cfg := standardCfg(a)
+	sb := NewScriptedSandbox()
+	sb.Push(&SandboxViolation{Kind: SandboxPathEscape, Path: "/etc/passwd"})
+	cfg.Sandbox = sb
+	// default policy = Recoverable (no opt-in)
+	h := NewStandardHarness(cfg)
+	r := h.Run(context.Background(), NewHarnessRunOptions(reactTask(5)))
+	if r.Kind != RunSuccess || r.Turns != 2 {
+		t.Fatalf("expected Success (recoverable, loop continued), got %+v", r)
+	}
+}
+
+// Policy (issue #150): a TOOL-surfaced sandbox violation is RECOVERABLE by
+// default — the harness appends it as a tool error and the loop continues to
+// completion.
+func TestToolSandboxViolationRecoverableByDefault(t *testing.T) {
+	a := NewMockAgent("t")
+	a.Push(NewToolCallRequested([]ToolCall{
+		{ID: "c", Name: "x", Input: json.RawMessage(`{}`)},
+	}, turnUsage()))
+	a.Push(NewFinalResponse("ack", turnUsage()))
+	cfg := standardCfg(a)
+	reg := NewScriptedToolRegistry()
+	reg.Push(ToolOutput{
+		Kind:      ToolOutputSandboxViolation,
+		Violation: &SandboxViolation{Kind: SandboxPathEscape, Path: "/etc/passwd"},
+	})
+	cfg.ToolRegistry = reg
+	// default policy = Recoverable (no opt-in)
+	h := NewStandardHarness(cfg)
+	r := h.Run(context.Background(), NewHarnessRunOptions(reactTask(5)))
+	if r.Kind != RunSuccess || r.Turns != 2 {
+		t.Fatalf("expected Success (recoverable, loop continued), got %+v", r)
+	}
+}
+
+// Policy (issue #150): opting into Halt makes a tool-surfaced always-halt
+// violation end the run with a TYPED HaltSandboxViolation (not an
+// UnrecoverableToolError).
+func TestToolSandboxViolationHaltsUnderHaltPolicy(t *testing.T) {
+	a := NewMockAgent("t")
+	a.Push(NewToolCallRequested([]ToolCall{
+		{ID: "c", Name: "x", Input: json.RawMessage(`{}`)},
+	}, turnUsage()))
+	cfg := standardCfg(a)
+	reg := NewScriptedToolRegistry()
+	reg.Push(ToolOutput{
+		Kind:      ToolOutputSandboxViolation,
+		Violation: &SandboxViolation{Kind: SandboxPathEscape, Path: "/etc/passwd"},
+	})
+	cfg.ToolRegistry = reg
+	cfg.SandboxViolationPolicy = SandboxViolationHalt
+	h := NewStandardHarness(cfg)
+	r := h.Run(context.Background(), NewHarnessRunOptions(reactTask(5)))
+	if r.Kind != RunFailure || r.Reason.Kind != HaltSandboxViolation ||
+		r.Reason.Violation == nil || r.Reason.Violation.Kind != SandboxPathEscape {
+		t.Fatalf("expected SandboxViolation halt, got %+v", r)
+	}
+}
+
+// Policy (issue #150): a Layer-2 (non-always-halt) tool-surfaced violation stays
+// recoverable even under Halt — only PathEscape/NetworkViolation are
+// halt-eligible.
+func TestToolLayer2ViolationRecoverableEvenUnderHaltPolicy(t *testing.T) {
+	a := NewMockAgent("t")
+	a.Push(NewToolCallRequested([]ToolCall{
+		{ID: "c", Name: "x", Input: json.RawMessage(`{}`)},
+	}, turnUsage()))
+	a.Push(NewFinalResponse("ack", turnUsage()))
+	cfg := standardCfg(a)
+	reg := NewScriptedToolRegistry()
+	reg.Push(ToolOutput{
+		Kind:      ToolOutputSandboxViolation,
+		Violation: &SandboxViolation{Kind: SandboxReadOnly, Path: "x"},
+	})
+	cfg.ToolRegistry = reg
+	cfg.SandboxViolationPolicy = SandboxViolationHalt
+	h := NewStandardHarness(cfg)
+	r := h.Run(context.Background(), NewHarnessRunOptions(reactTask(5)))
+	if r.Kind != RunSuccess || r.Turns != 2 {
+		t.Fatalf("expected Success (Layer-2 stays recoverable), got %+v", r)
+	}
+}
+
+// Round-trip (issue #150): the ToolOutputSandboxViolation variant marshals and
+// unmarshals back to an equal value, carrying the typed violation.
+func TestToolOutputSandboxViolationRoundTrip(t *testing.T) {
+	in := ToolOutput{
+		Kind:      ToolOutputSandboxViolation,
+		Violation: &SandboxViolation{Kind: SandboxPathEscape, Path: "/etc/passwd"},
+	}
+	data, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"kind":"sandbox_violation"`) {
+		t.Fatalf("expected sandbox_violation kind on the wire, got %s", data)
+	}
+	var out ToolOutput
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.Kind != ToolOutputSandboxViolation || out.Violation == nil ||
+		out.Violation.Kind != SandboxPathEscape || out.Violation.Path != "/etc/passwd" {
+		t.Fatalf("round-trip mismatch: %+v (violation=%+v)", out, out.Violation)
 	}
 }
 

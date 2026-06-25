@@ -752,6 +752,16 @@ const (
 	// the optional ChildState distinguishes worker-side (nil) from the
 	// subagent boundary (populated).
 	ToolOutputConsult ToolOutputKind = "consult"
+	// ToolOutputSandboxViolation (issue #150) — a tool was denied by the sandbox
+	// (e.g. a path escaped the workspace root, or a command was disallowed). It
+	// carries the TYPED SandboxViolation so the HARNESS — not the tool — decides
+	// whether it halts the run or is fed back to the model as a recoverable
+	// error, per HarnessConfig.SandboxViolationPolicy. Produced by the
+	// ToolExecutionError → ToolOutput conversion (and the registry-level
+	// pre-dispatch validate seam); the harness normalizes it into a halt or a
+	// recoverable ToolOutputError immediately after dispatch, so it never reaches
+	// message history.
+	ToolOutputSandboxViolation ToolOutputKind = "sandbox_violation"
 )
 
 // ToolOutput is the result of dispatching one tool call. Full shape lives
@@ -785,6 +795,10 @@ type ToolOutput struct {
 	// (above) is reused: nil for the worker-side signal, populated by
 	// SubagentTool at the subagent boundary.
 	ConsultRequest *ConsultRequest `json:"-"`
+	// sandbox_violation (issue #150). The typed violation carried to the harness,
+	// which applies HarnessConfig.SandboxViolationPolicy. Normalized into an
+	// Error (or a halt) right after dispatch, so it never reaches history.
+	Violation *SandboxViolation `json:"-"`
 }
 
 // MarshalJSON serialises ToolOutput as a flat tagged object.
@@ -841,6 +855,13 @@ func (o ToolOutput) MarshalJSON() ([]byte, error) {
 			ChildState *ChildPausedState `json:"child_state"`
 			Request    *ConsultRequest   `json:"request"`
 		}{o.Kind, o.ChildState, o.ConsultRequest})
+	case ToolOutputSandboxViolation:
+		// issue #150: carry the typed violation. Normally normalized away before
+		// history, but kept round-trippable.
+		return json.Marshal(struct {
+			Kind      ToolOutputKind    `json:"kind"`
+			Violation *SandboxViolation `json:"violation"`
+		}{o.Kind, o.Violation})
 	default:
 		return nil, fmt.Errorf("ToolOutput: unknown kind %q", o.Kind)
 	}
@@ -859,6 +880,7 @@ func (o *ToolOutput) UnmarshalJSON(data []byte) error {
 		Signal      *HarnessSignal    `json:"signal"`
 		Question    string            `json:"question"`
 		Options     *[]string         `json:"options"`
+		Violation   *SandboxViolation `json:"violation"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return err
@@ -873,6 +895,7 @@ func (o *ToolOutput) UnmarshalJSON(data []byte) error {
 	o.Signal = probe.Signal
 	o.Question = probe.Question
 	o.Options = probe.Options
+	o.Violation = probe.Violation
 	// consult (issue #114): the "request" key here is a ConsultRequest, not a
 	// HumanRequest. Re-read it into the dedicated field for that variant so the
 	// two "request"-keyed variants do not collide on one probe field.
@@ -1054,10 +1077,43 @@ func (s *SandboxViolation) Error() string {
 	}
 }
 
-// IsAlwaysHalt reports whether this violation is Layer-1 always-halt.
+// IsAlwaysHalt reports whether this violation is HALT-ELIGIBLE: a path escaping
+// the workspace root or a blocked network host (Layer-1). Whether such a
+// violation actually halts the run is governed by SandboxViolationPolicy; under
+// the default (Recoverable) even these are fed back to the model. The Layer-2
+// variants (path_denied, read_only_violation, …) are never halt-eligible — they
+// are always recoverable regardless of policy.
 func (s SandboxViolation) IsAlwaysHalt() bool {
 	return s.Kind == SandboxPathEscape || s.Kind == SandboxNetworkViolation
 }
+
+// SandboxViolationPolicy controls how the harness treats a SandboxViolation
+// surfaced by a tool (or the pre-dispatch validate check): coach the model and
+// let it retry, or halt the run outright (issue #150).
+//
+// This is the single switch for sandbox-violation handling, applied uniformly
+// across every tool (filesystem, bash/exec, …) and both surfacing paths. The
+// default is SandboxViolationRecoverable: a mis-targeted write or a blocked
+// command is a benign mistake for an agent, so the violation is appended as a
+// recoverable tool error and the model self-corrects (the boundary still holds —
+// the access was refused). Opt into SandboxViolationHalt to restore the original
+// Layer-1 always-halt behavior for path escapes / network violations.
+//
+// Set it via HarnessBuilder.SandboxViolationPolicy. The zero value is the empty
+// string, which behaves as Recoverable — so a default-constructed HarnessConfig
+// gets the recoverable default with no sentinel.
+type SandboxViolationPolicy string
+
+const (
+	// SandboxViolationRecoverable surfaces the violation to the model as a
+	// recoverable tool error it can retry from. Halt-eligible or not, nothing
+	// halts the run. The default (and the empty-string zero value).
+	SandboxViolationRecoverable SandboxViolationPolicy = "recoverable"
+	// SandboxViolationHalt halts the run when a halt-eligible violation
+	// (SandboxViolation.IsAlwaysHalt) is encountered. Layer-2 violations stay
+	// recoverable. Restores the pre-policy Layer-1 behavior.
+	SandboxViolationHalt SandboxViolationPolicy = "halt"
+)
 
 // ============================================================================
 // Operation — read | write | execute
@@ -3048,12 +3104,18 @@ type HarnessConfig struct {
 	// (Option B, additive scope) so existing callers and executor consumption
 	// sites stay byte-identical; physical removal + executor migration to registry
 	// resolution lands in #124.
-	Agent             Agent
-	ToolRegistry      ToolRegistry
-	Sandbox           SandboxProvider
-	ContextManager    ContextManager
-	TerminationPolicy TerminationPolicy
-	Middleware        MiddlewareChain // optional
+	Agent        Agent
+	ToolRegistry ToolRegistry
+	Sandbox      SandboxProvider
+	// SandboxViolationPolicy (issue #150) controls how a SandboxViolation
+	// surfaced by a tool (or the pre-dispatch validate check) is handled: fed back
+	// to the model as a recoverable error (the default) or halted on. The empty
+	// zero value behaves as SandboxViolationRecoverable, so default-constructed
+	// literals get the recoverable default without a sentinel.
+	SandboxViolationPolicy SandboxViolationPolicy `json:"sandbox_violation_policy"`
+	ContextManager         ContextManager
+	TerminationPolicy      TerminationPolicy
+	Middleware             MiddlewareChain // optional
 	// Observability is the loop's span-emission seam. Optional; when nil
 	// the loop emits nothing. The token→USD pricing used to stamp cost on
 	// turn spans is held by the observer (see HarnessObserver.CostFor) — it
@@ -4144,6 +4206,41 @@ func (h *StandardHarness) LoadTaskList(ctx context.Context, sessionID SessionID)
 		return TaskList{}, false
 	}
 	return list, true
+}
+
+// sandboxViolationHalts reports whether a sandbox violation should HALT the run
+// under the configured SandboxViolationPolicy (issue #150): only when the policy
+// is Halt AND the violation is halt-eligible (path_escape / network_violation).
+// Layer-2 violations are never halt-eligible, so they stay recoverable
+// regardless. The empty-string zero-value policy is NOT Halt, so a
+// default-constructed config naturally treats every violation as recoverable.
+func (h *StandardHarness) sandboxViolationHalts(v *SandboxViolation) bool {
+	if v == nil {
+		return false
+	}
+	return h.config.SandboxViolationPolicy == SandboxViolationHalt && v.IsAlwaysHalt()
+}
+
+// normalizeSandboxViolation flattens a ToolOutputSandboxViolation into a plain
+// ToolOutputError whose Recoverable flag reflects the policy (issue #150). Used
+// on tool-result drain paths (resume / human-approval flushes) that append
+// results to history but have no place to issue a typed halt; the main loop
+// handles the variant directly so it can return the typed HaltSandboxViolation.
+// A non-violation output passes through unchanged. The message format mirrors
+// the pre-dispatch validate-seam recoverable append (v.Error()).
+func (h *StandardHarness) normalizeSandboxViolation(output ToolOutput) ToolOutput {
+	if output.Kind != ToolOutputSandboxViolation {
+		return output
+	}
+	msg := "sandbox violation"
+	if output.Violation != nil {
+		msg = "sandbox: " + output.Violation.Error()
+	}
+	return ToolOutput{
+		Kind:        ToolOutputError,
+		Message:     msg,
+		Recoverable: !h.sandboxViolationHalts(output.Violation),
+	}
 }
 
 // observeWriteCall records a harness-OBSERVED write/edit at the tool-dispatch
@@ -5380,9 +5477,12 @@ func (h *StandardHarness) runReActInner(
 			var resultMsgIndices []int
 			toolPause := false
 			for i, call := range calls {
-				// Sandbox validation.
+				// Sandbox validation. The pre-dispatch validate seam honours the
+				// SAME policy as tool-surfaced violations (sandboxViolationHalts):
+				// halt only under Halt for an always-halt-eligible violation;
+				// otherwise recoverable (issue #150).
 				if v := h.config.Sandbox.Validate(ctx, call); v != nil {
-					if v.IsAlwaysHalt() {
+					if h.sandboxViolationHalts(v) {
 						return RunResult{
 							Kind: RunFailure,
 							Reason: HaltReason{
@@ -5392,7 +5492,7 @@ func (h *StandardHarness) runReActInner(
 							SessionID: sessionID, Usage: usage, Turns: budget.Turns,
 						}
 					}
-					// Layer-2 recoverable: append as tool error.
+					// Recoverable: append as tool error.
 					tr := HarnessToolResult{
 						CallID: call.ID,
 						Output: ToolOutput{
@@ -5423,6 +5523,26 @@ func (h *StandardHarness) runReActInner(
 				// built from real tool calls — never a model-self-reported field.
 				h.observeWriteCall(call)
 				output := dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call)
+
+				// Tool-surfaced sandbox violation (issue #150): the HARNESS decides
+				// halt-vs-recoverable per SandboxViolationPolicy, not the tool. Under
+				// Halt an always-halt-eligible violation ends the run with a typed
+				// HaltSandboxViolation; otherwise (the default) it becomes a
+				// recoverable error the model retries from — uniform across every
+				// tool and both surfacing paths.
+				if output.Kind == ToolOutputSandboxViolation {
+					if h.sandboxViolationHalts(output.Violation) {
+						return RunResult{
+							Kind: RunFailure,
+							Reason: HaltReason{
+								Kind:      HaltSandboxViolation,
+								Violation: output.Violation,
+							},
+							SessionID: sessionID, Usage: usage, Turns: budget.Turns,
+						}
+					}
+					output = h.normalizeSandboxViolation(output)
+				}
 
 				// Clarification pause (issue #81, Q4b): a tool (e.g.
 				// ask_user_question) needs a human answer before it can produce a
@@ -6079,7 +6199,11 @@ func (h *StandardHarness) resumeConsultInner(
 		}
 		h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
 		for _, call := range pending[1:] {
-			output := dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call)
+			// Drain path (issue #150): flatten any tool-surfaced sandbox violation
+			// to a recoverable error — there is no place to issue a typed halt
+			// here.
+			output := h.normalizeSandboxViolation(
+				dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call))
 			rtr := HarnessToolResult{CallID: call.ID, Output: output}
 			h.config.ContextManager.AppendToolResult(ctx, &session, &rtr)
 		}
@@ -6173,7 +6297,10 @@ func (h *StandardHarness) resumeInner(
 				}
 				h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
 				for _, call := range pending[1:] {
-					output := dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call)
+					// Drain path (issue #150): flatten any sandbox violation to a
+					// recoverable error — no typed-halt site here.
+					output := h.normalizeSandboxViolation(
+						dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call))
 					rtr := HarnessToolResult{CallID: call.ID, Output: output}
 					h.config.ContextManager.AppendToolResult(ctx, &session, &rtr)
 				}
@@ -6298,13 +6425,19 @@ func (h *StandardHarness) resumeInner(
 		h.config.ContextManager.AppendUserMessage(ctx, &session, response.Feedback)
 	case HumanRespAllow:
 		for _, call := range pending {
-			output := dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call)
+			// Resume path (issue #150): flatten any sandbox violation to a
+			// recoverable error — no typed-halt site here.
+			output := h.normalizeSandboxViolation(
+				dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call))
 			tr := HarnessToolResult{CallID: call.ID, Output: output}
 			h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
 		}
 	case HumanRespAllowWithModification:
 		for _, call := range response.Calls {
-			output := dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call)
+			// Resume path (issue #150): flatten any sandbox violation to a
+			// recoverable error — no typed-halt site here.
+			output := h.normalizeSandboxViolation(
+				dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call))
 			tr := HarnessToolResult{CallID: call.ID, Output: output}
 			h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
 		}
@@ -6346,10 +6479,14 @@ var _ Harness = (*StandardHarness)(nil)
 // dispatchAndUnwrap calls the registry's Dispatch and folds a *DispatchError
 // into a ToolOutput so the harness loop can keep operating on a uniform
 // ToolOutput shape. Recoverability follows the spec's Layer-2 routing:
-// UnregisteredTool is unrecoverable; SchemaValidationFailed and recoverable
-// SandboxViolations stay recoverable; ToolExecutionFailed mirrors the
-// originating recoverable flag (treated as unrecoverable by default since
-// the spec routes it via middleware on failure).
+// UnregisteredTool is unrecoverable; SchemaValidationFailed stays recoverable;
+// ToolExecutionFailed mirrors the originating recoverable flag (treated as
+// unrecoverable by default since the spec routes it via middleware on failure).
+// A SandboxViolation (issue #150) is carried through as the TYPED
+// ToolOutputSandboxViolation — the harness, not this folder, owns the
+// halt-vs-recoverable decision via SandboxViolationPolicy: the main loop sees
+// the variant and may issue a typed halt, while drain/resume sites flatten it
+// through normalizeSandboxViolation.
 func dispatchAndUnwrap(
 	ctx context.Context,
 	registry ToolRegistry,
@@ -6382,14 +6519,14 @@ func dispatchAndUnwrap(
 			Recoverable: true,
 		}
 	case DispatchErrSandboxViolation:
-		recoverable := true
-		if de.Violation != nil && de.Violation.IsAlwaysHalt() {
-			recoverable = false
-		}
+		// issue #150: carry the TYPED violation to the harness, which owns the
+		// halt-vs-recoverable decision via SandboxViolationPolicy. The main loop
+		// sees this variant and may issue a typed halt; drain/resume sites flatten
+		// it through normalizeSandboxViolation. Do NOT pre-decide recoverability
+		// here.
 		return ToolOutput{
-			Kind:        ToolOutputError,
-			Message:     de.Error(),
-			Recoverable: recoverable,
+			Kind:      ToolOutputSandboxViolation,
+			Violation: de.Violation,
 		}
 	default:
 		return ToolOutput{
@@ -6425,6 +6562,13 @@ func (NoopContextManager) AppendToolResult(_ context.Context, s *SessionState, r
 		text = r.Output.Content
 	case ToolOutputError:
 		text = "[error] " + r.Output.Message
+	case ToolOutputSandboxViolation:
+		// Normally normalized into an Error before append; defensive (issue #150).
+		if r.Output.Violation != nil {
+			text = "[error] sandbox violation: " + r.Output.Violation.Error()
+		} else {
+			text = "[error] sandbox violation"
+		}
 	case ToolOutputWaitingForHuman:
 		text = "[waiting]"
 	}
