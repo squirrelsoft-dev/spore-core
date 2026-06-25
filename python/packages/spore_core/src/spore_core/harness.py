@@ -3818,8 +3818,39 @@ SandboxViolation = Annotated[
 
 
 def sandbox_violation_is_always_halt(v: SandboxViolation) -> bool:
-    """Layer-1 violations cannot be overridden — they always halt."""
+    """The halt-ELIGIBLE Layer-1 violations: a path escaping the workspace root
+    (:class:`SandboxPathEscape`) or a blocked network host
+    (:class:`SandboxNetworkViolation`). Whether such a violation ACTUALLY halts
+    the run is governed by :class:`SandboxViolationPolicy`; under the default
+    (``RECOVERABLE``) even these are fed back to the model. The Layer-2 variants
+    (``path_denied``, ``read_only_violation``, …) are never halt-eligible — they
+    are always recoverable regardless of policy."""
     return isinstance(v, SandboxPathEscape | SandboxNetworkViolation)
+
+
+class SandboxViolationPolicy(str, Enum):
+    """How the harness treats a :class:`SandboxViolation` surfaced by a tool (or
+    the pre-dispatch ``validate`` check): coach the model and let it retry, or
+    halt the run outright.
+
+    This is the single switch for sandbox-violation handling, applied uniformly
+    across every tool (filesystem, bash/exec, …) and both surfacing paths. The
+    default is :attr:`RECOVERABLE`: a mis-targeted write or a blocked command is
+    a benign mistake for an agent, so the violation is appended as a recoverable
+    tool error and the model self-corrects (the boundary still holds — the
+    access was refused). Opt into :attr:`HALT` to restore the original Layer-1
+    always-halt behaviour for path escapes / network violations.
+
+    Set it via :meth:`HarnessBuilder.sandbox_violation_policy`. Mirrors Rust's
+    ``SandboxViolationPolicy``."""
+
+    #: Surface the violation to the model as a recoverable tool error it can
+    #: retry from. Halt-eligible or not, nothing halts the run. The default.
+    RECOVERABLE = "recoverable"
+    #: Halt the run when a halt-eligible violation
+    #: (:func:`sandbox_violation_is_always_halt`) is encountered. Layer-2
+    #: violations stay recoverable. Restores the pre-policy Layer-1 behaviour.
+    HALT = "halt"
 
 
 # ----- HookPoint (issue #11) ----------------------------------------------
@@ -4265,13 +4296,29 @@ class ToolOutputConsult(_Model):
         return cls(child_state=None, request=request)
 
 
+class ToolOutputSandboxViolation(_Model):
+    """A tool was denied by the sandbox (e.g. a path escaped the workspace root,
+    or a command was disallowed). Carries the typed :class:`SandboxViolation` so
+    the harness — not the tool — decides whether it halts the run or is fed back
+    to the model as a recoverable error, per
+    :attr:`HarnessConfig.sandbox_violation_policy`. Produced by the
+    ``ToolExecutionError`` → :class:`ToolOutput` conversion (issue #5); the
+    harness normalizes it into a halt or a recoverable :class:`ToolOutputError`
+    immediately after dispatch, so it never reaches message history. Mirrors
+    Rust's ``ToolOutput::SandboxViolation { violation }``."""
+
+    kind: Literal["sandbox_violation"] = "sandbox_violation"
+    violation: SandboxViolation
+
+
 ToolOutput = Annotated[
     ToolOutputSuccess
     | ToolOutputError
     | ToolOutputWaitingForHuman
     | ToolOutputEscalate
     | ToolOutputAwaitingClarification
-    | ToolOutputConsult,
+    | ToolOutputConsult
+    | ToolOutputSandboxViolation,
     Field(discriminator="kind"),
 ]
 
@@ -5713,6 +5760,7 @@ class HarnessConfig:
         sandbox: SandboxProvider,
         context_manager: ContextManager,
         termination_policy: TerminationPolicy,
+        sandbox_violation_policy: SandboxViolationPolicy = SandboxViolationPolicy.RECOVERABLE,
         middleware: MiddlewareChain | None = None,
         observability: ObservabilityProvider | None = None,
         compaction_verifier: CompactionVerifier | None = None,
@@ -5770,6 +5818,12 @@ class HarnessConfig:
         _ = evaluator_agent
         self.tool_registry = tool_registry
         self.sandbox = sandbox
+        # How a :class:`SandboxViolation` surfaced by a tool (or the pre-dispatch
+        # ``validate`` check) is handled: fed back to the model as a recoverable
+        # error (the default) or halted on. See :class:`SandboxViolationPolicy`
+        # and :meth:`StandardHarness._sandbox_violation_halts`. Mirrors Rust's
+        # ``HarnessConfig::sandbox_violation_policy``.
+        self.sandbox_violation_policy = sandbox_violation_policy
         self.context_manager = context_manager
         self.termination_policy = termination_policy
         self.middleware = middleware
@@ -6027,6 +6081,7 @@ class HarnessConfig:
             sandbox=sandbox,
             context_manager=self.context_manager,
             termination_policy=self.termination_policy,
+            sandbox_violation_policy=self.sandbox_violation_policy,
             middleware=self.middleware,
             observability=self.observability,
             compaction_verifier=self.compaction_verifier,
@@ -6133,6 +6188,11 @@ class HarnessBuilder:
         self._sandbox = sandbox
         self._context_manager = context_manager
         self._termination_policy = termination_policy
+        # How a tool-surfaced :class:`SandboxViolation` is handled — recoverable
+        # feedback to the model (the default) or a hard halt. See
+        # :meth:`sandbox_violation_policy` and
+        # :class:`SandboxViolationPolicy`.
+        self._sandbox_violation_policy: SandboxViolationPolicy = SandboxViolationPolicy.RECOVERABLE
         self._middleware: MiddlewareChain | None = None
         self._observability: ObservabilityProvider | None = None
         self._compaction_verifier: CompactionVerifier | None = None
@@ -6511,6 +6571,22 @@ class HarnessBuilder:
         self._sandbox = sandbox
         return self
 
+    def sandbox_violation_policy(self, policy: SandboxViolationPolicy) -> HarnessBuilder:
+        """Set how a :class:`SandboxViolation` surfaced by a tool is handled —
+        recoverable feedback to the model (the default) or a hard halt. See
+        :class:`SandboxViolationPolicy`.
+
+        Mirrors Rust's ``HarnessBuilder::sandbox_violation_policy``::
+
+            harness = (
+                HarnessBuilder.conversational(model)
+                .sandbox_violation_policy(SandboxViolationPolicy.HALT)
+                .build()
+            )
+        """
+        self._sandbox_violation_policy = policy
+        return self
+
     def system_prompt(self, system_prompt: str) -> HarnessBuilder:
         """Set an operating system prompt prepended to each turn's assembled
         context (issue #91).
@@ -6881,6 +6957,7 @@ class HarnessBuilder:
             sandbox=self._sandbox,
             context_manager=self._context_manager,
             termination_policy=self._termination_policy,
+            sandbox_violation_policy=self._sandbox_violation_policy,
             middleware=self._middleware,
             observability=self._observability,
             compaction_verifier=self._compaction_verifier,
@@ -7156,6 +7233,35 @@ class StandardHarness:
         path = call.input.get("path")
         if isinstance(path, str) and path not in self._observed_writes:
             self._observed_writes.append(path)
+
+    def _sandbox_violation_halts(self, violation: SandboxViolation) -> bool:
+        """Whether a sandbox violation should HALT the run under the configured
+        :class:`SandboxViolationPolicy`: only when the policy is ``HALT`` AND the
+        violation is halt-eligible (``path_escape`` / ``network_violation``).
+        Layer-2 violations are never halt-eligible, so they stay recoverable
+        regardless. Governs BOTH the tool-surfaced path and the pre-dispatch
+        ``validate`` seam. Mirrors Rust's
+        ``StandardHarness::sandbox_violation_halts``."""
+        return (
+            self._config.sandbox_violation_policy == SandboxViolationPolicy.HALT
+            and sandbox_violation_is_always_halt(violation)
+        )
+
+    def _normalize_sandbox_violation(self, output: ToolOutput) -> ToolOutput:
+        """Flatten a :class:`ToolOutputSandboxViolation` into a plain
+        :class:`ToolOutputError` whose ``recoverable`` flag reflects the policy.
+        Used on tool-result drain paths (resume / human-approval flushes) that
+        append results to history but have no place to issue a typed halt; the
+        main loop handles the variant directly so it can return the typed
+        :class:`HaltReasonSandboxViolation`. A non-violation output passes
+        through. Mirrors Rust's
+        ``StandardHarness::normalize_sandbox_violation``."""
+        if isinstance(output, ToolOutputSandboxViolation):
+            return ToolOutputError(
+                message=f"sandbox: {output.violation.kind}",
+                recoverable=not self._sandbox_violation_halts(output.violation),
+            )
+        return output
 
     async def _build_context_sources(
         self,
@@ -7686,7 +7792,10 @@ class StandardHarness:
                 )
                 await self._config.context_manager.append_tool_result(session_state, tr)
                 for call in rest:
-                    output = await tool_registry.dispatch(call)
+                    # Drain path: no place to issue a typed halt here, so flatten
+                    # any tool-surfaced sandbox violation to a recoverable-vs-halt
+                    # error per the policy (#150).
+                    output = self._normalize_sandbox_violation(await tool_registry.dispatch(call))
                     tr = HarnessToolResult(call_id=call.id, output=output)
                     await self._config.context_manager.append_tool_result(session_state, tr)
             # SC-BUG-1: a clarification that surfaced from inside a composed tree
@@ -7846,13 +7955,17 @@ class StandardHarness:
 
         elif isinstance(response, HumanResponseAllow):
             for call in pending:
-                output = await tool_registry.dispatch(call)
+                # Drain path: flatten a tool-surfaced sandbox violation per the
+                # policy — no place to issue a typed halt here (#150).
+                output = self._normalize_sandbox_violation(await tool_registry.dispatch(call))
                 tr = HarnessToolResult(call_id=call.id, output=output)
                 await self._config.context_manager.append_tool_result(session_state, tr)
 
         elif isinstance(response, HumanResponseAllowWithModification):
             for call in response.calls:
-                output = await tool_registry.dispatch(call)
+                # Drain path: flatten a tool-surfaced sandbox violation per the
+                # policy — no place to issue a typed halt here (#150).
+                output = self._normalize_sandbox_violation(await tool_registry.dispatch(call))
                 tr = HarnessToolResult(call_id=call.id, output=output)
                 await self._config.context_manager.append_tool_result(session_state, tr)
 
@@ -7966,7 +8079,9 @@ class StandardHarness:
             )
             await self._config.context_manager.append_tool_result(session_state, tr)
             for call in rest:
-                output = await tool_registry.dispatch(call)
+                # Drain path: flatten a tool-surfaced sandbox violation per the
+                # policy — no place to issue a typed halt here (#150).
+                output = self._normalize_sandbox_violation(await tool_registry.dispatch(call))
                 tr = HarnessToolResult(call_id=call.id, output=output)
                 await self._config.context_manager.append_tool_result(session_state, tr)
 
@@ -10041,10 +10156,13 @@ class StandardHarness:
                 # append time so it survives the #137 corrective-message interleaving.
                 result_msg_indices: list[int] = []
                 for i, call in enumerate(calls):
-                    # Sandbox validation.
+                    # Sandbox validation. The pre-dispatch ``validate`` seam
+                    # honours the SAME policy as tool-surfaced violations
+                    # (``_sandbox_violation_halts``): halt only under ``HALT`` for
+                    # an always-halt-eligible violation; otherwise recoverable.
                     violation = await config.sandbox.validate(call)
                     if violation is not None:
-                        if sandbox_violation_is_always_halt(violation):
+                        if self._sandbox_violation_halts(violation):
                             return self._fail(
                                 HaltReasonSandboxViolation(violation=violation),
                                 session_id,
@@ -10052,7 +10170,7 @@ class StandardHarness:
                                 budget_used.turns,
                                 session_state,
                             )
-                        # Layer-2 default: recoverable — append as tool error.
+                        # Recoverable — append as tool error.
                         tr = HarnessToolResult(
                             call_id=call.id,
                             output=ToolOutputError(
@@ -10080,6 +10198,26 @@ class StandardHarness:
                     tool_started_at = _now()
                     tool_clock = time.monotonic()
                     output = await tool_registry.dispatch(call)
+
+                    # Tool-surfaced sandbox violation: the HARNESS decides
+                    # halt-vs-recoverable per ``sandbox_violation_policy``, not
+                    # the tool. Under ``HALT`` an always-halt-eligible violation
+                    # ends the run with a typed :class:`HaltReasonSandboxViolation`;
+                    # otherwise (the default) it becomes a recoverable error the
+                    # model retries from — uniform across every tool.
+                    if isinstance(output, ToolOutputSandboxViolation):
+                        if self._sandbox_violation_halts(output.violation):
+                            return self._fail(
+                                HaltReasonSandboxViolation(violation=output.violation),
+                                session_id,
+                                usage,
+                                budget_used.turns,
+                                session_state,
+                            )
+                        output = ToolOutputError(
+                            message=f"sandbox: {output.violation.kind}",
+                            recoverable=True,
+                        )
 
                     # #126 (AC2): record harness-OBSERVED write/edit paths from
                     # the call ACTUALLY dispatched. This is the single

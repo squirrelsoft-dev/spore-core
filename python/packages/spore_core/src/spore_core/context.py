@@ -41,6 +41,7 @@ from .harness import (
     SessionId,
     TaskId,
     ToolOutputError,
+    ToolOutputSandboxViolation,
     ToolOutputSuccess,
     ToolOutputWaitingForHuman,
 )
@@ -918,6 +919,11 @@ class StandardContextManager:
             text = output.content
         elif isinstance(output, ToolOutputError):
             text = f"[error] {output.message}"
+        elif isinstance(output, ToolOutputSandboxViolation):
+            # Normally normalized into a :class:`ToolOutputError` (or a halt) by
+            # the harness before append; record the violation text defensively if
+            # it reaches here (#150).
+            text = f"[error] sandbox violation: {output.violation.kind}"
         elif isinstance(output, ToolOutputWaitingForHuman):
             text = "[waiting]"
         else:  # pragma: no cover — exhaustive

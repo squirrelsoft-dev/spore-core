@@ -70,6 +70,7 @@ from .harness import (
     SessionState as HarnessState,
     Task,
     ToolOutputError,
+    ToolOutputSandboxViolation,
     ToolOutputSuccess,
 )
 from .model import (
@@ -298,6 +299,11 @@ class StandardCompactionAdapter:
             return output.content
         if isinstance(output, ToolOutputError):
             return output.message
+        if isinstance(output, ToolOutputSandboxViolation):
+            # Normally normalized into a :class:`ToolOutputError` by the harness
+            # before being appended; record the violation text defensively if it
+            # reaches here (#150).
+            return f"sandbox violation: {output.violation.kind}"
         return ""
 
     async def append_tool_result(self, session: HarnessState, result: HarnessToolResult) -> None:

@@ -57,6 +57,8 @@ from spore_core import (
     RunResultWaitingForHuman,
     SandboxPathDenied,
     SandboxPathEscape,
+    SandboxReadOnlyViolation,
+    SandboxViolationPolicy,
     ScriptedMiddleware,
     ScriptedSandbox,
     ScriptedTerminationPolicy,
@@ -71,6 +73,7 @@ from spore_core import (
     ToolCall,
     ToolCallRequested,
     ToolOutputError,
+    ToolOutputSandboxViolation,
     ToolOutputSuccess,
     ToolOutputWaitingForHuman,
     TurnError,
@@ -109,6 +112,9 @@ def _config(agent: MockAgent, **overrides: Any) -> HarnessConfig:
         agent=agent,
         tool_registry=overrides.get("tool_registry", ScriptedToolRegistry()),
         sandbox=overrides.get("sandbox", AllowAllSandbox()),
+        sandbox_violation_policy=overrides.get(
+            "sandbox_violation_policy", SandboxViolationPolicy.RECOVERABLE
+        ),
         context_manager=overrides.get("context_manager", NoopContextManager()),
         termination_policy=overrides.get("termination_policy", AlwaysContinuePolicy()),
         middleware=overrides.get("middleware"),
@@ -236,7 +242,9 @@ async def test_agent_error_terminates_with_agent_error_halt_reason() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Rule: Layer-1 SandboxViolation::PathEscape halts unconditionally.
+# Rule: a pre-dispatch (validate-seam) Layer-1 PathEscape halts under HALT.
+# Halting on a path escape is now opt-in via the policy (#150); the default is
+# RECOVERABLE, so this opts in to exercise the always-halt path.
 # ---------------------------------------------------------------------------
 
 
@@ -244,11 +252,30 @@ async def test_layer1_path_escape_halts() -> None:
     a = _agent()
     a.push(ToolCallRequested(calls=[_tc(name="read")], usage=_usage()))
     sb = ScriptedSandbox().push(SandboxPathEscape(path="/etc/passwd"))
-    h = StandardHarness(_config(a, sandbox=sb))
+    h = StandardHarness(
+        _config(a, sandbox=sb, sandbox_violation_policy=SandboxViolationPolicy.HALT)
+    )
     r = await h.run(HarnessRunOptions(_react_task()))
     assert isinstance(r, RunResultFailure)
     assert isinstance(r.reason, HaltReasonSandboxViolation)
     assert isinstance(r.reason.violation, SandboxPathEscape)
+
+
+# ---------------------------------------------------------------------------
+# Rule: a pre-dispatch (validate-seam) Layer-1 PathEscape is RECOVERABLE by
+# default — the loop continues (#150).
+# ---------------------------------------------------------------------------
+
+
+async def test_validate_seam_path_escape_recoverable_by_default() -> None:
+    a = _agent()
+    a.push(ToolCallRequested(calls=[_tc(name="read")], usage=_usage()))
+    a.push(FinalResponse(content="ack", usage=_usage()))
+    sb = ScriptedSandbox().push(SandboxPathEscape(path="/etc/passwd"))
+    h = StandardHarness(_config(a, sandbox=sb))  # default policy = RECOVERABLE
+    r = await h.run(HarnessRunOptions(_react_task()))
+    assert isinstance(r, RunResultSuccess)
+    assert r.turns == 2
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +290,67 @@ async def test_layer2_path_denied_continues_as_tool_error() -> None:
     a.push(FinalResponse(content="ack", usage=_usage()))
     sb = ScriptedSandbox().push(SandboxPathDenied(path="/p"))
     h = StandardHarness(_config(a, sandbox=sb))
+    r = await h.run(HarnessRunOptions(_react_task()))
+    assert isinstance(r, RunResultSuccess)
+    assert r.turns == 2
+
+
+# ---------------------------------------------------------------------------
+# Policy: a TOOL-surfaced sandbox violation is RECOVERABLE by default — the
+# harness appends it as a tool error and the loop continues to completion (#150).
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_sandbox_violation_recoverable_by_default() -> None:
+    a = _agent()
+    a.push(ToolCallRequested(calls=[_tc()], usage=_usage()))
+    a.push(FinalResponse(content="ack", usage=_usage()))
+    reg = ScriptedToolRegistry().push(
+        ToolOutputSandboxViolation(violation=SandboxPathEscape(path="/etc/passwd"))
+    )
+    h = StandardHarness(_config(a, tool_registry=reg))  # default policy = RECOVERABLE
+    r = await h.run(HarnessRunOptions(_react_task()))
+    assert isinstance(r, RunResultSuccess)
+    assert r.turns == 2
+
+
+# ---------------------------------------------------------------------------
+# Policy: opting into HALT makes a tool-surfaced always-halt violation end the
+# run with a TYPED HaltReasonSandboxViolation (not UnrecoverableToolError) (#150).
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_sandbox_violation_halts_under_halt_policy() -> None:
+    a = _agent()
+    a.push(ToolCallRequested(calls=[_tc()], usage=_usage()))
+    reg = ScriptedToolRegistry().push(
+        ToolOutputSandboxViolation(violation=SandboxPathEscape(path="/etc/passwd"))
+    )
+    h = StandardHarness(
+        _config(a, tool_registry=reg, sandbox_violation_policy=SandboxViolationPolicy.HALT)
+    )
+    r = await h.run(HarnessRunOptions(_react_task()))
+    assert isinstance(r, RunResultFailure)
+    assert isinstance(r.reason, HaltReasonSandboxViolation)
+    assert isinstance(r.reason.violation, SandboxPathEscape)
+
+
+# ---------------------------------------------------------------------------
+# Policy: a Layer-2 (non-always-halt) violation stays recoverable even under
+# HALT — only PathEscape/NetworkViolation are halt-eligible (#150).
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_layer2_violation_recoverable_even_under_halt_policy() -> None:
+    a = _agent()
+    a.push(ToolCallRequested(calls=[_tc()], usage=_usage()))
+    a.push(FinalResponse(content="ack", usage=_usage()))
+    reg = ScriptedToolRegistry().push(
+        ToolOutputSandboxViolation(violation=SandboxReadOnlyViolation(path="x"))
+    )
+    h = StandardHarness(
+        _config(a, tool_registry=reg, sandbox_violation_policy=SandboxViolationPolicy.HALT)
+    )
     r = await h.run(HarnessRunOptions(_react_task()))
     assert isinstance(r, RunResultSuccess)
     assert r.turns == 2

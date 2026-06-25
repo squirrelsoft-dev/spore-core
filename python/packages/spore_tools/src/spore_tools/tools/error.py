@@ -1,11 +1,23 @@
 """``ToolExecutionError`` — typed error hierarchy for tool implementations.
 
-Mirrors ``rust/crates/spore-core/src/tools/error.rs``. Spec (issue #5):
+Mirrors ``rust/crates/spore-core/src/tools/error.rs``. Error → :class:`ToolOutput`
+mapping:
 
-* :class:`InvalidParameters` — ``recoverable=True``
-* :class:`Timeout` — ``recoverable=True``
-* :class:`ExecutionFailed` — caller-specified ``recoverable``
-* :class:`SandboxViolation` — ``recoverable=False``
+* :class:`InvalidParameters` — :class:`ToolOutputError` (``recoverable=True``)
+* :class:`Timeout` — :class:`ToolOutputError` (``recoverable=True``)
+* :class:`ExecutionFailed` — :class:`ToolOutputError` (caller-specified ``recoverable``)
+* :class:`SandboxViolationError` — :class:`ToolOutputSandboxViolation` (typed violation)
+
+A tool-surfaced sandbox violation is NOT flattened into a recoverable-or-not
+:class:`ToolOutputError` here — that decision is the HARNESS's, not the tool's.
+The conversion carries the typed violation through as
+:class:`ToolOutputSandboxViolation`, and the harness applies its
+``SandboxViolationPolicy``: by default the model is fed a recoverable error and
+retries (the boundary still holds — the access was refused); under ``HALT`` an
+always-halt-eligible violation ends the run with a typed
+``HaltReasonSandboxViolation``. Keeping the violation typed all the way to the
+harness is what makes the policy uniform across every tool and both surfacing
+paths (this one and the pre-dispatch ``validate`` check). See issue #150.
 
 Tools convert errors via :meth:`ToolExecutionError.to_tool_output` so the
 registry can stay on its happy path.
@@ -22,6 +34,7 @@ from spore_core.harness import (
 from spore_core.harness import (
     ToolOutput,
     ToolOutputError,
+    ToolOutputSandboxViolation,
 )
 
 
@@ -61,7 +74,10 @@ class ExecutionFailed(ToolExecutionError):
 
 @dataclass
 class SandboxViolationError(ToolExecutionError):
-    """Sandbox rejected the operation. Not recoverable."""
+    """Sandbox rejected the operation. The conversion carries the TYPED
+    violation to the harness, which applies the configured
+    ``SandboxViolationPolicy`` (recoverable feedback by default; halt on opt-in)
+    — the tool does NOT pre-decide recoverability. See the module docstring."""
 
     violation: HarnessSandboxViolation
 
@@ -69,10 +85,10 @@ class SandboxViolationError(ToolExecutionError):
         super().__init__(f"sandbox violation: {self.violation}")
 
     def to_tool_output(self) -> ToolOutput:
-        return ToolOutputError(
-            message=f"sandbox violation: {self.violation.kind}",
-            recoverable=False,
-        )
+        # Carry the typed violation to the harness, which applies the configured
+        # ``SandboxViolationPolicy`` (recoverable feedback by default; halt on
+        # opt-in). See the module docstring (#150).
+        return ToolOutputSandboxViolation(violation=self.violation)
 
 
 @dataclass

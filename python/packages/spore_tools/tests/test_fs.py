@@ -5,7 +5,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from spore_core.harness import ToolOutputError, ToolOutputSuccess, WorkspaceConfig
+from spore_core.harness import (
+    SandboxPathEscape,
+    ToolOutputError,
+    ToolOutputSandboxViolation,
+    ToolOutputSuccess,
+    WorkspaceConfig,
+)
 from spore_core.model import ToolCall
 from spore_core.sandbox import WorkspaceScopedSandbox
 from spore_core.tool_registry import AllowAllSandbox, make_test_ctx
@@ -156,14 +162,15 @@ async def test_read_missing_in_workspace_file_is_recoverable_not_found(
 
 async def test_read_outside_workspace_is_path_escape(tmp_path: Path) -> None:
     # Counterpart: a path that resolves outside the root is still a sandbox
-    # violation, even when the file does not exist.
+    # violation, even when the file does not exist. The tool surfaces the TYPED
+    # violation (:class:`ToolOutputSandboxViolation`); the harness — not the tool
+    # — decides recoverable-vs-halt via ``SandboxViolationPolicy`` (#150).
     sb = _workspace_sandbox(tmp_path)
     r = await ReadFileTool().execute(
         _call("read_file", {"path": "../nonexistent_secret"}), sb, _CTX
     )
-    assert isinstance(r, ToolOutputError)
-    lowered = r.message.lower()
-    assert "escape" in lowered or "sandbox" in lowered
+    assert isinstance(r, ToolOutputSandboxViolation)
+    assert isinstance(r.violation, SandboxPathEscape)
 
 
 # ============================================================================
