@@ -395,19 +395,35 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
 
     return new Promise<CommandOutput | SandboxViolation>((resolveFn) => {
       const controller = new AbortController();
-      const child = spawn(command, args as string[], {
-        cwd: cwd ?? this.root,
-        shell: false,
-        signal: controller.signal,
-        ...(childEnv != null ? { env: childEnv } : {}),
-        ...(stdio != null ? { stdio } : {}),
-      });
+      // SC-15: `spawn` can FAIL SYNCHRONOUSLY (e.g. ENOEXEC for a non-binary
+      // executable, EMFILE, …) by throwing instead of emitting `"error"`. That is
+      // still a "the process never started" failure, so convert it to the typed
+      // violation here — matching the Rust/Python/Go reference, which surface any
+      // start error (not just ENOENT/EACCES) as a spawn failure.
+      let child: ReturnType<typeof spawn>;
+      try {
+        child = spawn(command, args as string[], {
+          cwd: cwd ?? this.root,
+          shell: false,
+          signal: controller.signal,
+          ...(childEnv != null ? { env: childEnv } : {}),
+          ...(stdio != null ? { stdio } : {}),
+        });
+      } catch (err) {
+        resolveFn({ kind: "exec_spawn_failed", command, message: String(err) });
+        return;
+      }
 
       let stdout = "";
       let stderr = "";
       let timedOut = false;
       let timer: NodeJS.Timeout | null = null;
       let aborted = false;
+      // SC-15: did the OS actually start the process? The `"spawn"` event fires
+      // once the child has been spawned successfully; if the `"error"` event
+      // fires before it, the process never started (a spawn/start failure of
+      // ANY errno — ENOENT, EACCES, EPERM, ENOTDIR, EISDIR, …).
+      let spawned = false;
 
       const cleanup = (): void => {
         if (timer) clearTimeout(timer);
@@ -442,6 +458,9 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
         }, effectiveTimeoutMs);
       }
 
+      child.on("spawn", () => {
+        spawned = true;
+      });
       child.stdout?.on("data", (chunk: Buffer) => {
         stdout += chunk.toString("utf8");
       });
@@ -450,13 +469,17 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
       });
       child.on("error", (err) => {
         cleanup();
-        // SC-15: a genuine spawn failure (the binary never started) is a typed
-        // violation, not a fake `exit_code: -1` success. A timeout/abort is a
-        // real run that exceeded the clock / was cancelled — it KEEPS the legacy
-        // `CommandOutput { exit_code: -1, timed_out }` (only never-started spawns
-        // become the violation). Callers already narrow the union.
-        const code = (err as NodeJS.ErrnoException).code;
-        if (!timedOut && !aborted && (code === "ENOENT" || code === "EACCES")) {
+        // SC-15: a genuine spawn failure (the process never started) is a typed
+        // violation, not a fake `exit_code: -1` success — for ANY start errno, to
+        // match the Rust/Python/Go reference (Rust converts any `spawn()` Err,
+        // Python catches any OSError, Go converts any non-ExitError start error).
+        // `!spawned` is the breadth-complete, errno-agnostic discriminator: an
+        // error before the `"spawn"` event means the OS never started the child.
+        // A post-spawn error (e.g. an abort/timeout kill) has `spawned === true`
+        // and KEEPS the legacy `CommandOutput { exit_code: -1, timed_out }` (a
+        // real run that was cancelled, not a spawn failure). Callers narrow the
+        // union.
+        if (!spawned) {
           resolveFn({ kind: "exec_spawn_failed", command, message: String(err) });
           return;
         }

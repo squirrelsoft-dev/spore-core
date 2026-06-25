@@ -2,7 +2,14 @@
  * Execution tool tests — mirror `rust/crates/spore-core/src/tools/exec.rs#tests`.
  */
 
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -94,6 +101,38 @@ describe("ExecTool", () => {
       expect(r.violation.command).toBe("spore-definitely-no-such-binary-xyz");
     }
   });
+
+  // SC-15 breadth parity (#164): a non-ENOENT/EACCES start failure (ENOEXEC for a
+  // non-binary executable) must still become exec_spawn_failed via the DEFAULT
+  // executeCommand path, matching the Rust/Python/Go any-start-error behavior.
+  it.runIf(IS_UNIX)(
+    "non-binary executable is a typed spawn failure (ENOEXEC)",
+    async () => {
+      const sb = new AllowAllSandbox();
+      const dir = mkdtempSync(join(tmpdir(), "spore-exec-enoexec-"));
+      const notABinary = join(dir, "not-a-binary");
+      writeFileSync(notABinary, "");
+      chmodSync(notABinary, 0o755);
+      try {
+        const r = await new ExecTool().execute(
+          call("exec", { command: notABinary }),
+          sb,
+          ctx,
+        );
+        expect(r.kind).toBe("sandbox_violation");
+        if (r.kind !== "sandbox_violation") throw new Error("unreachable");
+        expect(r.violation.kind).toBe("exec_spawn_failed");
+        if (r.violation.kind === "exec_spawn_failed") {
+          expect(r.violation.command).toBe(notABinary);
+          // Prove the broadening: the errno is neither ENOENT nor EACCES.
+          expect(r.violation.message).not.toContain("ENOENT");
+          expect(r.violation.message).not.toContain("EACCES");
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
 
   it.runIf(IS_UNIX)(
     "timeout returns recoverable error",
@@ -197,7 +236,7 @@ describe("BashCommandTool", () => {
     const r = await new BashCommandTool().execute(
       call("bash_command", {
         script:
-          "awk 'BEGIN{for(i=0;i<10240;i++)printf \"x\" > \"/dev/stderr\"; exit 1}'",
+          'awk \'BEGIN{for(i=0;i<10240;i++)printf "x" > "/dev/stderr"; exit 1}\'',
       }),
       sb,
       ctx,

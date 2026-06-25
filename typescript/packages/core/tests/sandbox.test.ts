@@ -3,7 +3,14 @@
  * `rust/crates/spore-core/src/sandbox.rs#tests`.
  */
 
-import { mkdtempSync, realpathSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import {
+  mkdtempSync,
+  realpathSync,
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+  chmodSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -13,6 +20,7 @@ import {
   BuildError,
   WorkspaceScopedSandbox,
   sandboxViolationIsAlwaysHalt,
+  type CommandOutput,
   type IsolationMode,
   type SandboxViolation,
   type WorkspaceConfig,
@@ -286,6 +294,29 @@ describe("executeCommand spawn failure (SC-15)", () => {
     expect(sandboxViolationIsAlwaysHalt(v)).toBe(false);
   });
 
+  // SC-15 breadth parity (#164): a start failure whose errno is NOT ENOENT/EACCES
+  // must still become exec_spawn_failed (Rust/Python/Go convert ANY start error).
+  // An empty 0755 file is "executable" to the OS but not a valid binary, so
+  // exec(2) fails with ENOEXEC — which Node raises as a SYNCHRONOUS spawn() throw
+  // (not the async `"error"` event). The handler converts that throw too.
+  it.runIf(IS_UNIX)("a non-ENOENT start failure (ENOEXEC) yields exec_spawn_failed", async () => {
+    const root = tmp();
+    const notABinary = join(root, "not-a-binary");
+    writeFileSync(notABinary, "");
+    chmodSync(notABinary, 0o755);
+    const out = await sb_run(root, notABinary);
+    expect("kind" in out).toBe(true);
+    const v = out as SandboxViolation;
+    expect(v.kind).toBe("exec_spawn_failed");
+    if (v.kind === "exec_spawn_failed") {
+      expect(v.command).toBe(notABinary);
+      // Prove the broadening: the errno is neither ENOENT nor EACCES.
+      expect(v.message).not.toContain("ENOENT");
+      expect(v.message).not.toContain("EACCES");
+    }
+    expect(sandboxViolationIsAlwaysHalt(v)).toBe(false);
+  });
+
   it.runIf(IS_UNIX)(
     "a timeout keeps the legacy CommandOutput { exit_code: -1, timed_out }",
     async () => {
@@ -299,6 +330,12 @@ describe("executeCommand spawn failure (SC-15)", () => {
     15000,
   );
 });
+
+/** Run `command` through a sandbox rooted at `root`. */
+async function sb_run(root: string, command: string): Promise<CommandOutput | SandboxViolation> {
+  const sb = new WorkspaceScopedSandbox({ root });
+  return sb.executeCommand(command, []);
+}
 
 // --------------------------------------------------------------------------
 // SC-12 — ExecConfig exec-hardening knobs
