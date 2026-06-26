@@ -1,5 +1,11 @@
 # PROJECT STATE
 
+_2026-06-25 — **HillClimbing loop-correctness fix LANDED in Rust (working tree, UNCOMMITTED — implements `docs/design/hill-climbing-loop-correctness.md`).** The HillClimbing loop could not actually climb: it had NO durable pointer to the accepted candidate (only a bare `f64` `current_best`), never committed a keep, and reverted with a hardcoded `git reset --hard HEAD`. So a keep→discard sequence destroyed accepted progress — HEAD never advanced past the start, so the discard's revert snapped the tree all the way back to the original baseline (the design's concrete bug). **Fix — add the missing primitive (durable per-accepted-candidate SHA):** new `HillCandidate { current_sha, best_sha, current_best, best_score }` threaded through the loop (two pointers + two scores from day one per D2, equal under strict greedy, diverge when annealing lands). **Per-iteration (`hill_iteration` now takes `&mut HillCandidate`, returns `bool` non-improvement):** KEEP ⇒ `commit_accepted` (commit the tree, advance `current_sha`/`current_best`, and `best_*` if it beats), record the REAL accepted SHA in `commit_hash` (was always `""`); DISCARD/error ⇒ `reset_to(current_sha)` — the last ACCEPTED state, NOT HEAD. **Baseline (`hill_baseline` now returns `(score, Option<sha>)`)** commits the starting tree (D4) so `current_sha`/reverts are always well-defined. **Winner application (§4.6):** new `StrategyExecutor::hill_apply_winner` does `reset --hard best_sha` at the stagnation + turn-budget terminal exits (no-op when `best_sha` is None); `hill_climbing_partial_json` now carries `best_sha` on budget/escalation exits. **VcsProvider seam extended (§4.5):** added `head` / `commit_checkpoint` / `reset_to` (no-op defaults so the trait stays additive; `GitVcsProvider` implements all three git-through-sandbox). **Routing (SC-14 precedence preserved):** wired `VcsProvider` wins; else git-through-sandbox; **graceful no-VCS degradation** — when `head_sha` returns None (fake/no-git sandbox, e.g. the test spy or no-op provider) the loop falls back to pre-fix behaviour (empty `commit_hash`, `reset --hard HEAD` / `revert()`), which is why **every existing HC test + the cross-language fixture replay passes byte-identically with ZERO fixture changes** (the spy returns empty `rev-parse` ⇒ None ⇒ old path). **Critical sub-fix:** candidate commits **exclude the harness's own `.spore/` diagnostics** (`git add -A -- ':(exclude).spore'`, shared const `HILL_CLIMB_COMMIT_EXCLUDE`) so the results ledger stays UNTRACKED and a `reset --hard` (revert/winner-apply) never reverts or clobbers the live TSV — found via the live example, where committing `.spore` let the winner-apply restore a stale prior-run TSV. **Regression tests (the load-bearing deliverable, on a REAL temp git workspace + `WorkspaceScopedSandbox`, per [[noop-store-silently-disables-durable-behavior]] — a fake VCS would assert the opposite while passing):** `hill_climbing_keep_then_discard_preserves_kept_state` (keep `delta1` → discard `delta2` → tree MUST hold `delta1`, the discard row records the SAME SHA as the iter1 keep, `.spore` stays untracked; mutation-tested — fails when commit-on-keep is disabled, simulating `main`), `hill_climbing_revert_targets_latest_accepted_not_start` (multi-keep → revert lands on the LAST accepted), `git_vcs_provider_commit_head_reset_roundtrip`. Suite green: **Rust 1272 lib pass / 0 fail**; clippy clean on `harness.rs` (only the 2 pre-existing unrelated `ollama.rs` warnings remain); whole workspace builds. **Live example verified** (`10-hill-climbing`, `qwen3-coder:480b-cloud`): ran end-to-end, halted on stagnation, ledger TSV now carries real SHAs and survived the resets, discard rows record the accepted SHA, `.spore` untracked, best 24/30 draft preserved on disk. **OPEN DECISION D3 (needs owner):** `revert_on_no_improvement = false` semantics — kept the flag's current effect (false ⇒ no physical reset; fixture `revert_off_regress` expects `revert_count 0`), did NOT adopt the design's "always branch from current_sha" recommendation because on a single shared tree (no worktrees) it isn't physically meaningful and the design says confirm before removing the flag's effect; the second `false`-mode regression test is therefore deferred pending D3. **Deferred per §3 (NOT touched):** worktree/parallel/beam, fresh-sandbox-per-eval, LLM-judge re-score-pairwise, feedback-informed neighbors, target-threshold termination. **Next per design §8 / [[cross-language-fix-sequencing]]: commit the Rust ref, then file ONE TS/Py/Go parity issue (NOT yet filed/committed — outward actions pending maintainer go-ahead).**_
+
+_2026-06-25 — **#164 Phase 4 sandbox/exec hardening PORTED to TS/Python/Go (SC-12/13/14/15) + verifier-PASS; SC-16 DEFERRED to #148; #164 relabeled `status: blocked` (kept OPEN). Local `main` 4 commits ahead, NOT pushed.** Ran via `/implement` (Rust ref already on `main` from last loop ⇒ Phase 2 skipped): planning agent → 3 parallel opus language agents → cross-language verifier (PASS). Commits Go `e691030`, TS `ab04d9c` (+ SC-15 breadth fix `e0a60b5`), Python `36ac891`; **zero fixtures changed** in all three. **SC-12** ExecConfig — optional `exec_config` on `WorkspaceConfig`, applied in the `execute_command` spawn path; per-call timeout always wins over `default_timeout` (TS `number` ms / Py `float` seconds / Go `time.Duration` zero-means-unset, each matching that language's existing per-call exec-timeout idiom); `non_interactive_env` applied in sorted key order (Rust BTreeMap determinism); `kill_on_drop` via each lang's native cancel (TS `AbortSignal`→SIGKILL, Py `proc.kill()` on `CancelledError`, Go `exec.CommandContext`). **SC-13** `write_root` — read-everywhere/write-scoped; the load-bearing correctness point held in all four: the path-join base stays `root` for BOTH reads and writes, `write_root` only narrows the write *boundary check* (no `root/out/out/…` double-prefix), so a write under `root` but outside `write_root` is a `PathEscape`; new construction-time `BuildError` variants. **SC-14** `VcsProvider::revert` — additive per each lang's idiom (Rust default trait method / Py Protocol default body / TS optional `revert?` method / Go interface method + no-op `FixtureVcsProvider.Revert`); `GitVcsProvider.revert` runs `git reset --hard HEAD` through the sandbox; the no-provider hill-climbing fallback stays byte-identical (only a `if provider wired → route → return` guard added before it). **SC-15** (the only non-additive item) typed `ExecSpawnFailed` — new `SandboxViolation` variant `{kind:"exec_spawn_failed",command,message}`, Layer-2/never-halt, surfaced to the exec/git **tool layer as a typed `sandbox_violation`** in all four (NOT flattened — the Layer-2 `SandboxViolationPolicy` makes it recoverable), timeout KEEPS its `exit_code:-1,timed_out:true`; Python's exec/git tools gained new `except SandboxViolationException` arms (they previously didn't catch it; TS/Go callers already handled the violation arm). **Verifier caught one real divergence:** the first TS port narrowed the violation to `ENOENT`/`EACCES` only while Rust/Py/Go convert ANY OS start error — fixed `e0a60b5` via Node's `'spawn'`-event discriminator (`!spawned` ⇒ any-errno violation) + a try/catch around `spawn()` for synchronous throws (ENOEXEC/EMFILE) + a deterministic ENOEXEC breadth test. Empty-command behavior consistent across the ports (typed violation, matching Rust). Suites green: **Rust 1268 ref / TS core 1502 + tools 269 + eval 46 / Python 1631 pass, 8 skip / Go all-packages-ok**; lint/format/vet clean. **SC-16 DEFERRED to #148** — it hooks the request-side Ollama reasoning pipeline (`gate_thinking`/`supports_thinking`/`body.think`, Rust `a9c856b`) that is UN-PORTED in TS/Py/Go (TS only decodes response-side `thinking_delta`; Py/Go have no thinking seam); #148 is still open, so SC-16 has nothing to attach to. Maintainer chose to defer (not fold #148's whole pipeline into #164). **#164 relabeled `status: blocked`**, body trimmed to the remaining SC-16 work, kept OPEN as the SC-16 tracker — it unblocks when #148 lands. Local `main` now **4 commits ahead of `origin/main` (`e691030`/`ab04d9c`/`36ac891`/`e0a60b5`), NOT pushed** — ask the maintainer before pushing (Deviation #10 fresh drift). **OLDER backlog now #148 (which ALSO gates SC-16) + #146.** Phase 4 is ported except SC-16; remaining tracks: **#148** (Ollama thinking — now doubly important: drains the older backlog AND unblocks SC-16/#164), **#146** (`web_fetch` bugfix port), then consumer-friction **Phase 5**._
+
+_2026-06-25 — **66-commit `origin/main` drift CLEARED — maintainer pushed (reconcile-only loop, no code/issue change).** The maintainer made the call (Next Actions #5 / Deviation #10) and pushed the entire local-ahead backlog. Verified against the real remote: `git fetch origin` then `git rev-list --left-right --count origin/main...HEAD` reports **`0 0`**, with **`origin/main == local main == 5e2c00e`** and a clean working tree. Now on the remote: the consumer-friction Phase 1–3 Rust wave + the full TS/Python/Go port of it (#154–#163), the #151/#147 eval-phase port, the #153 SC-1/SC-30 port, the #150 sandbox-violation port (`b98eee8`/`48a58b4`/`c7614f6`), and the **Phase 4 Rust sandbox/exec wave** (`92a3720`/`0471aa0`/`87df0fe`/`2e16914`/`b0b3709`). **Deviation #10's current drift is RESOLVED** — the standing "ask before pushing" convention persists, but there is no longer any unpushed backlog. No GH issue closed (none passed; #164 remains the open parity work). Remaining work is unchanged: port Phase 4 via **#164**, drain the OLDER backlog (**#148** then **#146**), then consumer-friction **Phase 5**._
+
 _2026-06-25 — **Phase 4 sandbox/exec hardening LANDED in Rust (local `main`, NOT pushed) — 5 commits `92a3720`/`0471aa0`/`87df0fe`/`2e16914`/`b0b3709`; parity filed #164.** The consumer-friction plan §4 cluster, Rust-first per the cross-language sequencing convention (land+verify Rust, THEN file a TS/Py/Go parity issue — this is NOT a `/implement` port; no Rust ref existed). **SC-12** (`92a3720`): `ExecConfig { default_timeout, close_stdin, non_interactive_env, kill_on_drop }` as an OPTIONAL field on `WorkspaceConfig`, applied in `WorkspaceScopedSandbox::execute_command`; `None` = byte-identical legacy (inherit stdin / no implicit timeout / inherit env / leak-on-drop), `Some` tightens (per-call timeout still wins over `default_timeout`; `kill_on_drop` reaps on future-drop — tested via a sentinel the killed shell never touches). **SC-13** (`0471aa0`): `write_root: Option<PathBuf>` — read-everywhere, write-scoped (lets looper retire `PlanSandbox`). **Key design point the parity port must NOT get wrong:** path strings stay root-relative for BOTH reads and writes — the join base is ALWAYS `root`; `write_root` only narrows the write *boundary check* (joining writes onto `write_root` would double-prefix `root/out/out/…`), so a write under `root` but outside `write_root` is a `PathEscape`. `write_root` canonicalized at construction (new `BuildError::WriteRoot{NotFound,Io}`). **SC-15** (`87df0fe`, the only non-additive item): spawn failure returns `Err(SandboxViolation::ExecSpawnFailed { command, message })` instead of fake `Ok { exit_code: -1 }` — which conflated "ran and exited -1" with "never started". `ExecSpawnFailed` is Layer-2 (never halt-eligible) ⇒ recoverable feedback under the default policy; **timeout KEEPS its `Ok { exit_code:-1, timed_out:true }`** (a real run that exceeded the clock). Safe because every caller already handled the `Err` arm (exec/bash/git/termination/verifier/revert) and NO fixture encodes `-1`. **SC-14** (`2e16914`): pluggable `VcsProvider::revert()` (DEFAULT no-op so the trait stays additive; `GitVcsProvider` does `git reset --hard HEAD` THROUGH the sandbox — behavior relocated out of the harness); `hill_climbing_revert()` routes through `config.vcs_provider` when wired, else the hardcoded git fallback (byte-identical when unset, the default + what all fixtures use). **SC-16** (`b0b3709`): reasoning dropped on a non-thinking Ollama model now emits a ONE-TIME `eprintln!` warning (the gate returns whether it dropped; an `AtomicBool` guards once-per-client). Decision: the model layer has no `ObservabilityProvider` handle, so `eprintln!` (the house library-warn facade, as IsolationMode::None / observability_outbox) NOT a typed `WarnSpan` — documented limitation; fail-closed behavior unchanged. **All three confirmed plan decisions held:** SC-15 clean (no caller/fixture branched on `-1`), SC-14 additive via the default no-op, SC-16 eprintln facade. **Zero fixtures changed** (`git diff --name-only 92a3720^..HEAD -- fixtures/` empty; 4 source files touched). Full Rust suite green (1280 lib + all integration + 9 doctests, 0 failures); clippy clean modulo the 2 pre-existing UNRELATED ollama test warnings (`ollama.rs:1702/1707`, Default::default field-assign in a pre-existing test, not mine). Ahead-count 61→66, NOT pushed (Deviation #10). **Phase 4 is now COMPLETE in Rust** — the consumer-friction plan moves to Phase 5 (grouping/cleanup SC-17…25) + the LOC looper follow-ups; #164 is the TS/Py/Go parity follow-up (`status: queued`)._
 
 _2026-06-25 — **#150 recoverable sandbox violations PORTED to TS/Python/Go + CLOSED (local `main`, NOT pushed) — `b98eee8`(TS)/`48a58b4`(Py)/`c7614f6`(Go).** The largest + only breaking item of the OLDER pre-consumer-friction backlog. A tool-surfaced sandbox violation (write escaping the workspace root, blocked command) was flattened to a NON-recoverable error and halted the whole run; now **recoverable by default** in all four, with opt-in `Halt`. Ran via `/implement` (Rust ref `64938ee` already on `main`, so Phase 2 skipped): recon/plan agent → 3 parallel opus language agents → cross-language verifier (PASS). **The halt-vs-recoverable decision moved from the TOOL to the HARNESS:** a new typed `ToolOutput` variant (tag `sandbox_violation`, carries the `SandboxViolation`) + a new `SandboxViolationPolicy {Recoverable, Halt}` (default Recoverable) on `HarnessConfig`/builder; halt ⟺ `policy==Halt && violation.is_always_halt()` (only `path_escape`/`network_violation`; Layer-2 stays recoverable regardless). Applied UNIFORMLY across BOTH surfacing paths — the main tool-dispatch loop issues a typed `HaltReason::SandboxViolation`; the pre-dispatch `validate()` seam uses the same helper — and the drain/resume/human-approval-flush paths flatten via a normalize helper. The new variant is normalized away before message history, so **NO model-facing wire/fixture impact (zero fixtures changed, confirmed).** **Three port decisions resolved from the Rust ref + parity goal (not product calls):** (D1) recoverable-error message text kept **per-language** — each language's existing validate-seam format (TS/Py `sandbox: {kind}`, Go `sandbox: {v.Error()}`); Rust's `{violation:?}` Debug string isn't reproducible elsewhere and isn't fixture-pinned, so this is an intentional documented divergence (each language internally consistent across main-loop rewrite + validate-seam + normalize); (D2) Python policy = `str` Enum (mirrors dataless-enum siblings), NOT a tagged `_Model` union; (D3) Go kept `dispatchAndUnwrap` a policy-FREE free function that carries the typed variant through — the policy decision lives entirely in `*StandardHarness` methods (main loop halts; the 4 drain/resume sites call `normalizeSandboxViolation`), and the empty-string zero-value maps to Recoverable so all ~35 literal `HarnessConfig{}` sites needed zero change (no `*` sentinel). Cross-language verifier PASS (**Rust 1268+ / TS 2021 / Python 1616 / Go all-packages-ok**, zero failures; all 7 consistency points + 4 acceptance criteria confirmed). Minor: the TS port introduced one line of prettier drift (`errors.test.ts`), folded into `b98eee8` via amend (no prettier CI gate exists); the pre-existing ruff-format drift in 3 unrelated Python files (`test_harness_fill_and_plan_budget.py`/`exec.py`/`test_exec.py`) is NOT from this change (dirty on clean `main`). Closed `status: complete`. **Remote note:** `origin/main` has advanced to `f087479` (a PROJECT_STATE docs commit) vs the previously-recorded `e063cfc`; local `main` is now **61 commits ahead of `origin/main`, NOT pushed** (did not fetch — verify against the actual remote) — ask the maintainer before pushing (Deviation #10). **The OLDER pre-consumer-friction parity backlog is now down to #148 (Ollama thinking) + #146 (`web_fetch` `start_byte`, Python/Go).**_
@@ -44,17 +50,22 @@ _**Direction note:** The project has shifted from "hardening cluster done, maint
 spore-core is a language-agnostic agentic harness runtime with a **complete core
 capability surface**, four targets — Rust (reference), TypeScript, Python, Go —
 serialized formats byte-identical across all four. **The dated log entries at the top of this file are
-the live record;** this section keeps the standing per-issue history below it. Local `main` is **66 commits
-ahead of `origin/main`** (`origin/main` at `f087479`; not fetched this loop — verify the real remote) — the
-whole consumer-friction Phase 1–3 wave PLUS the full TS/Python/Go port of it (`c5f7a01` … `37c2dc5`) PLUS the
-#151/#147 eval-phase port PLUS the #153 SC-1/SC-30 port PLUS the #150 sandbox-violation port
-(`b98eee8`/`48a58b4`/`c7614f6`) PLUS the **Phase 4 Rust sandbox/exec wave** (`92a3720`/`0471aa0`/`87df0fe`/
-`2e16914`/`b0b3709`) is committed locally but **NOT pushed**; ask the maintainer before pushing (Deviation #10).
+the live record;** this section keeps the standing per-issue history below it. **`origin/main` is at `5e2c00e`;
+local `main` is 4 commits AHEAD and NOT pushed** (`e691030`/`ab04d9c`/`36ac891`/`e0a60b5` — this loop's #164
+Phase 4 TS/Py/Go port). Last loop the maintainer pushed the whole prior 66-commit backlog (consumer-friction
+Phase 1–3 wave + its full TS/Python/Go port `c5f7a01` … `37c2dc5`, the #151/#147 eval-phase port, the #153
+SC-1/SC-30 port, the #150 sandbox-violation port `b98eee8`/`48a58b4`/`c7614f6`, and the **Phase 4 Rust
+sandbox/exec wave** `92a3720`/`0471aa0`/`87df0fe`/`2e16914`/`b0b3709`), clearing that drift — but the 4 new
+port commits are fresh, unpushed drift (Deviation #10). The standing "ask before pushing" convention holds.
 
-**Active phase — consumer-friction Phase 4 (sandbox/exec hardening) now COMPLETE in Rust; Phases 0–3 COMPLETE
-across all four languages.** Phase 4's five §4 knobs (SC-12 ExecConfig, SC-13 write_root, SC-15 typed
-spawn-failure, SC-14 pluggable VcsProvider revert, SC-16 reasoning-dropped warning) landed Rust-first this loop
-(zero fixtures changed, full suite green), with TS/Py/Go parity filed as **#164** (`status: queued`). Phases 0–3 landed in Rust
+**Active phase — consumer-friction Phase 4 (sandbox/exec hardening) PORTED to all four languages EXCEPT SC-16;
+Phases 0–3 COMPLETE across all four languages.** Phase 4's five §4 knobs landed Rust-first last loop
+(`92a3720`/`0471aa0`/`87df0fe`/`2e16914`/`b0b3709`); this loop **SC-12 ExecConfig / SC-13 write_root / SC-15
+typed spawn-failure / SC-14 pluggable VcsProvider revert** were ported to TS/Python/Go via `/implement`
+(Go `e691030`, TS `ab04d9c` + breadth fix `e0a60b5`, Python `36ac891`), cross-language-verifier-PASS, zero
+fixtures changed. **SC-16 (reasoning-dropped warning) is DEFERRED to #148** — it hooks the request-side Ollama
+thinking pipeline that is un-ported in TS/Py/Go (still owed by #148), so it has nothing to attach to; **#164 is
+relabeled `status: blocked` and kept OPEN as the SC-16 tracker** (unblocks when #148 lands). Phases 0–3 landed in Rust
 (object-safety SC-2/#160, provider/window/AutoContinue knobs Phase 2, presets SC-8, the canonical middleware
 chain Q2, structural `ContextSources` injection of guides + skills + memory SC-26/SC-10/SC-28/#160) AND were
 ported to TS/Python/Go: **#154/#155/#156/#157/#158/#159/#161/#162/#163 are all DONE +
@@ -67,10 +78,10 @@ and, as the #151 verifier predicted, a genuine full port (SC-30 `ReadOnlyToolVie
 `check_structured_slot` present in all three). **With #153 done, NO "Phases 0–3" parity item remains.** **#131
 (the cordyceps-composition capstone, Composable Execution Success Criteria #1) was VERIFIED + CLOSED this loop**
 (`status: complete`, no code) — all 7 acceptance criteria mapped to green fixture-replay tests in all four
-languages; it was the last queued capstone item of the cordyceps PRD. The job from here: port **Phase 4 via
-#164** (the just-filed TS/Py/Go parity for the sandbox/exec wave), drain the OLDER pre-consumer-friction
-backlog (now just **#148/#146** — #150 closed last loop, #144 before it), and start consumer-friction **Phase 5**
-(grouping/cleanup SC-17…25, Rust-first). **Behind it sits that OLDER
+languages; it was the last queued capstone item of the cordyceps PRD. The job from here: drain the OLDER
+pre-consumer-friction backlog — **#148** (Ollama thinking, which ALSO unblocks SC-16/#164) then **#146**
+(`web_fetch` bugfix port) — and start consumer-friction **Phase 5** (grouping/cleanup SC-17…25, Rust-first).
+Phase 4's TS/Py/Go port is done except SC-16 (blocked on #148). **Behind it sits that OLDER
 cross-language parity backlog (#144–#150)** from the pre-consumer-friction wave — Rust raced ahead with
 Ollama + sandbox + bugfix work and TS/Python/Go still owe ports; that backlog's per-issue status (kept
 for reference):
@@ -289,22 +300,26 @@ ported to TS/Python/Go — all CLOSED `status: complete`, cross-language-verifie
 port, not the predicted verify-then-close). **#153** (Phase 1 SC-1/SC-30 no-startup-ceremony) is now DONE +
 CLOSED too (`7d80935`/`5e2b186`/`3bc94d2`, verifier-PASS, zero fixtures — and, as predicted, a real port: SC-30
 `ReadOnlyToolView` was uniformly absent + SC-1's `check_structured_slot` still present in all three). **With
-#153 done, NO "Phases 0–3" parity item remains open.** **Phase 4 (sandbox/exec hardening) is now COMPLETE in
-Rust** (this loop, `92a3720`/`0471aa0`/`87df0fe`/`2e16914`/`b0b3709`; parity **#164**). Three tracks remain,
-all maintainer-sequenceable:
-1. **Port Phase 4 via #164** — SC-12 ExecConfig / SC-13 write_root / SC-15 typed spawn-failure / SC-14
-   pluggable VcsProvider revert / SC-16 reasoning-dropped warning, to TS/Py/Go via `/implement` (Rust ref →
-   3 parallel language agents → cross-language verifier). Only SC-15 is non-additive (a return shape, not the
-   wire); zero fixtures. **LOC-2** (looper-side, not spore-core) was already unblocked by SC-28/#162.
-2. **Drain the OLDER pre-consumer-friction parity backlog** (predates this epoch): **#148** (Ollama thinking
-   models — Rust `a9c856b`), **#146** (bugfix port — Python/Go `web_fetch` `start_byte`). (#150 + #144 + #147
-   now DONE/CLOSED — #150 was the largest, the breaking sandbox-violation default change.)
+#153 done, NO "Phases 0–3" parity item remains open.** **Phase 4 (sandbox/exec hardening) landed Rust-first last
+loop and was PORTED to TS/Py/Go this loop for SC-12/13/14/15** (`e691030`/`ab04d9c`+`e0a60b5`/`36ac891`,
+verifier-PASS, zero fixtures); **only SC-16 remains, deferred to #148** (#164 now `status: blocked`). Three tracks
+remain, all maintainer-sequenceable:
+1. **Drain the OLDER pre-consumer-friction parity backlog** (predates this epoch): **#148** (Ollama
+   thinking/reasoning models — Rust `a9c856b`; TS/Py/Go owed) — now doubly important because it ALSO unblocks
+   **SC-16/#164**; then **#146** (bugfix port — Python/Go `web_fetch` `start_byte`). (#150 + #144 + #147 now
+   DONE/CLOSED — #150 was the largest, the breaking sandbox-violation default change.) Same `/implement`
+   convention. **LOC-2** (looper-side, not spore-core) was already unblocked by SC-28/#162.
+2. **Finish Phase 4 — SC-16 only** — port the reasoning-dropped one-time warning (each language's library-warn
+   facade, not a typed span; copy the warning string byte-identical) ONCE #148 lands the `gate_thinking` seam it
+   hooks. Tracked on #164 (`status: blocked`).
 3. **Consumer-friction Phase 5** (grouping/cleanup, lowest priority) — SC-17…SC-25 (sub-config grouping,
    one `TruncationPolicy`, `RetryConfig`, exposed magic numbers, `harness.rs` split). Rust-first, then port.
 
-**Housekeeping:** local `main` is **66 commits ahead of `origin/main` (`f087479`), NOT pushed** — **ask the
-maintainer before pushing** (Deviation #10). No GH issue was closed this loop (Phase 4 is Rust-first; #164 is
-the parity follow-up, kept `status: queued`); no reconcile-only steps remain outstanding.
+**Housekeeping:** local `main` is **4 commits AHEAD of `origin/main` (`5e2c00e`), NOT pushed** — this loop's
+#164 Phase 4 port (`e691030`/`ab04d9c`/`36ac891`/`e0a60b5`). The maintainer pushed last loop's 66-commit
+backlog (drift cleared then); these 4 are fresh, unpushed drift (Deviation #10) — ask before pushing. #164 was
+reconciled this loop to PARTIAL: SC-12/13/14/15 ported + verified, SC-16 deferred to #148, relabeled
+`status: blocked`, body trimmed, kept open as the SC-16 tracker.
 
 **Parked behind the consumer-friction work:** examples #109 (`13-coding-agent`)/#92 (observability) +
 `web_search` #108/#110; harness gap #116 (HITL child-consult resume — overlaps #130's resume seam, and
@@ -357,14 +372,12 @@ the live loop; what remains under #7 is the Block-1/2 `CacheHashMismatch` halt p
    #116 finally wires the `child_state` resume branch the scoped catalogue is already available.
    **#138 (now landed) generalized the resume seed to be phase-agnostic, so #116 can reuse that
    seam directly when it wires the `child_state` branch.**
-10. **Local `main` push hygiene (standing reminder).** ⚠️ **66 AHEAD (2026-06-25):** local `main` is
-    66 commits ahead of `origin/main` (`origin/main` at `f087479`; **not fetched this loop, so verify against
-    the actual remote**) — the entire consumer-friction Phase 1–3 Rust wave PLUS the full TS/Python/Go port of
-    it (~26 commits across #154–#163) PLUS the #151/#147 eval-phase port PLUS the #153 SC-1/SC-30 port PLUS the
-    #150 sandbox-violation port (`b98eee8`/`48a58b4`/`c7614f6`) PLUS the **Phase 4 Rust sandbox/exec wave**
-    (`92a3720`/`0471aa0`/`87df0fe`/`2e16914`/`b0b3709`) is committed locally but **not pushed**. The
-    standing reminder holds: **ask before pushing** — an agent-initiated push was denied in an earlier session, so
-    confirm maintainer OK before clearing this (now substantial) drift.
+10. **Local `main` push hygiene (standing convention).** ⚠️ **FRESH DRIFT (2026-06-25):** local `main` is
+    **4 commits ahead of `origin/main` (`5e2c00e`), NOT pushed** — this loop's #164 Phase 4 TS/Py/Go port
+    (`e691030`/`ab04d9c`/`36ac891`/`e0a60b5`). Last loop the maintainer pushed the prior 66-commit backlog
+    (drift cleared then); these 4 are new. **The standing convention persists:** an agent must **ask before
+    pushing** — an agent-initiated push was denied in an earlier session, so this ahead-of-remote state
+    requires maintainer OK before clearing.
 11. **Rust-only `12-cordyceps` polish + a Rust-only core addition** (`scope: debt`, not yet
     mirrored) — `8bb7734` adds `SubagentTool::with_stream` to the core harness (optional child
     stream sink); `d65ae64` builds on it in the Rust example. **TS/Python/Go have neither the core
@@ -417,20 +430,20 @@ path/extras-mirror/Rust-dyn/compaction-tokens/observability-content stubs — al
 loops.)_
 
 ## Next Actions
-1. **Port Phase 4 via #164 — the just-landed Rust sandbox/exec wave to TS/Python/Go.** SC-12 ExecConfig,
-   SC-13 write_root (read-everywhere/write-scoped — DON'T double-join writes onto write_root; join base stays
-   `root`, only the boundary check tightens), SC-15 typed `ExecSpawnFailed` (the only non-additive item — a
-   return shape, not the wire; verify every caller handles `Err` + no fixture encodes `-1` per language),
-   SC-14 pluggable `VcsProvider::revert()` (default no-op keeps the trait additive), SC-16 reasoning-dropped
-   one-time warning (each language's library-warn facade, not a typed span). Standard `/implement` convention
-   (Rust ref → 3 parallel language agents → cross-language verifier). Zero fixtures; copy the SC-16 warning
-   string byte-identical. **LOC-2** (looper-side, not spore-core) is the consumer follow-up, already unblocked.
-2. **Finish draining the OLDER pre-consumer-friction parity backlog — #148 then #146.** **#148** (Ollama
-   thinking/reasoning models — Rust `a9c856b`; TS/Python/Go owed) is the larger; **#146** (char-boundary-safe
-   `web_fetch` `start_byte`, Python/Go only) is a small bugfix port. Same `/implement` convention. While on
-   #148, decide whether the un-filed Rust-ahead Ollama bits — streaming `read_timeout` (`56361b2`) + think-effort
-   levels (`c486331`, whose `reasoning_effort` enum/field was already pulled in by #155 SC-27) — need their own
-   parity issues or fold into #148. **With #148 + #146 done, the OLDER backlog is fully drained.**
+1. **Port #148 (Ollama thinking/reasoning models) — now the highest priority: it drains the OLDER backlog AND
+   unblocks SC-16/#164.** Rust `a9c856b`; TS/Python/Go owed (TS only decodes response-side `thinking_delta`;
+   Py/Go have no thinking seam at all). Standard `/implement` convention (Rust ref → 3 parallel language agents →
+   cross-language verifier). While on #148, decide whether the un-filed Rust-ahead Ollama bits — streaming
+   `read_timeout` (`56361b2`) + think-effort levels (`c486331`, whose `reasoning_effort` enum/field was already
+   pulled in by #155 SC-27) — need their own parity issues or fold into #148. Then **#146** (char-boundary-safe
+   `web_fetch` `start_byte`, Python/Go only — a small bugfix port). **With #148 + #146 done, the OLDER backlog
+   is fully drained.**
+2. **Finish Phase 4 — SC-16 only (after #148).** Port the reasoning-dropped one-time warning to TS/Py/Go: each
+   language's library-warn facade (TS `console.warn`, Py `warnings.warn`/`logging`, Go `log`/stderr), NOT a
+   typed span; one-time guard per client; copy the warning string byte-identical (it's in #164's SC-16 section).
+   Tracked on **#164** (`status: blocked`) — unblocks the moment #148 lands the `gate_thinking` seam it hooks.
+   The 4 #164 port commits (`e691030`/`ab04d9c`/`36ac891`/`e0a60b5`) are unpushed (Deviation #10) — ask before
+   pushing. **LOC-2** (looper-side, not spore-core) was already unblocked by SC-28/#162.
 3. **Consumer-friction Phase 5 (grouping/cleanup, Rust-first) — lowest priority.** SC-17 sub-config grouping of
    `HarnessConfig`'s ~30 fields, SC-18 one `TruncationPolicy`, SC-19 `RetryConfig`, SC-20 expose magic numbers,
    SC-21–24 (`ExecutionRegistry` convenience layer, custom-strategy contract docs, retire migration cruft,
@@ -440,19 +453,23 @@ loops.)_
    verified implemented + tested in all four langs while closing #131 — likely a verify-then-close, scope-check
    first), **#121** SubagentTool takes a LoopStrategy (A.7), **#127** custom RunStrategy path end-to-end (A-1),
    **#128** per-node observability span attributes. Cheap-to-medium; #122 first (probably closable).
-5. **Maintainer call — push + parked work.** Clear the **66-commit** `origin/main` drift once OK'd
-   (Deviation #10; origin at `f087479` — verify the real remote first, this loop did not fetch). Then parked
-   examples #109/#92 + `web_search` #108/#110, larger features #113/#107/#106 + protocol #83–87,
-   correctness/safety #34→#31→#30 + docs #27/#35/#36. Optional polish: strip the 3 cosmetic stale-A.5 comments
-   from #153 (TS `leaf-system-prompt.test.ts:114`, Py `test_strategy.py:64` + `test_recursive_executor.py:499`);
-   migrate the in-repo `10-hill-climbing`/`12-cordyceps` examples onto the now-ported #157 presets.
+5. **Parked work (maintainer-sequenceable; push drift now cleared).** The 66-commit `origin/main` drift was
+   pushed this loop (Deviation #10 resolved), so what remains here is the parked backlog: examples #109/#92 +
+   `web_search` #108/#110, larger features #113/#107/#106 + protocol #83–87, correctness/safety #34→#31→#30 +
+   docs #27/#35/#36. Optional polish: strip the 3 cosmetic stale-A.5 comments from #153 (TS
+   `leaf-system-prompt.test.ts:114`, Py `test_strategy.py:64` + `test_recursive_executor.py:499`); migrate the
+   in-repo `10-hill-climbing`/`12-cordyceps` examples onto the now-ported #157 presets.
 
-**Note:** consumer-friction Phases 0–3 are COMPLETE across ALL FOUR languages; **Phase 4 is COMPLETE in Rust**
-(parity **#164** queued). The OLDER pre-consumer-friction parity backlog is down to **#148/#146**. Local `main`
-is **66 commits ahead of `origin/main` (`f087479`), NOT pushed** — ask before pushing.
+**Note:** consumer-friction Phases 0–3 are COMPLETE across ALL FOUR languages; **Phase 4 is ported to all four
+EXCEPT SC-16** (SC-12/13/14/15 done + verifier-PASS this loop; SC-16 deferred to #148, #164 `status: blocked`).
+The OLDER pre-consumer-friction parity backlog is down to **#148/#146** (#148 now also gates SC-16). Local
+`main` is **4 commits ahead of `origin/main` (`5e2c00e`), NOT pushed** (this loop's #164 port) — ask the
+maintainer before pushing (Deviation #10).
 
-_Last updated: 2026-06-25 by /close (Phase 4 sandbox/exec hardening landed in Rust — SC-12 ExecConfig
-`92a3720` / SC-13 write_root `0471aa0` / SC-15 typed spawn-failure `87df0fe` / SC-14 pluggable VcsProvider
-revert `2e16914` / SC-16 reasoning-dropped warning `b0b3709`; zero fixtures changed, full Rust suite green,
-clippy clean modulo 2 pre-existing ollama test warnings. TS/Py/Go parity filed as #164 `status: queued`; no GH
-issue closed this loop. Ahead-count 61→66, NOT pushed)._
+_Last updated: 2026-06-25 by /close (#164 Phase 4 sandbox/exec hardening PORTED to TS/Py/Go for SC-12/13/14/15
+via /implement — planning agent → 3 parallel language agents → verifier-PASS, zero fixtures; commits
+`e691030`/`ab04d9c`+`e0a60b5`/`36ac891`. SC-16 DEFERRED to #148 (un-ported Ollama thinking prerequisite); #164
+reconciled PARTIAL → relabeled `status: blocked`, body trimmed to remaining SC-16 work, kept open as SC-16
+tracker, 2 comments posted. Local `main` now 4 commits ahead of `origin/main`, NOT pushed — Deviation #10 fresh
+drift. Sections updated: Current State + Active Direction (Phase 4 now ported-except-SC-16; sync→4-ahead),
+Deviation #10 (fresh drift), Next Actions (#148 now top — also unblocks SC-16), footer. No new deviations.)._

@@ -598,6 +598,48 @@ pub struct HillClimbingConfig {
     pub behavior: BudgetExhaustedBehavior,
 }
 
+/// Durable candidate pointers threaded through a `HillClimbing` run
+/// (`hill-climbing-loop-correctness`). The pre-fix loop tracked only a bare
+/// `f64` high-water score and never committed the accepted candidate, so a
+/// revert snapped the tree all the way back to the original start rather than
+/// to the last KEPT state — destroying accepted progress. This struct adds the
+/// missing primitive: a real per-accepted-candidate reference.
+///
+/// `current_*` is where the NEXT neighbor branches from (the last accepted
+/// state); `best_*` is the best artifact ever accepted. They are always equal
+/// under strict greedy climbing, but are tracked separately from day one (D2)
+/// so that annealing / random-restart can diverge them later without a ledger
+/// refactor.
+///
+/// The `*_sha` fields are `None` when the workspace has no usable VCS (e.g. the
+/// no-op default provider, or a sandbox with no git): in that degenerate world
+/// the loop cannot commit per-candidate and gracefully falls back to the
+/// pre-fix behaviour (revert targets `HEAD`). With a real git workspace (or a
+/// wired [`VcsProvider`]) the SHAs are populated and the climb is correct.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HillCandidate {
+    /// SHA of the last ACCEPTED candidate — the base the next neighbor branches
+    /// from and the target a no-improvement revert resets to. `None` ⇒ no usable
+    /// VCS (revert falls back to `HEAD`).
+    pub current_sha: Option<String>,
+    /// SHA of the best artifact ever accepted (winner applied at loop exit).
+    pub best_sha: Option<String>,
+    /// Score of the current accepted candidate (the keep/revert comparison
+    /// baseline — pre-fix `current_best`).
+    pub current_best: f64,
+    /// Best score ever accepted. Equal to `current_best` under strict greedy.
+    pub best_score: f64,
+}
+
+/// Git pathspec excluding the harness's own `.spore/` directory from a
+/// HillClimbing candidate commit (`hill-climbing-loop-correctness`). The results
+/// ledger lives at `{workspace_root}/.spore/results/` — it must stay UNTRACKED so
+/// a `git reset --hard` revert/winner-apply never reverts or clobbers it (reset
+/// leaves untracked files alone). Used by both the harness git-through-sandbox
+/// fallback and [`GitVcsProvider::commit_checkpoint`]; kept byte-identical across
+/// the four reference implementations (per `consumer-friction-port-patterns`).
+const HILL_CLIMB_COMMIT_EXCLUDE: &str = ":(exclude).spore";
+
 /// Loop strategy — a closed, recursive serde enum of config newtypes. The
 /// `ReAct` variant is the leaf; the rest are combinators holding
 /// `Box<LoopStrategy>` children. See the section header above for the full
@@ -1501,6 +1543,11 @@ pub trait StrategyExecutor: Send + Sync {
     /// `Err(RunResult)` on a baseline-evaluation failure (already records the
     /// failed row + writes the TSV). Leaf primitive of the legacy
     /// `run_hill_climbing`.
+    ///
+    /// `hill-climbing-loop-correctness` D4: also commits the starting tree so
+    /// the climb has a well-defined baseline candidate, and returns its SHA
+    /// (`None` when the workspace has no usable VCS). The returned SHA seeds
+    /// `current_sha`/`best_sha`.
     #[allow(clippy::too_many_arguments)]
     fn hill_baseline<'a>(
         &'a self,
@@ -1512,13 +1559,21 @@ pub trait StrategyExecutor: Send + Sync {
         span_seq: &'a mut u64,
         total_usage: AggregateUsage,
         turns: u32,
-    ) -> BoxFut<'a, Result<f64, RunResult>>;
+    ) -> BoxFut<'a, Result<(f64, Option<String>), RunResult>>;
 
     /// HillClimbing per-iteration metric eval + keep/revert decision (#124): the
     /// agent turn already ran (recursively); this evaluates the metric, applies
-    /// `should_keep`, optionally reverts, records the row + span, and returns the
-    /// updated `(current_best, stagnation_increment)`. Leaf primitive of the
-    /// legacy `run_hill_climbing`.
+    /// `should_keep`, and updates the durable candidate pointers in `cand`
+    /// (`hill-climbing-loop-correctness`):
+    ///   - KEEP ⇒ commit the working tree, advance `current_sha`/`current_best`
+    ///     (and `best_sha`/`best_score` if it beats the best), record the row
+    ///     with the real accepted SHA;
+    ///   - DISCARD / error ⇒ reset the tree to `cand.current_sha` (the last
+    ///     ACCEPTED state, NOT the original HEAD) when `revert_on_no_improvement`,
+    ///     record the row, leave the pointers unchanged.
+    ///
+    /// Records the row + span and returns `true` iff this iteration was a
+    /// non-improvement (the caller's stagnation increment).
     #[allow(clippy::too_many_arguments)]
     fn hill_iteration<'a>(
         &'a self,
@@ -1529,10 +1584,16 @@ pub trait StrategyExecutor: Send + Sync {
         direction: HillClimbingDirection,
         revert_on_no_improvement: bool,
         min_improvement_delta: Option<f64>,
-        current_best: f64,
+        cand: &'a mut HillCandidate,
         rows: &'a mut Vec<crate::metric::ResultsEntry>,
         span_seq: &'a mut u64,
-    ) -> BoxFut<'a, (f64, bool)>;
+    ) -> BoxFut<'a, bool>;
+
+    /// Apply the best accepted candidate at loop exit (winner application,
+    /// `hill-climbing-loop-correctness` §4.6): `reset --hard <best_sha>` so the
+    /// working tree holds the winner before a terminal return. A no-op when
+    /// `best_sha` is `None`.
+    fn hill_apply_winner<'a>(&'a self, best_sha: Option<&'a str>) -> BoxFut<'a, ()>;
 
     /// Write the HillClimbing results TSV (#124, leaf primitive).
     fn hill_write_tsv<'a>(
@@ -3232,8 +3293,10 @@ impl RunStrategy for HillClimbingConfig {
             };
             cx.push_budget(hc_policy, self.behavior.clone(), "hill_climbing");
 
-            // ── Iteration 0: pure baseline (no agent turn).
-            let mut current_best = match executor
+            // ── Iteration 0: pure baseline (no agent turn). D4: also commits the
+            // starting tree and returns its SHA, seeding the durable candidate
+            // pointers (hill-climbing-loop-correctness §4.1).
+            let (baseline_score, start_sha) = match executor
                 .hill_baseline(
                     &evaluator,
                     &session_id,
@@ -3252,6 +3315,15 @@ impl RunStrategy for HillClimbingConfig {
                     cx.stream = on_stream;
                     return cx.finish(executor, task, result).await;
                 }
+            };
+            // `current_*` is where the next neighbor branches from; `best_*` is
+            // the best artifact ever accepted. Equal under strict greedy, tracked
+            // separately from day one (D2).
+            let mut cand = HillCandidate {
+                current_sha: start_sha.clone(),
+                best_sha: start_sha,
+                current_best: baseline_score,
+                best_score: baseline_score,
             };
 
             let mut stagnation: u32 = 0;
@@ -3279,7 +3351,8 @@ impl RunStrategy for HillClimbingConfig {
                         continue;
                     }
                     executor.hill_write_tsv(&task_id, &rows).await;
-                    let partial = hill_climbing_partial_json(current_best);
+                    let partial =
+                        hill_climbing_partial_json(cand.best_score, cand.best_sha.as_deref());
                     cx.pop_budget();
                     cx.scratch.task = Some(task.clone());
                     cx.stream = on_stream;
@@ -3322,6 +3395,9 @@ impl RunStrategy for HillClimbingConfig {
                     StandardHarness::budget_exceeded(&task.budget, &carried, Instant::now())
                 {
                     executor.hill_write_tsv(&task_id, &rows).await;
+                    // Winner application (§4.6): a wall/cost/token budget halt is a
+                    // terminal exit — leave the best accepted candidate on disk.
+                    executor.hill_apply_winner(cand.best_sha.as_deref()).await;
                     let result = RunResult::Failure {
                         reason: HaltReason::BudgetExceeded { limit_type },
                         session_id,
@@ -3361,7 +3437,8 @@ impl RunStrategy for HillClimbingConfig {
                 // typed BudgetExhausted (partial = best candidate + score).
                 if let StrategyOutcome::BudgetExhausted { .. } = &iter_outcome {
                     executor.hill_write_tsv(&task_id, &rows).await;
-                    let partial = hill_climbing_partial_json(current_best);
+                    let partial =
+                        hill_climbing_partial_json(cand.best_score, cand.best_sha.as_deref());
                     let err = cx
                         .budgets
                         .current_mut()
@@ -3400,8 +3477,11 @@ impl RunStrategy for HillClimbingConfig {
                     return cx.finish(executor, task, turn_result).await;
                 }
 
-                // ── Evaluate the metric + keep/revert decision.
-                let (best, non_improvement) = executor
+                // ── Evaluate the metric + keep/revert decision. `hill_iteration`
+                // mutates the durable candidate pointers in `cand` (commit-on-keep,
+                // reset-to-current_sha-on-discard) and returns the non-improvement
+                // flag.
+                let non_improvement = executor
                     .hill_iteration(
                         &evaluator,
                         &session_id,
@@ -3410,12 +3490,11 @@ impl RunStrategy for HillClimbingConfig {
                         direction,
                         revert,
                         min_delta,
-                        current_best,
+                        &mut cand,
                         &mut rows,
                         &mut span_seq,
                     )
                     .await;
-                current_best = best;
                 if non_improvement {
                     stagnation += 1;
                 } else {
@@ -3425,10 +3504,14 @@ impl RunStrategy for HillClimbingConfig {
                 if let Some(limit) = max_stagnation {
                     if stagnation >= limit {
                         executor.hill_write_tsv(&task_id, &rows).await;
+                        // Winner application (§4.6): stagnation is the canonical
+                        // HillClimbing termination — leave the best accepted
+                        // candidate on disk before returning.
+                        executor.hill_apply_winner(cand.best_sha.as_deref()).await;
                         let result = RunResult::Failure {
                             reason: HaltReason::StagnationLimitReached {
                                 iterations: stagnation,
-                                best_metric: current_best,
+                                best_metric: cand.best_score,
                             },
                             session_id,
                             usage: total_usage,
@@ -3772,12 +3855,17 @@ fn self_verifying_partial_json(last_worker_output: &str, last_verdict: &str) -> 
     .to_string()
 }
 
-/// HillClimbing partial: the best candidate value + its score (#125, fork #2).
-fn hill_climbing_partial_json(best_score: f64) -> String {
+/// HillClimbing partial: the best candidate value + its score (#125, fork #2),
+/// plus the `best_sha` of the commit holding that best artifact
+/// (`hill-climbing-loop-correctness` §4.6) so a caller resuming a
+/// budget/stagnation/escalation exit knows which commit to inspect. `best_sha`
+/// is `null` when the workspace has no usable VCS.
+fn hill_climbing_partial_json(best_score: f64, best_sha: Option<&str>) -> String {
     serde_json::json!({
         "node": "hill_climbing",
         "best_candidate": best_score,
         "score": best_score,
+        "best_sha": best_sha,
     })
     .to_string()
 }
@@ -5158,6 +5246,39 @@ pub trait VcsProvider: Send + Sync {
     fn revert<'a>(&'a self) -> BoxFut<'a, Result<(), VcsError>> {
         Box::pin(async move { Ok(()) })
     }
+
+    /// Return the SHA (or opaque revision id) the workspace currently points at
+    /// (`hill-climbing-loop-correctness` §4.5). [`GitVcsProvider`] runs
+    /// `git rev-parse HEAD`. The default returns the empty string — a provider
+    /// whose workspace has no commit concept reports "no SHA", and the
+    /// HillClimbing loop then degrades to its no-VCS fallback (revert to HEAD).
+    fn head<'a>(&'a self) -> BoxFut<'a, Result<String, VcsError>> {
+        Box::pin(async move { Ok(String::new()) })
+    }
+
+    /// Commit the current working tree as an accepted candidate and return its
+    /// SHA (`hill-climbing-loop-correctness` §4.5). Called by HillClimbing after
+    /// a KEPT iteration so the accepted artifact has a durable, revertible
+    /// pointer. [`GitVcsProvider`] runs `git add -A && git commit` then
+    /// `rev-parse HEAD`. The default returns the empty string (no-op providers
+    /// cannot checkpoint); the loop then records an empty `commit_hash` and
+    /// keeps the pre-fix behaviour. `label` is the commit message.
+    fn commit_checkpoint<'a>(&'a self, label: &'a str) -> BoxFut<'a, Result<String, VcsError>> {
+        let _ = label;
+        Box::pin(async move { Ok(String::new()) })
+    }
+
+    /// Reset the workspace to a SPECIFIC accepted candidate SHA
+    /// (`hill-climbing-loop-correctness` §4.5) — the load-bearing fix: a
+    /// no-improvement revert targets the last KEPT state, not the original
+    /// `HEAD`. [`GitVcsProvider`] runs `git reset --hard <sha>`. The default is a
+    /// no-op (a provider with no SHA concept leaves the tree as-is); the
+    /// HillClimbing loop only calls this with a non-empty SHA, falling back to
+    /// [`revert`](Self::revert) when it has none.
+    fn reset_to<'a>(&'a self, sha: &'a str) -> BoxFut<'a, Result<(), VcsError>> {
+        let _ = sha;
+        Box::pin(async move { Ok(()) })
+    }
 }
 
 /// Parameters shaping a [`VcsProvider::log`] read. Each field maps to a
@@ -5277,6 +5398,85 @@ impl VcsProvider for GitVcsProvider {
                 "--hard".to_string(),
                 "HEAD".to_string(),
             ];
+            let out = self
+                .sandbox
+                .execute_command("git", &argv, Some(self.workspace_root.as_path()), None)
+                .await
+                .map_err(VcsError::Sandbox)?;
+            if out.exit_code != 0 {
+                return Err(VcsError::CommandFailed {
+                    message: out.stderr,
+                });
+            }
+            Ok(())
+        })
+    }
+
+    fn head<'a>(&'a self) -> BoxFut<'a, Result<String, VcsError>> {
+        Box::pin(async move {
+            // `git rev-parse HEAD` THROUGH the sandbox (hill-climbing-loop-
+            // correctness §4.5). Returns the trimmed SHA.
+            let argv = vec!["rev-parse".to_string(), "HEAD".to_string()];
+            let out = self
+                .sandbox
+                .execute_command("git", &argv, Some(self.workspace_root.as_path()), None)
+                .await
+                .map_err(VcsError::Sandbox)?;
+            if out.exit_code != 0 {
+                return Err(VcsError::CommandFailed {
+                    message: out.stderr,
+                });
+            }
+            Ok(out.stdout.trim().to_string())
+        })
+    }
+
+    fn commit_checkpoint<'a>(&'a self, label: &'a str) -> BoxFut<'a, Result<String, VcsError>> {
+        Box::pin(async move {
+            // `git add -A && git commit -m <label>` then resolve HEAD (hill-
+            // climbing-loop-correctness §4.5). The commit is best-effort: a
+            // "nothing to commit" exit is NOT an error — HEAD still resolves to
+            // the (unchanged) accepted SHA. A blocked spawn is surfaced. The
+            // harness's `.spore/` diagnostics are excluded so they stay untracked
+            // and survive a later `git reset --hard`.
+            let add = vec![
+                "add".to_string(),
+                "-A".to_string(),
+                "--".to_string(),
+                HILL_CLIMB_COMMIT_EXCLUDE.to_string(),
+            ];
+            let _ = self
+                .sandbox
+                .execute_command("git", &add, Some(self.workspace_root.as_path()), None)
+                .await
+                .map_err(VcsError::Sandbox)?;
+            let commit = vec!["commit".to_string(), "-m".to_string(), label.to_string()];
+            let _ = self
+                .sandbox
+                .execute_command("git", &commit, Some(self.workspace_root.as_path()), None)
+                .await
+                .map_err(VcsError::Sandbox)?;
+            let head = vec!["rev-parse".to_string(), "HEAD".to_string()];
+            let out = self
+                .sandbox
+                .execute_command("git", &head, Some(self.workspace_root.as_path()), None)
+                .await
+                .map_err(VcsError::Sandbox)?;
+            if out.exit_code != 0 {
+                return Err(VcsError::CommandFailed {
+                    message: out.stderr,
+                });
+            }
+            Ok(out.stdout.trim().to_string())
+        })
+    }
+
+    fn reset_to<'a>(&'a self, sha: &'a str) -> BoxFut<'a, Result<(), VcsError>> {
+        Box::pin(async move {
+            // `git reset --hard <sha>` THROUGH the sandbox (hill-climbing-loop-
+            // correctness §4.3): the no-improvement revert targets the last
+            // ACCEPTED candidate, not the original HEAD.
+            let argv = vec!["reset".to_string(), "--hard".to_string(), sha.to_string()];
             let out = self
                 .sandbox
                 .execute_command("git", &argv, Some(self.workspace_root.as_path()), None)
@@ -10405,11 +10605,13 @@ tool. Use the provided tool-call format to actually invoke the tool."
     //   - Iterations 1.. : run one bounded ReAct agent turn (proposes a change),
     //     then evaluate. On a successful evaluation, route through
     //     `should_keep(new, current_best, payload_direction, min_improvement_delta)`:
-    //       * keep   → status Kept, update `current_best`, reset the stagnation
-    //                  counter to 0.
+    //       * keep   → status Kept, commit the accepted neighbor (advancing
+    //                  `current_sha`/`current_best`, and `best_sha`/`best_score`
+    //                  if it beats the best), reset the stagnation counter to 0.
     //       * no keep → status Discarded; if `revert_on_no_improvement`, run
-    //                  `git reset --hard HEAD` via the sandbox; increment the
-    //                  stagnation counter.
+    //                  `git reset --hard <current_sha>` via the sandbox (the last
+    //                  ACCEPTED state, NOT the original HEAD — hill-climbing-loop-
+    //                  correctness §4.3); increment the stagnation counter.
     //     On a MetricError (Crashed/Timeout/etc.), the iteration status is
     //     `IterationStatus::from_error` (Crashed/Timeout), the metric value is
     //     EMPTY in the TSV, the iteration counts as a non-improvement (increment
@@ -10425,11 +10627,14 @@ tool. Use the provided tool-call format to actually invoke the tool."
     //     `{workspace_root}/.spore/results/{task_id}.tsv`.
     //
     // ## Six pinned spec decisions (resolved with the user — NOT relitigated)
-    //   1. REVERT: `revert_on_no_improvement: true` reverts via the sandbox
-    //      `git reset --hard HEAD` directly from the harness. The harness NEVER
-    //      git commits; `commit_hash` in the TSV stays empty unless a VcsProvider
-    //      supplies it (default empty). Revert discards uncommitted working-tree
-    //      changes back to current HEAD.
+    //   1. REVERT/COMMIT (revised by hill-climbing-loop-correctness): the harness
+    //      now COMMITS each accepted candidate through the sandbox (`git add -A &&
+    //      git commit`, D1) so `commit_hash` carries the real accepted SHA, and
+    //      `revert_on_no_improvement: true` reverts via `git reset --hard
+    //      <current_sha>` — the last accepted state, not the original HEAD. A
+    //      wired `VcsProvider` owns commit/head/reset; with no provider AND no
+    //      usable git (e.g. a fake sandbox), the SHAs are `None` and the loop
+    //      degrades to the pre-fix behaviour (empty `commit_hash`, reset to HEAD).
     //   2. TSV FLOAT FORMAT: both `metric_value` and `duration_secs` are
     //      formatted with exactly 6 decimal places (`format!("{:.6}", x)`) for
     //      cross-language byte-identity.
@@ -10452,25 +10657,36 @@ tool. Use the provided tool-call format to actually invoke the tool."
     //
     // No `// SPEC QUESTION:` markers — all six decisions are resolved.
 
-    /// Revert the working tree for a no-improvement iteration (issue #60,
-    /// Decision 1). SC-14: when a [`VcsProvider`] is wired it owns the revert
-    /// (e.g. [`GitVcsProvider`] runs `git reset --hard HEAD`, a custom provider
-    /// does whatever its workspace needs); with no provider (the default) the
-    /// harness falls back to the original hardcoded `git reset --hard HEAD`
-    /// THROUGH the sandbox — byte-identical to the pre-SC-14 behavior. Either
-    /// way the harness NEVER spawns git directly, and the revert is best-effort:
-    /// an error/non-zero exit is swallowed and the loop continues (the next
-    /// agent turn re-derives state).
-    async fn hill_climbing_revert(&self) {
+    /// Reset the working tree for a no-improvement iteration
+    /// (`hill-climbing-loop-correctness` §4.3). The load-bearing fix: revert
+    /// targets the last ACCEPTED candidate (`target_sha`), NOT the original
+    /// `HEAD`. Routing precedence (SC-14 — the harness NEVER spawns git
+    /// directly):
+    ///   - a wired [`VcsProvider`] owns the reset: `reset_to(sha)` for a known
+    ///     SHA, else `revert()` (its revert-to-last-known-good);
+    ///   - otherwise git-through-sandbox: `git reset --hard <sha>` for a known
+    ///     SHA, else `git reset --hard HEAD` — byte-identical to the pre-fix
+    ///     fallback when the workspace has no usable VCS (`target_sha == None`).
+    ///
+    /// Best-effort: an error / non-zero exit is swallowed and the loop continues.
+    async fn hill_climbing_reset_to(&self, target_sha: Option<&str>) {
+        let known = target_sha.filter(|s| !s.is_empty());
         if let Some(vcs) = &self.config.vcs_provider {
-            let _ = vcs.revert().await;
+            match known {
+                Some(sha) => {
+                    let _ = vcs.reset_to(sha).await;
+                }
+                // No durable SHA (no-op/degenerate VCS) ⇒ fall back to the
+                // provider's revert-to-last-known-good, preserving pre-fix
+                // behaviour for providers that only implement `revert`.
+                None => {
+                    let _ = vcs.revert().await;
+                }
+            }
             return;
         }
-        let args = [
-            "reset".to_string(),
-            "--hard".to_string(),
-            "HEAD".to_string(),
-        ];
+        let target = known.unwrap_or("HEAD").to_string();
+        let args = ["reset".to_string(), "--hard".to_string(), target];
         let _ = self
             .config
             .sandbox
@@ -10478,13 +10694,90 @@ tool. Use the provided tool-call format to actually invoke the tool."
             .await;
     }
 
-    /// Resolve the `commit_hash` recorded on a HillClimbing TSV row (issue #60,
-    /// Decision 1). The harness never commits, so this is the EMPTY string unless
-    /// a [`VcsProvider`] is wired to supply a hash. v1 has no per-keep commit, so
-    /// we always return `None` (serialized as the empty string in the TSV); the
-    /// `VcsProvider` seam is reserved for a later revision.
-    async fn hill_climbing_commit_hash(&self) -> Option<String> {
-        None
+    /// Resolve the workspace's current commit SHA
+    /// (`hill-climbing-loop-correctness` §4.4). A wired [`VcsProvider`] supplies
+    /// it (`head()`); otherwise `git rev-parse HEAD` THROUGH the sandbox. Returns
+    /// `None` when there is no usable VCS — a blocked spawn, a non-zero exit, or
+    /// empty stdout (the case for a fake/no-op sandbox). A `None` here is what
+    /// makes the loop degrade gracefully to its pre-fix behaviour rather than
+    /// recording a bogus SHA.
+    async fn hill_climbing_head_sha(&self) -> Option<String> {
+        if let Some(vcs) = &self.config.vcs_provider {
+            return vcs
+                .head()
+                .await
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+        }
+        let args = ["rev-parse".to_string(), "HEAD".to_string()];
+        let out = self
+            .config
+            .sandbox
+            .execute_command("git", &args, None, None)
+            .await
+            .ok()?;
+        if out.exit_code != 0 {
+            return None;
+        }
+        let sha = out.stdout.trim().to_string();
+        (!sha.is_empty()).then_some(sha)
+    }
+
+    /// Commit the current working tree as an accepted candidate and return its
+    /// SHA (`hill-climbing-loop-correctness` §4.4, Decision D1: commit through
+    /// the sandbox in the default path — no `VcsProvider` required). A wired
+    /// provider's `commit_checkpoint` wins; otherwise `git add -A && git commit
+    /// -m <label>` THROUGH the sandbox, then [`hill_climbing_head_sha`]. Returns
+    /// `None` when no SHA could be obtained (no usable VCS) — the caller then
+    /// records an empty `commit_hash` and keeps the pre-fix score-only behaviour
+    /// (there is nothing durable to revert to, which is inherent without a VCS).
+    ///
+    /// [`hill_climbing_head_sha`]: Self::hill_climbing_head_sha
+    async fn hill_climbing_commit_accepted(&self, label: &str) -> Option<String> {
+        if let Some(vcs) = &self.config.vcs_provider {
+            return vcs
+                .commit_checkpoint(label)
+                .await
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+        }
+        // Stage everything EXCEPT the harness's own `.spore/` diagnostics: it
+        // must stay UNTRACKED so a later `git reset --hard` (revert / winner
+        // apply) leaves the live results ledger on disk (`git reset --hard` never
+        // touches untracked files). Committing `.spore/` would let a revert
+        // clobber the in-progress TSV with a stale committed copy.
+        let add = [
+            "add".to_string(),
+            "-A".to_string(),
+            "--".to_string(),
+            HILL_CLIMB_COMMIT_EXCLUDE.to_string(),
+        ];
+        let _ = self
+            .config
+            .sandbox
+            .execute_command("git", &add, None, None)
+            .await;
+        let commit = ["commit".to_string(), "-m".to_string(), label.to_string()];
+        let _ = self
+            .config
+            .sandbox
+            .execute_command("git", &commit, None, None)
+            .await;
+        self.hill_climbing_head_sha().await
+    }
+
+    /// The commit message for an accepted HillClimbing candidate
+    /// (`hill-climbing-loop-correctness` §4.4). Kept as a single helper so the
+    /// exact string is byte-identical across the four reference implementations
+    /// (per `consumer-friction-port-patterns`). Iteration 0 is the baseline.
+    fn hill_commit_label(iteration: u32) -> String {
+        if iteration == 0 {
+            "hill-climb baseline".to_string()
+        } else {
+            format!("hill-climb iter {iteration}")
+        }
     }
 
     /// Emit one fire-and-forget per-iteration observability span for a
@@ -11345,7 +11638,7 @@ impl StrategyExecutor for StandardHarness {
         span_seq: &'a mut u64,
         total_usage: AggregateUsage,
         turns: u32,
-    ) -> BoxFut<'a, Result<f64, RunResult>> {
+    ) -> BoxFut<'a, Result<(f64, Option<String>), RunResult>> {
         Box::pin(async move {
             use crate::metric::{IterationStatus, MetricResult, ResultsEntry};
             use crate::termination::SessionStateSnapshot;
@@ -11363,9 +11656,16 @@ impl StrategyExecutor for StandardHarness {
                 Ok(MetricResult {
                     value, duration, ..
                 }) => {
+                    // D4: commit the starting tree as the baseline candidate so
+                    // `current_sha`/reverts are always well-defined (handles a
+                    // dirty start). `None` when the workspace has no usable VCS,
+                    // in which case the loop degrades to its pre-fix behaviour.
+                    let start_sha = self
+                        .hill_climbing_commit_accepted(&Self::hill_commit_label(0))
+                        .await;
                     rows.push(ResultsEntry {
                         iteration: 0,
-                        commit_hash: self.hill_climbing_commit_hash().await,
+                        commit_hash: start_sha.clone(),
                         metric_value: value,
                         direction,
                         status: IterationStatus::Kept,
@@ -11383,13 +11683,14 @@ impl StrategyExecutor for StandardHarness {
                         IterationStatus::Kept,
                         false,
                     );
-                    Ok(value)
+                    Ok((value, start_sha))
                 }
                 Err(err) => {
                     let status = IterationStatus::from_error(&err);
                     rows.push(ResultsEntry {
                         iteration: 0,
-                        commit_hash: self.hill_climbing_commit_hash().await,
+                        // Baseline eval failed ⇒ no baseline candidate to commit.
+                        commit_hash: None,
                         metric_value: f64::NAN,
                         direction,
                         status,
@@ -11426,10 +11727,10 @@ impl StrategyExecutor for StandardHarness {
         direction: HillClimbingDirection,
         revert_on_no_improvement: bool,
         min_improvement_delta: Option<f64>,
-        current_best: f64,
+        cand: &'a mut HillCandidate,
         rows: &'a mut Vec<crate::metric::ResultsEntry>,
         span_seq: &'a mut u64,
-    ) -> BoxFut<'a, (f64, bool)> {
+    ) -> BoxFut<'a, bool> {
         Box::pin(async move {
             use crate::metric::{should_keep, IterationStatus, MetricResult, ResultsEntry};
             use crate::termination::SessionStateSnapshot;
@@ -11447,15 +11748,35 @@ impl StrategyExecutor for StandardHarness {
                 Ok(MetricResult {
                     value, duration, ..
                 }) => {
-                    let kept = should_keep(value, current_best, direction, min_improvement_delta);
+                    let kept =
+                        should_keep(value, cand.current_best, direction, min_improvement_delta);
                     let delta = match direction {
-                        HillClimbingDirection::Minimize => current_best - value,
-                        HillClimbingDirection::Maximize => value - current_best,
+                        HillClimbingDirection::Minimize => cand.current_best - value,
+                        HillClimbingDirection::Maximize => value - cand.current_best,
                     };
                     if kept {
+                        // Commit the accepted neighbor → durable pointer (§4.2).
+                        // `None` ⇒ no usable VCS: the keep still advances the
+                        // score high-water mark (pre-fix behaviour), but there is
+                        // no SHA to revert a later discard to.
+                        let nbr_sha = self
+                            .hill_climbing_commit_accepted(&Self::hill_commit_label(iteration))
+                            .await;
+                        cand.current_sha = nbr_sha.clone();
+                        cand.current_best = value;
+                        // Update the best-ever pointer when this strictly beats it
+                        // (D2: tracked separately even though equal under greedy).
+                        let beats_best = match direction {
+                            HillClimbingDirection::Minimize => value < cand.best_score,
+                            HillClimbingDirection::Maximize => value > cand.best_score,
+                        };
+                        if beats_best {
+                            cand.best_sha = nbr_sha.clone();
+                            cand.best_score = value;
+                        }
                         rows.push(ResultsEntry {
                             iteration,
-                            commit_hash: self.hill_climbing_commit_hash().await,
+                            commit_hash: nbr_sha,
                             metric_value: value,
                             direction,
                             status: IterationStatus::Kept,
@@ -11473,17 +11794,23 @@ impl StrategyExecutor for StandardHarness {
                             IterationStatus::Kept,
                             false,
                         );
-                        (value, false)
+                        false
                     } else {
+                        // Revert to the last ACCEPTED state (§4.3), NOT HEAD.
                         let reverted = if revert_on_no_improvement {
-                            self.hill_climbing_revert().await;
+                            self.hill_climbing_reset_to(cand.current_sha.as_deref())
+                                .await;
                             true
                         } else {
                             false
                         };
                         rows.push(ResultsEntry {
                             iteration,
-                            commit_hash: self.hill_climbing_commit_hash().await,
+                            // The discard row records the surviving accepted SHA
+                            // (== HEAD after the reset; == HEAD anyway when revert
+                            // is off, since uncommitted neighbor edits don't move
+                            // HEAD).
+                            commit_hash: cand.current_sha.clone(),
                             metric_value: value,
                             direction,
                             status: IterationStatus::Discarded,
@@ -11501,20 +11828,21 @@ impl StrategyExecutor for StandardHarness {
                             IterationStatus::Discarded,
                             reverted,
                         );
-                        (current_best, true)
+                        true
                     }
                 }
                 Err(err) => {
                     let status = IterationStatus::from_error(&err);
                     let reverted = if revert_on_no_improvement {
-                        self.hill_climbing_revert().await;
+                        self.hill_climbing_reset_to(cand.current_sha.as_deref())
+                            .await;
                         true
                     } else {
                         false
                     };
                     rows.push(ResultsEntry {
                         iteration,
-                        commit_hash: self.hill_climbing_commit_hash().await,
+                        commit_hash: cand.current_sha.clone(),
                         metric_value: f64::NAN,
                         direction,
                         status,
@@ -11525,8 +11853,18 @@ impl StrategyExecutor for StandardHarness {
                     self.emit_hill_climbing_span(
                         session_id, task_id, span_seq, iteration, None, None, status, reverted,
                     );
-                    (current_best, true)
+                    true
                 }
+            }
+        })
+    }
+
+    fn hill_apply_winner<'a>(&'a self, best_sha: Option<&'a str>) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            // Winner application (§4.6): reset to the best accepted candidate
+            // before a terminal return. No-op when there is no committed best.
+            if let Some(sha) = best_sha.filter(|s| !s.is_empty()) {
+                self.hill_climbing_reset_to(Some(sha)).await;
             }
         })
     }
@@ -22969,6 +23307,37 @@ mod tests {
         assert_eq!(sandbox.revert_count(), 1);
     }
 
+    // hill-climbing-loop-correctness §4.5: the new GitVcsProvider seam methods
+    // (head / commit_checkpoint / reset_to) round-trip on a REAL git workspace.
+    #[tokio::test]
+    async fn git_vcs_provider_commit_head_reset_roundtrip() {
+        let (_dir, root, draft) = init_git_repo("base");
+        let sandbox: Arc<dyn SandboxProvider> = Arc::new(
+            crate::sandbox::WorkspaceScopedSandbox::new(crate::sandbox::WorkspaceConfig::scoped(
+                root.clone(),
+            ))
+            .unwrap(),
+        );
+        let provider = GitVcsProvider::new(sandbox, root);
+
+        let sha0 = provider.head().await.unwrap();
+        assert!(!sha0.is_empty(), "head resolves the init commit");
+
+        std::fs::write(&draft, "v1").unwrap();
+        let sha1 = provider.commit_checkpoint("c1").await.unwrap();
+        assert_ne!(sha1, sha0, "a new candidate is a new commit");
+
+        std::fs::write(&draft, "v2").unwrap();
+        let sha2 = provider.commit_checkpoint("c2").await.unwrap();
+        assert_ne!(sha2, sha1);
+
+        // Reset to the FIRST checkpoint: the tree returns to that exact state,
+        // and HEAD follows — the load-bearing reset-to-a-specific-SHA behavior.
+        provider.reset_to(&sha1).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&draft).unwrap(), "v1");
+        assert_eq!(provider.head().await.unwrap(), sha1);
+    }
+
     // strict min_delta boundary: an improvement of exactly min_delta is NOT
     // progress (discarded). Minimize, baseline 2.0, then 1.5 with min_delta 0.5.
     #[tokio::test]
@@ -23186,6 +23555,222 @@ mod tests {
     async fn h_run(cfg: &HarnessConfig, t: Task) -> RunResult {
         let h = StandardHarness::new(cfg.clone());
         h.run(HarnessRunOptions::new(t)).await
+    }
+
+    // ── hill-climbing-loop-correctness: SHA-backed climbing on a REAL git tree ──
+
+    /// A worker agent that performs a REAL working-tree edit each turn — writes a
+    /// per-iteration marker to `path` — so a git-backed HillClimbing run produces
+    /// distinct committable states. Returns a trivial FinalResponse so the inner
+    /// ReAct completes in one turn. Used by the keep-then-discard regression test:
+    /// the metric is scripted, and the FILE CONTENT is the artifact under test.
+    struct FileEditingAgent {
+        id: AgentId,
+        path: std::path::PathBuf,
+        contents: StdMutex<std::collections::VecDeque<String>>,
+    }
+    impl FileEditingAgent {
+        fn new(path: std::path::PathBuf, contents: Vec<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                id: AgentId::new("file-editor"),
+                path,
+                contents: StdMutex::new(contents.into_iter().map(String::from).collect()),
+            })
+        }
+    }
+    impl Agent for FileEditingAgent {
+        fn turn<'a>(&'a self, _context: Context) -> BoxFut<'a, TurnResult> {
+            if let Some(c) = self.contents.lock().unwrap().pop_front() {
+                std::fs::write(&self.path, c).expect("agent writes the draft");
+            }
+            Box::pin(async move {
+                TurnResult::FinalResponse {
+                    reasoning: None,
+                    content: "edited".into(),
+                    usage: TokenUsage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
+                    },
+                }
+            })
+        }
+        fn id(&self) -> AgentId {
+            self.id.clone()
+        }
+    }
+
+    /// Create a real temp git repo with one tracked file committed. Returns the
+    /// (kept-alive) tempdir, the canonical workspace root, and the draft path. A
+    /// REAL VCS is required here: per the `no-op store silently disables durable
+    /// behavior` lesson, a fake VCS path would assert the opposite of the bug
+    /// while still passing.
+    fn init_git_repo(initial: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let draft = root.join("draft.txt");
+        std::fs::write(&draft, initial).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("git is available");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@spore.invalid"]);
+        git(&["config", "user.name", "spore test"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+        (dir, root, draft)
+    }
+
+    // THE load-bearing regression (hill-climbing-loop-correctness §5). keep-then-
+    // discard on a REAL git workspace: iter1 improves (KEPT → committed), iter2
+    // regresses (DISCARDED → revert). The fix makes the revert target the last
+    // ACCEPTED commit (iter1), so iter1's edit SURVIVES. On `main` the revert ran
+    // `git reset --hard HEAD`, and because the harness never committed a keep,
+    // HEAD was still the original start — so the accepted iter1 edit was DESTROYED
+    // and the tree snapped back to the baseline. This test fails on `main` and
+    // passes after the fix.
+    #[tokio::test]
+    async fn hill_climbing_keep_then_discard_preserves_kept_state() {
+        let (_dir, root, draft) = init_git_repo("base");
+        let sandbox = Arc::new(
+            crate::sandbox::WorkspaceScopedSandbox::new(crate::sandbox::WorkspaceConfig::scoped(
+                root.clone(),
+            ))
+            .unwrap(),
+        );
+        // maximize: baseline 1.0, iter1 2.0 (improve → keep), iter2 1.5 (regress
+        // → discard). The scripted scores DRIVE keep/discard; the file content is
+        // what the revert must preserve.
+        let eval = Arc::new(ScriptedMetricEvaluator::new(
+            vec![Ok(1.0), Ok(2.0), Ok(1.5)],
+            HillClimbingDirection::Maximize,
+        ));
+        let agent = FileEditingAgent::new(draft.clone(), vec!["delta1", "delta2"]);
+        let mut cfg = standard_config(make_agent());
+        set_worker_agent(&mut cfg, agent);
+        cfg.sandbox = sandbox;
+        set_default_metric(&mut cfg, eval);
+
+        // max_stagnation 1 ⇒ the iter2 discard halts the climb.
+        let t = hill_task(HillClimbingDirection::Maximize, Some(1), true, None);
+        let task_id = t.id.as_str().to_string();
+        let r = h_run(&cfg, t).await;
+
+        match r {
+            RunResult::Failure {
+                reason: HaltReason::StagnationLimitReached { best_metric, .. },
+                ..
+            } => assert!(
+                (best_metric - 2.0).abs() < 1e-9,
+                "best stays the kept iter1 score 2.0; got {best_metric}"
+            ),
+            other => panic!("expected StagnationLimitReached, got {other:?}"),
+        }
+
+        // THE assertion: the working tree holds iter1's KEPT edit, NOT the
+        // original start. On `main` this reads "base" (revert went to HEAD ==
+        // start, destroying delta1). Because the scripted evaluator scored these
+        // exact bytes 2.0, the surviving artifact is the one that produced the
+        // best score — score and artifact have not diverged (§5 step 5).
+        let on_disk = std::fs::read_to_string(&draft).unwrap();
+        assert_eq!(
+            on_disk, "delta1",
+            "the kept iter1 edit must survive the iter2 discard"
+        );
+
+        // §4.7: kept rows now carry REAL (non-empty) commit SHAs — baseline and
+        // iter1 both committed. (Pre-fix every commit_hash was the empty string.)
+        let tsv = std::fs::read_to_string(root.join(format!(".spore/results/{task_id}.tsv")))
+            .expect("tsv written");
+        let rows: Vec<&str> = tsv.lines().skip(1).collect();
+        // rows: [0] baseline kept, [1] iter1 kept, [2] iter2 discarded.
+        let sha = |line: &str| line.split('\t').nth(1).unwrap_or("").to_string();
+        let iter1_sha = sha(rows[1]);
+        let iter2_sha = sha(rows[2]);
+        assert!(
+            !iter1_sha.is_empty(),
+            "iter1 kept row carries a real commit SHA; tsv:\n{tsv}"
+        );
+        assert!(rows[2].contains("\tdiscarded\t"), "iter2 is discarded");
+        // The KEY revert-target assertion, NOT masked by the exit-time winner
+        // application: the discard row records the same accepted SHA as the iter1
+        // keep, proving the revert targeted the last KEPT commit — not the
+        // original HEAD/start (where main reset to). This is set during the
+        // discard, before the loop exits.
+        assert_eq!(
+            iter1_sha, iter2_sha,
+            "the no-improvement revert targeted the iter1 commit, not HEAD; tsv:\n{tsv}"
+        );
+        assert_ne!(
+            sha(rows[0]),
+            iter1_sha,
+            "the baseline and iter1 are distinct commits (the climb advanced)"
+        );
+
+        // The harness's own `.spore/` ledger must NOT be swept into candidate
+        // commits — otherwise the winner-apply `git reset --hard` would clobber
+        // the freshly-written TSV with a stale committed copy. Prove it stayed
+        // untracked (and so survived every reset, real SHAs intact above).
+        let tracked = std::process::Command::new("git")
+            .args(["ls-files"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let tracked = String::from_utf8_lossy(&tracked.stdout);
+        assert!(
+            !tracked.lines().any(|f| f.starts_with(".spore")),
+            "the .spore ledger dir must stay untracked; tracked files:\n{tracked}"
+        );
+    }
+
+    // Companion to the regression: prove the durable pointer also fixes the
+    // multi-keep case. baseline → iter1 keep (delta1) → iter2 keep (delta2) →
+    // iter3 discard. The revert must land on delta2 (the LAST accepted state),
+    // not delta1 and not the start.
+    #[tokio::test]
+    async fn hill_climbing_revert_targets_latest_accepted_not_start() {
+        let (_dir, root, draft) = init_git_repo("base");
+        let sandbox = Arc::new(
+            crate::sandbox::WorkspaceScopedSandbox::new(crate::sandbox::WorkspaceConfig::scoped(
+                root.clone(),
+            ))
+            .unwrap(),
+        );
+        // maximize: 1.0 baseline, 2.0 keep, 3.0 keep, 2.5 discard.
+        let eval = Arc::new(ScriptedMetricEvaluator::new(
+            vec![Ok(1.0), Ok(2.0), Ok(3.0), Ok(2.5)],
+            HillClimbingDirection::Maximize,
+        ));
+        let agent = FileEditingAgent::new(draft.clone(), vec!["delta1", "delta2", "delta3"]);
+        let mut cfg = standard_config(make_agent());
+        set_worker_agent(&mut cfg, agent);
+        cfg.sandbox = sandbox;
+        set_default_metric(&mut cfg, eval);
+
+        let t = hill_task(HillClimbingDirection::Maximize, Some(1), true, None);
+        let r = h_run(&cfg, t).await;
+        match r {
+            RunResult::Failure {
+                reason: HaltReason::StagnationLimitReached { best_metric, .. },
+                ..
+            } => assert!((best_metric - 3.0).abs() < 1e-9, "best is iter2's 3.0"),
+            other => panic!("expected StagnationLimitReached, got {other:?}"),
+        }
+        let on_disk = std::fs::read_to_string(&draft).unwrap();
+        assert_eq!(
+            on_disk, "delta2",
+            "revert lands on the LAST accepted state (delta2), not delta1 or the start"
+        );
     }
 
     // ── HillClimbing cross-language fixture replay ──────────────────────────
@@ -26837,10 +27422,15 @@ mod budget_enforcement_tests {
     #[test]
     fn hill_climbing_partial_shape() {
         let json: serde_json::Value =
-            serde_json::from_str(&hill_climbing_partial_json(0.875)).unwrap();
+            serde_json::from_str(&hill_climbing_partial_json(0.875, Some("abc123"))).unwrap();
         assert_eq!(json["node"], "hill_climbing");
         assert_eq!(json["best_candidate"], 0.875);
         assert_eq!(json["score"], 0.875);
+        assert_eq!(json["best_sha"], "abc123");
+        // No usable VCS ⇒ best_sha serializes as JSON null.
+        let no_vcs: serde_json::Value =
+            serde_json::from_str(&hill_climbing_partial_json(0.5, None)).unwrap();
+        assert!(no_vcs["best_sha"].is_null());
     }
 
     // ── Rule 1: a node capped at N stops at N without killing siblings ───────
