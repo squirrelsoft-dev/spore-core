@@ -203,7 +203,8 @@ pub use tool_call_repair::{
 };
 pub use tool_registry::{
     DispatchError, RealToolRegistry, RegistrationError, StandardToolRegistry, TaskPhase, Tool,
-    ToolAnnotations, ToolContext, ToolRegistry, ToolSchema as RegisteredToolSchema, ToolSet,
+    ToolAnnotations, ToolContext, ToolNamespace, ToolRegistry, ToolSchema as RegisteredToolSchema,
+    ToolSearchConfig, ToolSearchRegistry, ToolSet,
 };
 pub use verifier::{
     CompositeVerifier, EvaluatorResponseVerifier, TestSuiteVerifier, Verifier, VerifierInput,

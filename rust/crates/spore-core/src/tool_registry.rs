@@ -883,6 +883,474 @@ impl HarnessToolRegistry for RealToolRegistry {
 }
 
 // ============================================================================
+// ToolSearchRegistry — deferred (search-on-demand) tool exposure
+// ============================================================================
+
+/// A named group of deferred tools, advertised as a single cheap HEADER.
+///
+/// The model sees the header (name + description) in its tool list every turn —
+/// the menu of capability groups available — and "opens" the namespace by CALLING
+/// it (a zero-arg dispatch) to load the member tools into the active set; it can
+/// also reach a member directly via `tool_search`. This mirrors the
+/// `toolNamespace` grouping in agent SDKs, realized client-side here because local
+/// models have no native tool-search. For an MCP future, one server maps naturally
+/// to one namespace.
+///
+/// Versus advertising a lone `tool_search`, headers give a weaker model the
+/// category menu UP FRONT (more reliable discovery) while keeping advertised prose
+/// tiny (one terse line per group).
+#[derive(Debug, Clone)]
+pub struct ToolNamespace {
+    /// The namespace handle — advertised as a callable header; calling it loads the
+    /// member tools. MUST be distinct from every catalogue tool name (a colliding
+    /// namespace is dropped at construction so it never shadows a real tool).
+    pub name: String,
+    /// One terse line describing the group — what the model sees in its tool list.
+    pub description: String,
+    /// Member tool names (catalogue tools deferred behind this header).
+    pub tools: Vec<String>,
+}
+
+impl ToolNamespace {
+    /// A namespace grouping `tools` under a `name` header with a one-line
+    /// `description`.
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        tools: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            tools: tools.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Configuration for a [`ToolSearchRegistry`]: which tools are always advertised,
+/// how much description prose the advertised set may carry, and how many tools a
+/// single `tool_search` call surfaces.
+///
+/// The motivating constraint (see looper's local-vLLM notes) is that a local
+/// model's NATIVE tool-calling collapses once the total volume of natural-language
+/// tool-DESCRIPTION text advertised at once crosses a model-specific cliff — NOT
+/// the tool count or byte size, the *description prose*. A catalogue with many
+/// description-rich tools (or a 75-tool MCP server) buries native tool-calling far
+/// past that cliff. The deferred-tool pattern keeps the advertised set small and
+/// description-bounded, loading more tools on demand, so native tool-calling keeps
+/// working at catalogue scale.
+#[derive(Debug, Clone)]
+pub struct ToolSearchConfig {
+    /// Names of tools ALWAYS advertised (never deferred, never evicted). Tools
+    /// outside this list start hidden and are surfaced on demand by `tool_search`
+    /// or by opening the [`namespace`](Self::namespaces) they belong to.
+    /// Names absent from the wrapped catalogue are ignored.
+    pub core: Vec<String>,
+    /// Deferred-tool groups, each advertised as a single cheap header the model can
+    /// open. Members are catalogue tools NOT in `core`; a tool in a namespace is
+    /// still independently findable via `tool_search`. Empty (the default) is a
+    /// flat catalogue — every non-core tool is standalone deferred.
+    pub namespaces: Vec<ToolNamespace>,
+    /// Soft ceiling on the TOTAL description bytes across the advertised set
+    /// (core + namespace headers + the search meta-tool + currently-loaded tools).
+    /// Loaded tools are LRU-evicted to keep the total at or below this. The
+    /// always-on baseline (core + headers + meta-tool) is advertised even if it
+    /// alone exceeds the budget (correctness over the cliff — size `core` and the
+    /// namespace headers sanely). Calibrate against the consumer's real schemas to
+    /// sit BELOW the native-tool-calling description-volume cliff.
+    pub description_budget: usize,
+    /// Maximum tools a single `tool_search` call — or one namespace open — loads
+    /// into the active set.
+    pub search_top_k: usize,
+    /// Name of the synthetic search meta-tool. Defaults to `tool_search`.
+    pub search_tool_name: String,
+}
+
+impl ToolSearchConfig {
+    /// New config with the given always-on core tool names and conservative
+    /// defaults (`description_budget` 4096, `search_top_k` 5, search tool named
+    /// `tool_search`). Consumers should calibrate `description_budget` against
+    /// their own model/schemas.
+    pub fn new(core: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            core: core.into_iter().map(Into::into).collect(),
+            namespaces: Vec::new(),
+            description_budget: 4096,
+            search_top_k: 5,
+            search_tool_name: "tool_search".into(),
+        }
+    }
+
+    /// Add a deferred-tool namespace (group). Chainable; call once per group.
+    pub fn namespace(mut self, ns: ToolNamespace) -> Self {
+        self.namespaces.push(ns);
+        self
+    }
+
+    /// Replace the namespace list wholesale.
+    pub fn namespaces(mut self, namespaces: impl IntoIterator<Item = ToolNamespace>) -> Self {
+        self.namespaces = namespaces.into_iter().collect();
+        self
+    }
+
+    /// Set the advertised-description byte ceiling.
+    pub fn description_budget(mut self, bytes: usize) -> Self {
+        self.description_budget = bytes;
+        self
+    }
+
+    /// Set the max tools surfaced per `tool_search` call.
+    pub fn search_top_k(mut self, k: usize) -> Self {
+        self.search_top_k = k;
+        self
+    }
+
+    /// Rename the search meta-tool.
+    pub fn search_tool_name(mut self, name: impl Into<String>) -> Self {
+        self.search_tool_name = name.into();
+        self
+    }
+}
+
+/// A harness-loop [`ToolRegistry`](crate::harness::ToolRegistry) wrapper that
+/// advertises only a small, description-bounded ACTIVE set — the configured core
+/// tools plus a `tool_search` meta-tool — and loads the rest of the catalogue on
+/// demand.
+///
+/// `schemas()` is re-read by the harness every turn, so the wrapper grows/shrinks
+/// the advertised set turn-to-turn via interior mutability:
+/// * `tool_search(query)` keyword-matches the full catalogue (names + descriptions),
+///   loads the top-K hits into the active set, and returns their schemas in the
+///   tool result so the model can call them next turn.
+/// * any tool actually dispatched is touched (kept warm, MRU).
+/// * the active set is LRU-evicted to keep total advertised description bytes at or
+///   below [`ToolSearchConfig::description_budget`].
+///
+/// It is constructed once per turn-loop window (alongside the wrapped
+/// [`RealToolRegistry`]), so a search loaded mid-window stays loaded for the rest
+/// of that window and resets on the next window (fresh task ⇒ re-search).
+///
+/// Deferred tools may be grouped into [`ToolNamespace`]s: each is advertised as a
+/// cheap header the model opens (by calling it) to load the group's tools, giving
+/// a weaker model the menu of capability groups up front. Namespaced and standalone
+/// deferred tools coexist, and every deferred tool stays findable via `tool_search`.
+///
+/// `dispatch` of any non-search, non-namespace tool delegates straight to the inner
+/// registry, so a model that calls a catalogue tool that is not currently advertised
+/// (e.g. one it just learned of, or one that was evicted) STILL succeeds — exposure
+/// is a hint to the model, never a hard gate on dispatch.
+pub struct ToolSearchRegistry {
+    inner: Arc<dyn HarnessToolRegistry>,
+    /// Full catalogue snapshot (every tool the inner registry advertises).
+    catalogue: Vec<ModelToolSchema>,
+    /// Core tool names present in the catalogue, in catalogue order.
+    core: Vec<String>,
+    /// Validated namespaces: members exist in the catalogue and are non-core, and
+    /// the namespace name does not collide with any catalogue tool name.
+    namespaces: Vec<ToolNamespace>,
+    /// Precomputed synthetic header schemas (one per namespace), advertised every
+    /// turn alongside `core` and the search meta-tool.
+    namespace_headers: Vec<ModelToolSchema>,
+    config: ToolSearchConfig,
+    /// Synthetic search meta-tool schema, advertised every turn.
+    search_schema: ModelToolSchema,
+    /// Loaded (searched-in / namespace-opened) tool names in LRU order: front =
+    /// most-recently-used.
+    loaded: std::sync::Mutex<std::collections::VecDeque<String>>,
+}
+
+impl ToolSearchRegistry {
+    /// Wrap an inner harness-loop registry (typically a [`RealToolRegistry`] over
+    /// the full catalogue). The inner registry's `schemas()` defines the catalogue
+    /// available to search; its `dispatch()` routes every real tool.
+    pub fn new(inner: Arc<dyn HarnessToolRegistry>, config: ToolSearchConfig) -> Self {
+        let catalogue = inner.schemas();
+        let in_catalogue = |n: &str| catalogue.iter().any(|s| s.name == n);
+        // Core names that actually exist in the catalogue, catalogue order, deduped.
+        let mut core: Vec<String> = Vec::new();
+        for s in &catalogue {
+            if config.core.iter().any(|c| c == &s.name) && !core.iter().any(|c| c == &s.name) {
+                core.push(s.name.clone());
+            }
+        }
+        let is_core = |n: &str| core.iter().any(|c| c == n);
+        // Validate namespaces: drop a name that collides with a catalogue tool (it
+        // would shadow the real tool on dispatch) or with an earlier namespace;
+        // keep only members that exist in the catalogue and are non-core, deduped.
+        let mut namespaces: Vec<ToolNamespace> = Vec::new();
+        for ns in &config.namespaces {
+            if in_catalogue(&ns.name) || namespaces.iter().any(|k| k.name == ns.name) {
+                continue;
+            }
+            let mut tools: Vec<String> = Vec::new();
+            for t in &ns.tools {
+                if in_catalogue(t) && !is_core(t) && !tools.iter().any(|x| x == t) {
+                    tools.push(t.clone());
+                }
+            }
+            if tools.is_empty() {
+                continue;
+            }
+            namespaces.push(ToolNamespace { name: ns.name.clone(), description: ns.description.clone(), tools });
+        }
+        let namespace_headers = namespaces.iter().map(Self::header_schema).collect();
+        let search_schema = Self::build_search_schema(&config.search_tool_name);
+        Self {
+            inner,
+            catalogue,
+            core,
+            namespaces,
+            namespace_headers,
+            config,
+            search_schema,
+            loaded: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    /// Synthetic, always-advertised header for a namespace. Zero-arg: calling it
+    /// opens the group. The "(call to load …)" hint nudges a weak model to open it.
+    fn header_schema(ns: &ToolNamespace) -> ModelToolSchema {
+        ModelToolSchema {
+            name: ns.name.clone(),
+            description: format!("{} (call to load this group's tools)", ns.description),
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+        }
+    }
+
+    fn build_search_schema(name: &str) -> ModelToolSchema {
+        // Kept deliberately TERSE: this description is advertised every turn and
+        // counts against the same description-prose budget the cliff cares about,
+        // so verbosity here would cancel out the savings from deferring tools.
+        ModelToolSchema {
+            name: name.to_string(),
+            description: "Load more tools by keyword when you need a capability you don't \
+                currently have (e.g. run command, web search, task list)."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Keywords for the capability you need." }
+                },
+                "required": ["query"]
+            }),
+        }
+    }
+
+    /// Whether `name` is a configured (and catalogue-present) core tool.
+    fn is_core(&self, name: &str) -> bool {
+        self.core.iter().any(|c| c == name)
+    }
+
+    /// Move `name` to the front of the LRU (most-recently-used). No-op for the
+    /// search tool, core tools, and names absent from the catalogue.
+    fn touch(&self, name: &str) {
+        if name == self.config.search_tool_name
+            || self.is_core(name)
+            || !self.catalogue.iter().any(|s| s.name == name)
+        {
+            return;
+        }
+        let mut g = self.loaded.lock().expect("loaded lock poisoned");
+        g.retain(|n| n != name);
+        g.push_front(name.to_string());
+    }
+
+    /// Keyword search over the non-core catalogue. Scores `+3` per query term
+    /// found in a tool name and `+1` per term in its description; returns up to
+    /// `search_top_k` names with a positive score, best first (ties by name).
+    fn search(&self, query: &str) -> Vec<String> {
+        let terms: Vec<String> = query
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| t.len() >= 2)
+            .map(|t| t.to_string())
+            .collect();
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let mut scored: Vec<(i32, &str)> = Vec::new();
+        for s in &self.catalogue {
+            if s.name == self.config.search_tool_name || self.is_core(&s.name) {
+                continue;
+            }
+            let name_l = s.name.to_lowercase();
+            let desc_l = s.description.to_lowercase();
+            let mut score = 0i32;
+            for t in &terms {
+                if name_l.contains(t.as_str()) {
+                    score += 3;
+                }
+                if desc_l.contains(t.as_str()) {
+                    score += 1;
+                }
+            }
+            if score > 0 {
+                scored.push((score, s.name.as_str()));
+            }
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        scored
+            .into_iter()
+            .take(self.config.search_top_k)
+            .map(|(_, n)| n.to_string())
+            .collect()
+    }
+
+    /// Handle a `tool_search` dispatch: run the search, load the hits, and return
+    /// a readable listing of the now-available tools.
+    fn run_search(&self, input: &serde_json::Value) -> ToolOutput {
+        let query = input
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if query.is_empty() {
+            return ToolOutput::error(format!(
+                "{}: provide a non-empty `query` string describing the capability you need.",
+                self.config.search_tool_name
+            ));
+        }
+        let hits = self.search(query);
+        if hits.is_empty() {
+            return ToolOutput::success(format!(
+                "No tools matched \"{query}\". Try different keywords — the tools you already have \
+                 are in your current tool list."
+            ));
+        }
+        self.load_and_list(
+            &hits,
+            format!("Loaded {} tool(s) for \"{query}\". You can now call them directly:", hits.len()),
+        )
+    }
+
+    /// Handle a namespace-header dispatch: load the group's member tools (capped at
+    /// `search_top_k`) and return a readable listing of them.
+    fn open_namespace(&self, name: &str) -> ToolOutput {
+        let Some(ns) = self.namespaces.iter().find(|n| n.name == name) else {
+            // Unreachable on the dispatch path (membership is checked first), but be
+            // defensive rather than panic.
+            return ToolOutput::error(format!("namespace `{name}` is not registered"));
+        };
+        let members: Vec<String> = ns
+            .tools
+            .iter()
+            .take(self.config.search_top_k)
+            .cloned()
+            .collect();
+        if members.is_empty() {
+            return ToolOutput::success(format!("Namespace \"{name}\" has no available tools."));
+        }
+        self.load_and_list(
+            &members,
+            format!(
+                "Opened namespace \"{name}\" — loaded {} tool(s). You can now call them directly:",
+                members.len()
+            ),
+        )
+    }
+
+    /// Load `names` into the active set (MRU-first) and render a `header` +
+    /// per-tool listing (name, description, parameters) the model can act on.
+    fn load_and_list(&self, names: &[String], header: String) -> ToolOutput {
+        // Push in reverse so the first-listed ends at the LRU front (last evicted).
+        for name in names.iter().rev() {
+            self.touch(name);
+        }
+        let by_name: std::collections::HashMap<&str, &ModelToolSchema> =
+            self.catalogue.iter().map(|s| (s.name.as_str(), s)).collect();
+        let mut lines = vec![header];
+        for name in names {
+            if let Some(s) = by_name.get(name.as_str()) {
+                lines.push(format!("- {}: {}", s.name, s.description));
+                lines.push(format!("  parameters: {}", s.input_schema));
+            }
+        }
+        ToolOutput::success(lines.join("\n"))
+    }
+
+    /// Total description bytes the registry advertises right now (core + the search
+    /// meta-tool + currently-loaded tools, after eviction). Exposed for budget
+    /// calibration and tests.
+    pub fn advertised_description_bytes(&self) -> usize {
+        self.schemas().iter().map(|s| s.description.len()).sum()
+    }
+}
+
+impl HarnessToolRegistry for ToolSearchRegistry {
+    fn dispatch<'a>(&'a self, call: ToolCall) -> BoxFut<'a, ToolOutput> {
+        if call.name == self.config.search_tool_name {
+            let out = self.run_search(&call.input);
+            return Box::pin(async move { out });
+        }
+        // A namespace header opens its group (synthetic; never reaches the inner
+        // registry). Checked before delegation — a colliding name was dropped at
+        // construction, so this can't shadow a real tool.
+        if self.namespaces.iter().any(|n| n.name == call.name) {
+            let out = self.open_namespace(&call.name);
+            return Box::pin(async move { out });
+        }
+        // Keep an actually-used tool warm, then delegate to the full catalogue.
+        self.touch(&call.name);
+        self.inner.dispatch(call)
+    }
+
+    fn is_always_halt(&self, tool_name: &str) -> bool {
+        if tool_name == self.config.search_tool_name
+            || self.namespaces.iter().any(|n| n.name == tool_name)
+        {
+            return false;
+        }
+        self.inner.is_always_halt(tool_name)
+    }
+
+    fn schemas(&self) -> Vec<ModelToolSchema> {
+        let by_name: std::collections::HashMap<&str, &ModelToolSchema> =
+            self.catalogue.iter().map(|s| (s.name.as_str(), s)).collect();
+        let mut out: Vec<ModelToolSchema> = Vec::new();
+        let mut used: usize = 0;
+        // Core tools — always advertised.
+        for name in &self.core {
+            if let Some(s) = by_name.get(name.as_str()) {
+                used += s.description.len();
+                out.push((*s).clone());
+            }
+        }
+        // Namespace headers — always advertised (the capability-group menu).
+        for header in &self.namespace_headers {
+            used += header.description.len();
+            out.push(header.clone());
+        }
+        // Search meta-tool — always advertised.
+        used += self.search_schema.description.len();
+        out.push(self.search_schema.clone());
+        // Loaded tools (MRU first), included while they fit; the overflow tail is
+        // EVICTED from state (true LRU eviction on read).
+        let mut guard = self.loaded.lock().expect("loaded lock poisoned");
+        let mut kept: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        for name in guard.iter() {
+            if self.is_core(name) {
+                continue;
+            }
+            let Some(s) = by_name.get(name.as_str()) else {
+                continue;
+            };
+            let next = used + s.description.len();
+            if next > self.config.description_budget {
+                break;
+            }
+            used = next;
+            kept.push_back(name.clone());
+            out.push((*s).clone());
+        }
+        *guard = kept;
+        drop(guard);
+        // Sort by name for cache-stability when the advertised set is unchanged.
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1439,5 +1907,387 @@ mod tests {
                 ),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_search_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Minimal inner harness-loop registry: advertises a fixed schema list and
+    /// records the names it is asked to dispatch.
+    struct FixedInner {
+        schemas: Vec<ModelToolSchema>,
+        dispatched: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FixedInner {
+        fn new(schemas: Vec<ModelToolSchema>) -> Arc<Self> {
+            Arc::new(Self {
+                schemas,
+                dispatched: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl HarnessToolRegistry for FixedInner {
+        fn dispatch<'a>(&'a self, call: ToolCall) -> BoxFut<'a, ToolOutput> {
+            self.dispatched
+                .lock()
+                .unwrap()
+                .push(call.name.clone());
+            Box::pin(async move { ToolOutput::success(format!("ran {}", call.name)) })
+        }
+        fn schemas(&self) -> Vec<ModelToolSchema> {
+            self.schemas.clone()
+        }
+    }
+
+    fn tool(name: &str, description: &str) -> ModelToolSchema {
+        ModelToolSchema {
+            name: name.into(),
+            description: description.into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    fn tcall(name: &str, input: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: format!("c-{name}"),
+            name: name.into(),
+            input,
+        }
+    }
+
+    fn names(schemas: &[ModelToolSchema]) -> Vec<String> {
+        schemas.iter().map(|s| s.name.clone()).collect()
+    }
+
+    /// catalogue: 3 core + 3 deferred.
+    fn fixture() -> ToolSearchRegistry {
+        let inner = FixedInner::new(vec![
+            tool("read_file", "Read a file's contents from the workspace."),
+            tool("write_file", "Create or overwrite a file in the workspace."),
+            tool("bash_command", "Run a shell command in the workspace."),
+            tool("web_search", "Search the web for information via a backend."),
+            tool("task_list", "Author and update the structured task DAG."),
+            tool("todo_write", "Persist a lightweight todo checklist."),
+        ]);
+        ToolSearchRegistry::new(
+            inner,
+            ToolSearchConfig::new(["read_file", "write_file", "bash_command"])
+                .description_budget(100_000)
+                .search_top_k(5),
+        )
+    }
+
+    #[test]
+    fn advertises_core_plus_search_tool_only_by_default() {
+        let reg = fixture();
+        let advertised = names(&reg.schemas());
+        // Core tools + the synthetic tool_search, nothing deferred yet.
+        assert_eq!(
+            advertised,
+            vec![
+                "bash_command".to_string(),
+                "read_file".to_string(),
+                "tool_search".to_string(),
+                "write_file".to_string(),
+            ]
+        );
+        assert!(!advertised.contains(&"web_search".to_string()));
+    }
+
+    #[test]
+    fn unknown_core_names_are_ignored() {
+        let inner = FixedInner::new(vec![tool("read_file", "Read a file.")]);
+        let reg = ToolSearchRegistry::new(
+            inner,
+            ToolSearchConfig::new(["read_file", "does_not_exist"]),
+        );
+        let advertised = names(&reg.schemas());
+        assert_eq!(advertised, vec!["read_file".to_string(), "tool_search".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn tool_search_loads_matching_tools_into_active_set() {
+        let reg = fixture();
+        let out = reg
+            .dispatch(tcall("tool_search", json!({"query": "search the web"})))
+            .await;
+        match out {
+            ToolOutput::Success { content, .. } => {
+                assert!(content.contains("web_search"), "result lists the match: {content}");
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+        // web_search is now advertised; the unrelated deferred tools are not.
+        let advertised = names(&reg.schemas());
+        assert!(advertised.contains(&"web_search".to_string()));
+        assert!(!advertised.contains(&"todo_write".to_string()));
+    }
+
+    #[tokio::test]
+    async fn search_matches_tool_name_keyword() {
+        let reg = fixture();
+        reg.dispatch(tcall("tool_search", json!({"query": "task"})))
+            .await;
+        let advertised = names(&reg.schemas());
+        assert!(advertised.contains(&"task_list".to_string()));
+    }
+
+    #[tokio::test]
+    async fn empty_query_is_a_recoverable_error() {
+        let reg = fixture();
+        let out = reg
+            .dispatch(tcall("tool_search", json!({"query": "   "})))
+            .await;
+        assert!(matches!(out, ToolOutput::Error { recoverable: true, .. }));
+    }
+
+    #[tokio::test]
+    async fn no_matches_reports_cleanly_without_loading() {
+        let reg = fixture();
+        let out = reg
+            .dispatch(tcall("tool_search", json!({"query": "quantum teleportation"})))
+            .await;
+        assert!(matches!(out, ToolOutput::Success { .. }));
+        // Nothing new loaded.
+        let advertised = names(&reg.schemas());
+        assert_eq!(advertised.len(), 4); // 3 core + tool_search
+    }
+
+    #[tokio::test]
+    async fn dispatch_delegates_real_tools_to_inner() {
+        let inner = FixedInner::new(vec![
+            tool("read_file", "Read a file."),
+            tool("web_search", "Search the web."),
+        ]);
+        let reg = ToolSearchRegistry::new(inner.clone(), ToolSearchConfig::new(["read_file"]));
+        // A core tool dispatches through.
+        let out = reg.dispatch(tcall("read_file", json!({"path": "x"}))).await;
+        assert!(matches!(out, ToolOutput::Success { .. }));
+        // A deferred, never-searched tool STILL dispatches (exposure is a hint,
+        // not a hard gate) and gets kept warm afterwards.
+        let out = reg.dispatch(tcall("web_search", json!({"query": "x"}))).await;
+        assert!(matches!(out, ToolOutput::Success { .. }));
+        assert_eq!(*inner.dispatched.lock().unwrap(), vec!["read_file", "web_search"]);
+        // web_search is now advertised (it was touched on dispatch).
+        assert!(names(&reg.schemas()).contains(&"web_search".to_string()));
+    }
+
+    #[tokio::test]
+    async fn description_budget_lru_evicts_oldest_loaded() {
+        // Each deferred description is 10 bytes ("dddddddddd"). Core is empty, the
+        // search tool's description is large, so set a budget that fits the search
+        // tool + exactly ONE deferred tool.
+        let inner = FixedInner::new(vec![
+            tool("alpha", "dddddddddd"),
+            tool("bravo", "dddddddddd"),
+        ]);
+        let search_desc_len = ToolSearchRegistry::build_search_schema("tool_search")
+            .description
+            .len();
+        let reg = ToolSearchRegistry::new(
+            inner,
+            ToolSearchConfig::new(Vec::<String>::new())
+                .description_budget(search_desc_len + 10)
+                .search_top_k(5),
+        );
+        reg.dispatch(tcall("tool_search", json!({"query": "alpha"}))).await;
+        reg.dispatch(tcall("tool_search", json!({"query": "bravo"}))).await;
+        // Only one deferred tool fits; bravo was loaded most recently, so alpha is
+        // evicted.
+        let advertised = names(&reg.schemas());
+        assert!(advertised.contains(&"bravo".to_string()), "MRU kept: {advertised:?}");
+        assert!(!advertised.contains(&"alpha".to_string()), "LRU evicted: {advertised:?}");
+        assert!(reg.advertised_description_bytes() <= search_desc_len + 10);
+    }
+
+    /// Calibration: print the description-prose volume of looper's Default ceiling
+    /// (coding_set − memory = the 13-tool cliff) vs the 9-tool core, and the
+    /// ToolSearch-bounded advertised set. Run with `--nocapture` to read the
+    /// numbers; asserts the registry materially shrinks the advertised prose.
+    #[test]
+    fn calibration_default_ceiling_description_volume() {
+        use crate::tools::StandardTools;
+
+        let coding_minus_memory: Vec<ModelToolSchema> = StandardTools::coding_set()
+            .into_iter()
+            .filter(|t| t.schema.name != "memory")
+            .map(|t| t.schema.to_model_schema())
+            .collect();
+        let full_bytes: usize = coding_minus_memory.iter().map(|s| s.description.len()).sum();
+
+        let core = [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_dir",
+            "grep",
+            "grep_files",
+            "find_files",
+            "bash_command",
+            "send_message",
+        ];
+        let core_bytes: usize = coding_minus_memory
+            .iter()
+            .filter(|s| core.contains(&s.name.as_str()))
+            .map(|s| s.description.len())
+            .sum();
+
+        let inner = FixedInner::new(coding_minus_memory.clone());
+        let reg = ToolSearchRegistry::new(
+            inner,
+            ToolSearchConfig::new(core).description_budget(100_000),
+        );
+        let advertised_bytes = reg.advertised_description_bytes();
+        let search_bytes = ToolSearchRegistry::build_search_schema("tool_search")
+            .description
+            .len();
+
+        println!(
+            "[tool-search calibration] tools={} full_desc_bytes={} core9_desc_bytes={} \
+             search_tool_desc_bytes={} advertised(core9+search)_bytes={}",
+            coding_minus_memory.len(),
+            full_bytes,
+            core_bytes,
+            search_bytes,
+            advertised_bytes,
+        );
+
+        // The bounded advertised set carries materially less description prose
+        // than the full 13-tool ceiling that trips the native-tool-calling cliff.
+        assert!(
+            advertised_bytes < full_bytes,
+            "advertised {advertised_bytes} should be < full ceiling {full_bytes}"
+        );
+        // Core (9) + the search tool only — deferred web/task/todo tools are hidden.
+        assert_eq!(reg.schemas().len(), core.len() + 1);
+    }
+
+    // ---- namespaces --------------------------------------------------------
+
+    /// catalogue: 1 core (read_file) + a `web` namespace (web_fetch, web_search) +
+    /// a standalone deferred tool (task_list).
+    fn ns_fixture() -> ToolSearchRegistry {
+        let inner = FixedInner::new(vec![
+            tool("read_file", "Read a file's contents from the workspace."),
+            tool("web_fetch", "Fetch the contents of a URL over HTTP."),
+            tool("web_search", "Search the web for information via a backend."),
+            tool("task_list", "Author and update the structured task DAG."),
+        ]);
+        ToolSearchRegistry::new(
+            inner,
+            ToolSearchConfig::new(["read_file"])
+                .namespace(ToolNamespace::new(
+                    "web",
+                    "Web access tools (fetch a URL, search the web)",
+                    ["web_fetch", "web_search"],
+                ))
+                .description_budget(100_000)
+                .search_top_k(5),
+        )
+    }
+
+    #[test]
+    fn namespace_header_is_advertised_but_members_are_hidden() {
+        let reg = ns_fixture();
+        let advertised = names(&reg.schemas());
+        // Header + core + search tool; standalone deferred task_list hidden.
+        assert!(advertised.contains(&"web".to_string()), "header advertised: {advertised:?}");
+        assert!(advertised.contains(&"read_file".to_string()));
+        assert!(advertised.contains(&"tool_search".to_string()));
+        // Members and the standalone deferred tool are NOT advertised yet.
+        assert!(!advertised.contains(&"web_fetch".to_string()));
+        assert!(!advertised.contains(&"web_search".to_string()));
+        assert!(!advertised.contains(&"task_list".to_string()));
+        // Header carries the namespace description + the open hint.
+        let header = reg.schemas().into_iter().find(|s| s.name == "web").unwrap();
+        assert!(header.description.contains("Web access tools"));
+        assert!(header.description.contains("call to load"));
+    }
+
+    #[tokio::test]
+    async fn opening_a_namespace_loads_its_members() {
+        let reg = ns_fixture();
+        let out = reg.dispatch(tcall("web", json!({}))).await;
+        match out {
+            ToolOutput::Success { content, .. } => {
+                assert!(content.contains("web_fetch"), "lists members: {content}");
+                assert!(content.contains("web_search"), "lists members: {content}");
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+        // Both members are now advertised alongside the header.
+        let advertised = names(&reg.schemas());
+        assert!(advertised.contains(&"web_fetch".to_string()));
+        assert!(advertised.contains(&"web_search".to_string()));
+        assert!(advertised.contains(&"web".to_string()), "header stays");
+    }
+
+    #[tokio::test]
+    async fn opening_a_namespace_does_not_reach_the_inner_registry() {
+        let inner = FixedInner::new(vec![
+            tool("read_file", "Read a file."),
+            tool("web_fetch", "Fetch a URL."),
+        ]);
+        let reg = ToolSearchRegistry::new(
+            inner.clone(),
+            ToolSearchConfig::new(["read_file"]).namespace(ToolNamespace::new(
+                "web",
+                "Web tools",
+                ["web_fetch"],
+            )),
+        );
+        reg.dispatch(tcall("web", json!({}))).await;
+        // The synthetic header never dispatches to the catalogue.
+        assert!(inner.dispatched.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn namespace_members_are_still_findable_via_search() {
+        let reg = ns_fixture();
+        reg.dispatch(tcall("tool_search", json!({"query": "fetch url web"}))).await;
+        let advertised = names(&reg.schemas());
+        assert!(advertised.contains(&"web_fetch".to_string()), "search finds namespaced tool");
+    }
+
+    #[tokio::test]
+    async fn a_namespace_colliding_with_a_tool_name_is_dropped() {
+        // A namespace named after a real catalogue tool must NOT shadow it.
+        let inner = FixedInner::new(vec![
+            tool("read_file", "Read a file."),
+            tool("web_fetch", "Fetch a URL."),
+        ]);
+        let reg = ToolSearchRegistry::new(
+            inner.clone(),
+            ToolSearchConfig::new(Vec::<String>::new()).namespace(ToolNamespace::new(
+                "read_file", // collides with the real tool
+                "bogus",
+                ["web_fetch"],
+            )),
+        );
+        // No synthetic header was created; calling read_file dispatches the REAL tool.
+        let out = reg.dispatch(tcall("read_file", json!({"path": "x"}))).await;
+        assert!(matches!(out, ToolOutput::Success { .. }));
+        assert_eq!(*inner.dispatched.lock().unwrap(), vec!["read_file"]);
+    }
+
+    #[test]
+    fn namespace_with_no_valid_members_is_dropped() {
+        let inner = FixedInner::new(vec![tool("read_file", "Read a file.")]);
+        let reg = ToolSearchRegistry::new(
+            inner,
+            ToolSearchConfig::new(["read_file"]).namespace(ToolNamespace::new(
+                "empty",
+                "nothing here",
+                ["does_not_exist", "read_file"], // missing + core ⇒ no valid members
+            )),
+        );
+        let advertised = names(&reg.schemas());
+        assert!(!advertised.contains(&"empty".to_string()), "empty namespace dropped: {advertised:?}");
+        assert_eq!(advertised, vec!["read_file".to_string(), "tool_search".to_string()]);
     }
 }

@@ -235,6 +235,43 @@ pub fn detect_prose_response(text: &str, tools_advertised: bool) -> Option<ToolC
         "i can use the",
         "i'm going to use",
         "i am going to use",
+        // Research/inspection verbs an agent narrates instead of calling a tool
+        // (e.g. Qwen: "I'll list the directory structure for you."). Each strongly
+        // implies an action it should have performed via a tool.
+        "i'll list",
+        "i will list",
+        "let me list",
+        "i'll inspect",
+        "i will inspect",
+        "let me inspect",
+        "i'll read",
+        "i will read",
+        "let me read",
+        "i'll examine",
+        "i will examine",
+        "let me examine",
+        "i'll review",
+        "i will review",
+        "let me review",
+        "i'll analyze",
+        "i will analyze",
+        "let me analyze",
+        "i'll check",
+        "i will check",
+        "let me check",
+        "i'll look at",
+        "i will look at",
+        "let me look",
+        "i'll search",
+        "i will search",
+        "let me search",
+        "i'll explore",
+        "i will explore",
+        "let me explore",
+        "i'll start by",
+        "i will start by",
+        "let me start by",
+        "let's start by",
     ];
     let lower = trimmed.to_ascii_lowercase();
     if ACTION_PHRASES.iter().any(|p| lower.contains(p)) {
@@ -420,6 +457,26 @@ mod tests {
     fn prose_detected_case_insensitive() {
         let got = detect_prose_response("LET ME CALL the search tool now.", true);
         assert!(matches!(got, Some(ToolCallFailure::ProseResponse(_))));
+    }
+
+    #[test]
+    fn prose_detected_on_research_verb_narration() {
+        // A model that narrates an inspection action instead of calling a tool —
+        // the exact "I'll list the directory…" wording the agent must be nudged on.
+        for text in [
+            "I'll list the top-level directory structure for you.",
+            "Let me inspect the key configuration files.",
+            "I'll read the README and report findings.",
+            "I'll start by exploring the source directory.",
+        ] {
+            assert!(
+                matches!(
+                    detect_prose_response(text, true),
+                    Some(ToolCallFailure::ProseResponse(_))
+                ),
+                "should detect action-narration: {text:?}"
+            );
+        }
     }
 
     #[test]

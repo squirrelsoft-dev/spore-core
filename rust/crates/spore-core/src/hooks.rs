@@ -1758,6 +1758,8 @@ mod tests {
             content_capture: Default::default(),
             tool_call_repair: None,
             max_repair_attempts: 1,
+            plan_empty_max_retries: 0,
+            tool_call_nudge: false,
             max_stop_blocks: 8,
             error_loop_threshold: 3,
             enforce_output_schemas: false,
@@ -1780,6 +1782,7 @@ mod tests {
             consult_handlers: std::collections::HashMap::new(),
             registry: crate::ExecutionRegistry::builder().agent("", agent).build(),
             escalation_mode: crate::EscalationMode::SurfaceToHuman,
+            tool_search: None,
         }
     }
 }

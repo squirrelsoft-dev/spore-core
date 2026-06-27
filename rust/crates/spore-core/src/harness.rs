@@ -448,6 +448,14 @@ pub struct AgentRef(pub String);
 #[serde(transparent)]
 pub struct ToolsetRef(pub String);
 
+/// Reserved [`ToolsetRef`] handle that resolves to [`EmptyToolRegistry`] — the
+/// model is offered NO tools. Used by the PlanExecute plan-empty re-ask to force
+/// the planner to answer in message content instead of derailing into a tool
+/// call. The double-underscore makes a real consumer toolset name collision
+/// implausible; [`effective_tool_registry`](StandardHarness::effective_tool_registry)
+/// intercepts it before the catalogue lookup.
+pub const NO_TOOLS_TOOLSET: &str = "__none__";
+
 /// Per-node handle to a named output/evaluator schema. Serializes as a bare
 /// JSON string. Resolution lands with the registry slice (#120).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1253,6 +1261,19 @@ pub struct RunScratch {
     /// by the FIRST PlanExecute that reads it, so it never leaks into a nested
     /// per-task PlanExecute, which must plan fresh.
     pub continue_task_list: bool,
+    /// One-shot FORCED output schema for the immediate sub-run (the plan-empty
+    /// REPAIR re-ask, #139). When `Some`, the next [`ReactConfig::run`] uses it as
+    /// the leaf's `output_schema` REGARDLESS of the global `enforce_output_schemas`
+    /// flag — so the default path "trusts the model" (unconstrained), and only the
+    /// repair forces a schema-constrained (`response_format`) retry. Consumed
+    /// (`take`) by the leaf that reads it. `None` everywhere else → byte-identical.
+    pub forced_output_schema: Option<serde_json::Value>,
+    /// One-shot marker that the immediate sub-run is a PlanExecute EXECUTE step.
+    /// Set by the execute walk before `self.execute.run(cx)` and consumed by the
+    /// next [`ReactConfig::run`]. Scopes the behavioral tool-call nudge
+    /// ([`HarnessConfig::tool_call_nudge`]) to execute steps, so the plan-JSON turn
+    /// is never nudged for "no tool call". `false` everywhere else.
+    pub in_execute_step: bool,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -1354,6 +1375,9 @@ pub trait StrategyExecutor: Send + Sync {
         // to pre-SC-10). `Some` ⇒ this prompt REPLACES the global one for every turn
         // of this window, so the leaf sees ONLY its own prompt. Mirrors `toolset`.
         system_prompt: Option<String>,
+        // Whether this window is a PlanExecute EXECUTE step (scopes the behavioral
+        // tool-call nudge). `false` for plan/other leaves.
+        execute_step: bool,
     ) -> BoxFut<'a, RunResult>;
 
     /// Resolve an [`AgentRef`] to its registered agent (#124). The leaf and the
@@ -1450,6 +1474,9 @@ pub trait StrategyExecutor: Send + Sync {
         plan_session: SessionState,
         budget_used: BudgetSnapshot,
         on_stream: Option<StreamSink>,
+        // #139: a one-shot FORCED output schema for this sub-run (the plan-empty
+        // repair re-ask). `None` on the trusted first attempt — byte-identical.
+        forced_output_schema: Option<serde_json::Value>,
     ) -> BoxFut<'a, Option<RunResult>>;
 
     /// Reconcile a freshly-parsed task list against the DURABLE RunStore
@@ -1529,6 +1556,17 @@ pub trait StrategyExecutor: Send + Sync {
 
     /// The Ralph outer-loop reset cap (`config.max_resets`, #124).
     fn ralph_max_resets(&self) -> u32;
+
+    /// PlanExecute plan-empty re-ask cap: how many ADDITIONAL times the plan
+    /// phase re-asks the model for a usable plan — nudging it to emit the plan as
+    /// message CONTENT — before halting with [`HaltReason::EmptyPlan`]. `0` (the
+    /// default) preserves the historical behaviour: the first empty plan halts
+    /// immediately. Reasoning models that route their plan into the reasoning
+    /// channel (e.g. Qwen behind vLLM) leave the message content empty, so the
+    /// strict + prose capture yields no tasks; a small cap lets them recover.
+    fn plan_empty_max_retries(&self) -> u32 {
+        0
+    }
 
     /// Resolve the HillClimbing metric evaluator for `key` (#124, Q2), or
     /// `Err(RunResult)` with the misconfiguration failure when absent.
@@ -1681,14 +1719,20 @@ impl RunStrategy for ReactConfig {
             // delivery, no validation). The schema is canonicalized to compact
             // key-sorted JSON so its delivered/reported bytes are identical
             // across the four language ports.
-            let output_schema: Option<serde_json::Value> = if executor.enforce_output_schemas() {
-                self.output
-                    .as_ref()
-                    .and_then(|r| cx.registry.resolve_schema(r))
-                    .cloned()
-            } else {
-                None
-            };
+            // A FORCED schema (the plan-empty repair re-ask, #139) wins over the
+            // global enforce gate and is consumed one-shot; otherwise fall back to
+            // the normal `enforce_output_schemas` + `self.output` resolution.
+            let output_schema: Option<serde_json::Value> =
+                cx.scratch.forced_output_schema.take().or_else(|| {
+                    if executor.enforce_output_schemas() {
+                        self.output
+                            .as_ref()
+                            .and_then(|r| cx.registry.resolve_schema(r))
+                            .cloned()
+                    } else {
+                        None
+                    }
+                });
             let output_schema_max_retries = executor.output_schema_max_retries();
             if let Some(schema) = output_schema.as_ref() {
                 // AC1: append the resolved schema to the leaf's directive/system
@@ -1718,6 +1762,10 @@ JSON schema: {}",
             // live agent adapter forwards to, so token deltas carry attribution too.
             let agent_id = (!self.agent.0.is_empty()).then(|| self.agent.0.clone());
             let on_stream = wrap_node_sink(cx.stream.clone(), "react", agent_id);
+            // Consume the one-shot execute-step marker (set by the execute walk) so
+            // the behavioral tool-call nudge scopes to execute steps only and never
+            // leaks into a nested leaf.
+            let execute_step = std::mem::take(&mut cx.scratch.in_execute_step);
             let result = executor
                 .react_window(
                     task,
@@ -1737,6 +1785,7 @@ JSON schema: {}",
                     // SC-10: thread THIS leaf's per-node system-prompt override
                     // (None ⇒ the window keeps using the global prompt).
                     self.system_prompt.clone(),
+                    execute_step,
                 )
                 .await;
             executor.finalize(&result).await;
@@ -2016,100 +2065,172 @@ impl RunStrategy for PlanExecuteConfig {
                         .as_ref()
                         .is_none_or(|l| l.tasks.iter().all(|t| t.status != TaskStatus::InProgress));
                 let directive = executor.plan_directive(&task.instruction);
-                let mut plan_session = if plan_resume {
+                // The resume seed (if any) is consumed ONCE here; the re-ask loop
+                // below re-plans from this same base session each attempt.
+                let plan_base = if plan_resume {
                     resume_seed_session
                         .take()
                         .unwrap_or_else(|| base_session.clone())
                 } else {
                     base_session.clone()
                 };
-                executor
-                    .seed_user_message(&mut plan_session, &directive)
-                    .await;
-                // The plan phase runs under the plan sub-strategy's OWN declared
-                // budget (e.g. a ReAct `PerLoop{4}`); the global `max_turns` is only
-                // the outer backstop.
-                let plan_task = Task {
-                    id: task.id.clone(),
-                    instruction: directive,
-                    session_id: session_id.clone(),
-                    budget: task.budget.clone(),
-                    loop_strategy: (*self.plan).clone(),
-                };
-                let plan_result = executor
-                    .run_plan_subtree(
-                        &self.plan,
-                        plan_task,
-                        plan_session,
-                        budget_used.clone(),
-                        cx.stream.clone(),
-                    )
-                    .await;
-                let (plan_output, plan_usage, plan_turns) = match plan_result {
-                    Some(RunResult::Success {
-                        output,
-                        usage,
-                        turns,
-                        ..
-                    }) => (output, usage, turns),
-                    Some(other) => {
-                        cx.stream = on_stream;
-                        return cx.finish(executor, task, other).await;
+
+                // Plan-empty re-ask loop. A reasoning model can route its plan into
+                // the reasoning channel, leaving the message CONTENT empty so the
+                // strict + prose capture yields no tasks. Rather than halting on the
+                // FIRST empty plan, re-ask up to `plan_empty_max_retries` more times
+                // — nudging the planner to emit the plan as message content — before
+                // falling through to `EmptyPlan`. A cap of `0` (the default)
+                // preserves the historical single-shot behaviour byte-for-byte: the
+                // loop runs once and the `attempt >= max` guard fires immediately on
+                // an empty plan, with zero discarded usage to fold.
+                let plan_empty_max_retries = executor.plan_empty_max_retries();
+                // The re-ask runs with tools SUPPRESSED: a reasoning model offered
+                // the full toolset tends to derail into a tool call (or pure
+                // reasoning) instead of emitting the plan; with no tools it must
+                // answer in content. The first attempt keeps tools (it may research).
+                // Built ONLY when re-asks are enabled — at the default cap of `0` the
+                // loop is single-shot and this clone would be wasted (keeps the
+                // historical no-retry path byte-identical and allocation-free).
+                let retry_plan =
+                    (plan_empty_max_retries > 0).then(|| plan_with_tools_suppressed(&self.plan));
+                // Usage from discarded (empty) attempts, folded into whichever
+                // artifact terminates the loop so the carried budget counts them.
+                let mut discarded_usage = AggregateUsage::default();
+                let mut attempt: u32 = 0;
+                let (mut outcome, mut task_list) = loop {
+                    let active_plan: &LoopStrategy = if attempt == 0 {
+                        &self.plan
+                    } else {
+                        retry_plan.as_ref().unwrap_or(&self.plan)
+                    };
+                    // Per-attempt plan session: the seeded directive, plus — on a
+                    // retry — a corrective nudge demanding the plan as content.
+                    let mut plan_session = plan_base.clone();
+                    executor
+                        .seed_user_message(&mut plan_session, &directive)
+                        .await;
+                    if attempt > 0 {
+                        // The trailing `/no_think` is a soft thinking-suppression
+                        // hint: reasoning models that honor it (e.g. Qwen) stop
+                        // routing the plan into the reasoning channel and emit it as
+                        // content; models that don't simply ignore the token.
+                        let nudge = "Your previous response produced no usable plan \
+(no JSON object, and no tasks were authored). Output the plan NOW as a single JSON \
+object in your MESSAGE CONTENT: {\"tasks\": [<ordered step strings>], \"rationale\": \
+<string>}. Do NOT put the plan only in your reasoning, and do NOT call any tools. \
+/no_think";
+                        executor.seed_user_message(&mut plan_session, nudge).await;
                     }
-                    None => {
-                        cx.stream = on_stream;
-                        let result = RunResult::Failure {
-                            reason: HaltReason::PlanPhaseFailed {
-                                error: crate::plan::PlanPhaseError::PlanningTurnFailed {
-                                    message: "plan sub-strategy produced no terminal".into(),
+                    // The plan phase runs under the plan sub-strategy's OWN declared
+                    // budget (e.g. a ReAct `PerLoop{4}`); the global `max_turns` is
+                    // only the outer backstop.
+                    let plan_task = Task {
+                        id: task.id.clone(),
+                        instruction: directive.clone(),
+                        session_id: session_id.clone(),
+                        budget: task.budget.clone(),
+                        loop_strategy: active_plan.clone(),
+                    };
+                    // #139: the trusted first attempt runs UNCONSTRAINED; each
+                    // repair re-ask FORCES the plan schema (→ `response_format`), so
+                    // a model that answered in prose is now made to emit valid
+                    // `{tasks, rationale}` JSON.
+                    let forced_schema = (attempt > 0).then(plan_output_schema);
+                    let plan_result = executor
+                        .run_plan_subtree(
+                            active_plan,
+                            plan_task,
+                            plan_session,
+                            budget_used.clone(),
+                            cx.stream.clone(),
+                            forced_schema,
+                        )
+                        .await;
+                    let (plan_output, plan_usage, plan_turns) = match plan_result {
+                        Some(RunResult::Success {
+                            output,
+                            usage,
+                            turns,
+                            ..
+                        }) => (output, usage, turns),
+                        Some(other) => {
+                            cx.stream = on_stream.clone();
+                            return cx.finish(executor, task.clone(), other).await;
+                        }
+                        None => {
+                            cx.stream = on_stream.clone();
+                            let result = RunResult::Failure {
+                                reason: HaltReason::PlanPhaseFailed {
+                                    error: crate::plan::PlanPhaseError::PlanningTurnFailed {
+                                        message: "plan sub-strategy produced no terminal".into(),
+                                    },
                                 },
-                            },
+                                session_id: session_id.clone(),
+                                usage: AggregateUsage::default(),
+                                turns: budget_used.turns,
+                                session_state: SessionState::default(),
+                            };
+                            return cx.finish(executor, task.clone(), result).await;
+                        }
+                    };
+
+                    // Capture + persist the artifact from the plan child's output
+                    // (R3/R4/R11) — the harness-side machinery, no model turn.
+                    let outcome = match executor
+                        .capture_plan_artifact(&session_id, &plan_output, plan_usage, plan_turns)
+                        .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(failure) => {
+                            cx.stream = on_stream.clone();
+                            return cx.finish(executor, task.clone(), failure).await;
+                        }
+                    };
+
+                    // #126 decision C: the runnable task list comes from the
+                    // persisted `task_list` tool store (the ONE authoring path — it
+                    // can carry real blockers). Fall back to the linear plan-artifact
+                    // bridge only when nothing was authored via the tool (back-compat
+                    // with the #59/#124 plan-only path and its replay fixtures).
+                    let task_list = match executor.load_task_list(&session_id).await {
+                        Some(persisted) if !persisted.tasks.is_empty() => persisted,
+                        _ =>
+                        {
+                            #[allow(deprecated)]
+                            crate::tasklist::plan_artifact_to_task_list(&outcome.artifact)
+                        }
+                    };
+
+                    if !task_list.tasks.is_empty() {
+                        break (outcome, task_list);
+                    }
+
+                    // Empty plan: re-ask while attempts remain, else halt with
+                    // `EmptyPlan` (reporting every attempt's usage).
+                    if attempt >= plan_empty_max_retries {
+                        cx.stream = on_stream;
+                        let mut usage = outcome.usage;
+                        usage.input_tokens += discarded_usage.input_tokens;
+                        usage.output_tokens += discarded_usage.output_tokens;
+                        let result = RunResult::Failure {
+                            reason: HaltReason::EmptyPlan,
                             session_id,
-                            usage: AggregateUsage::default(),
-                            turns: budget_used.turns,
+                            usage,
+                            turns: outcome.turns,
                             session_state: SessionState::default(),
                         };
                         return cx.finish(executor, task, result).await;
                     }
+                    discarded_usage.input_tokens += outcome.usage.input_tokens;
+                    discarded_usage.output_tokens += outcome.usage.output_tokens;
+                    attempt += 1;
                 };
 
-                // Capture + persist the artifact from the plan child's output (R3/
-                // R4/R11) — the harness-side machinery, no model turn.
-                let outcome = match executor
-                    .capture_plan_artifact(&session_id, &plan_output, plan_usage, plan_turns)
-                    .await
-                {
-                    Ok(outcome) => outcome,
-                    Err(failure) => {
-                        cx.stream = on_stream;
-                        return cx.finish(executor, task, failure).await;
-                    }
-                };
-
-                // #126 decision C: the runnable task list comes from the persisted
-                // `task_list` tool store (the ONE authoring path — it can carry real
-                // blockers). Fall back to the linear plan-artifact bridge only when
-                // nothing was authored via the tool (back-compat with the #59/#124
-                // plan-only path and its replay fixtures).
-                let mut task_list = match executor.load_task_list(&session_id).await {
-                    Some(persisted) if !persisted.tasks.is_empty() => persisted,
-                    _ =>
-                    {
-                        #[allow(deprecated)]
-                        crate::tasklist::plan_artifact_to_task_list(&outcome.artifact)
-                    }
-                };
-                if task_list.tasks.is_empty() {
-                    cx.stream = on_stream;
-                    let result = RunResult::Failure {
-                        reason: HaltReason::EmptyPlan,
-                        session_id,
-                        usage: outcome.usage,
-                        turns: outcome.turns,
-                        session_state: SessionState::default(),
-                    };
-                    return cx.finish(executor, task, result).await;
-                }
+                // Fold any discarded-attempt usage into the successful artifact so
+                // the carried budget reflects EVERY plan turn that actually ran.
+                outcome.usage.input_tokens += discarded_usage.input_tokens;
+                outcome.usage.output_tokens += discarded_usage.output_tokens;
 
                 // #126 AC5: re-check the WHOLE graph for cycles at execute entry.
                 if task_list.has_cycle() {
@@ -2198,8 +2319,10 @@ impl RunStrategy for PlanExecuteConfig {
             };
             cx.push_budget(plan_policy, self.behavior.clone(), "plan_execute");
 
-            // Total positional count for the OnTaskAdvance hook (stable).
-            let total_tasks = task_list.tasks.len();
+            // Positional count for the OnTaskAdvance hook. No longer "stable": the
+            // execute agent can append tasks mid-walk via the `task_list` tool, so
+            // this is refreshed after each step reload below.
+            let mut total_tasks = task_list.tasks.len();
 
             // ── Phase 2: ready-set DAG walk (#126). ─────────────────────────
             //
@@ -2298,8 +2421,39 @@ impl RunStrategy for PlanExecuteConfig {
                 cx.scratch.task = Some(step_task);
                 cx.scratch.run_session = step_session;
                 cx.scratch.run_budget = carried.clone();
+                // Mark this as an EXECUTE step so the leaf's behavioral tool-call
+                // nudge applies — but ONLY when other tasks remain Pending. The
+                // FINAL task is the synthesis/report step, which legitimately calls
+                // no tools (it answers from the ledger); nudging it there discards a
+                // good report and pushes the model into unparseable "calls".
+                let more_tasks_pending = task_list
+                    .tasks
+                    .iter()
+                    .any(|t| t.status == TaskStatus::Pending);
+                cx.scratch.in_execute_step = more_tasks_pending;
                 let carried_before = carried.turns;
                 let step_outcome = self.execute.run(cx).await;
+
+                // The execute sub-strategy's agent may have mutated the SHARED
+                // durable task list during this step via the `task_list` tool
+                // (notably `add_task`) — that tool and this walk read/write the
+                // SAME project-namespaced RunStore key. Reload it before applying
+                // this step's outcome so those edits survive. The walk's own
+                // in-flight state is already on disk (the `InProgress` mark was
+                // persisted before the step ran), so the reloaded list is the
+                // UNION of "what the walk persisted" and "what the agent added";
+                // re-adopting it lets `next_ready` schedule the new tasks. WITHOUT
+                // this, the walk's stale in-memory copy would overwrite the agent's
+                // additions on the very next persist (mark-complete / cascade-block)
+                // and the added tasks would never run. `add` validates blockers at
+                // tool time (no self-block / unknown-id / cycle), so the merged
+                // graph stays acyclic — no re-check needed. No durable store ⇒
+                // `None` ⇒ keep the in-memory list (the agent couldn't have
+                // persisted anything either, so there is nothing to merge).
+                if let Some(reloaded) = executor.load_task_list(&session_id).await {
+                    task_list = reloaded;
+                    total_tasks = task_list.tasks.len();
+                }
 
                 // ── BudgetExhausted (#125 rule 4/7) — resolve THIS scope. ────
                 if let StrategyOutcome::BudgetExhausted {
@@ -3061,6 +3215,37 @@ fn worker_toolset_of(ls: &LoopStrategy) -> ToolsetRef {
         LoopStrategy::Ralph(c) => worker_toolset_of(&c.inner),
         LoopStrategy::HillClimbing(c) => worker_toolset_of(&c.inner),
     }
+}
+
+/// Clone `ls` with its driving leaf's ReAct toolset re-pointed at
+/// [`NO_TOOLS_TOOLSET`], so a plan re-ask run through it advertises NO tools and
+/// the planner is forced to answer in message content. Recurses into wrappers
+/// (the PLAN side of a nested `PlanExecute`).
+fn plan_with_tools_suppressed(ls: &LoopStrategy) -> LoopStrategy {
+    let mut cloned = ls.clone();
+    match &mut cloned {
+        LoopStrategy::ReAct(c) => c.toolset = ToolsetRef(NO_TOOLS_TOOLSET.to_string()),
+        LoopStrategy::PlanExecute(c) => *c.plan = plan_with_tools_suppressed(&c.plan),
+        LoopStrategy::SelfVerifying(c) => *c.inner = plan_with_tools_suppressed(&c.inner),
+        LoopStrategy::Ralph(c) => *c.inner = plan_with_tools_suppressed(&c.inner),
+        LoopStrategy::HillClimbing(c) => *c.inner = plan_with_tools_suppressed(&c.inner),
+    }
+    cloned
+}
+
+/// The JSON schema the plan-empty REPAIR forces on a re-ask (#139): the canonical
+/// `{ tasks: [string], rationale: string }` plan contract. Delivered as the
+/// OpenAI/vLLM `response_format` (or Ollama `format`) so the planner is
+/// guided-decoded into valid JSON instead of free prose.
+fn plan_output_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "tasks": { "type": "array", "items": { "type": "string" } },
+            "rationale": { "type": "string" }
+        },
+        "required": ["tasks", "rationale"]
+    })
 }
 
 impl RunStrategy for RalphConfig {
@@ -4076,6 +4261,20 @@ fn grant_strategy_budget(ls: &mut LoopStrategy, granted: u32) {
     }
 }
 
+/// The `(is_error, content)` view a [`ToolOutput`] surfaces on the coarse
+/// [`StreamEvent::ToolResult`] (issue #103, Q5). Mirrors the per-call derivation
+/// at the initial emit site so the AfterTool re-emit (SC-9 stream parity) snapshots
+/// and compares the SAME projection — by the time `fire_after_tool` runs, every
+/// output is a `Success` or `Error` (the pause/escalate variants returned earlier),
+/// so the catch-all is defensive (`false`, empty) and never taken on that path.
+fn stream_view(output: &ToolOutput) -> (bool, String) {
+    match output {
+        ToolOutput::Success { content, .. } => (false, content.clone()),
+        ToolOutput::Error { message, .. } => (true, message.clone()),
+        _ => (false, String::new()),
+    }
+}
+
 /// Translate a terminal [`RunResult`] into a [`StrategyOutcome`] (#124, Q5):
 /// `Success → Complete(output)`, every non-success terminal → `Failed`. A
 /// `BudgetExceeded` failure maps to `Failed` here (the budget-enforcement
@@ -4245,6 +4444,16 @@ pub enum StreamEvent {
         /// pre-#103 serialized events back-compatible.
         #[serde(default)]
         content: String,
+        /// `true` when this event REPLACES a `ToolResult` already emitted for the
+        /// same `call_id` because an `AfterTool` middleware rewrote the result in
+        /// place (`ContinueWithModification`, issue #11 / SC-9). The model side is
+        /// patched via [`ContextManager::replace_tool_result`]; this is the
+        /// symmetric stream-side signal so consumers correct the displayed result
+        /// instead of double-counting it as a second call. `#[serde(default)]`
+        /// keeps consumers that ignore the field back-compatible — they simply see
+        /// the corrected content, which is strictly better than the stale one.
+        #[serde(default)]
+        revised: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         node: Option<NodeAttr>,
     },
@@ -6682,6 +6891,18 @@ pub struct HarnessConfig {
     /// Maximum number of repair-and-re-dispatch attempts per tool call.
     /// Defaults to `1`. Ignored when `tool_call_repair` is `None`.
     pub max_repair_attempts: u32,
+    /// PlanExecute plan-empty re-ask cap (see
+    /// [`StrategyExecutor::plan_empty_max_retries`]). `0` (default) halts on the
+    /// first empty plan; higher values re-ask the planner that many times for the
+    /// plan as message content before `EmptyPlan`.
+    pub plan_empty_max_retries: u32,
+    /// Conservative tool-call nudge: when a turn advertises tools but the model
+    /// answers in ACTION-INTENT prose ("I'll list the directory…") WITHOUT calling
+    /// a tool, nudge it to actually emit the call and force one more turn (bounded
+    /// per window). Unlike [`prompt_tool_call_flag`](Self::prompt_tool_call_flag)
+    /// it does NOT switch the model to prompt-based tool calling — it only corrects
+    /// narrate-instead-of-act. `false` (default) is byte-identical.
+    pub tool_call_nudge: bool,
     /// Maximum number of consecutive Stop-hook blocks within a single `run()`
     /// before the loop terminates anyway (issue #69, Decision 4/5). The
     /// counter is PER-RUN — it resets on every `run()` call, so a resumed
@@ -6877,6 +7098,13 @@ pub struct HarnessConfig {
     /// slice — consumed in #130. Builder defaults to
     /// [`EscalationMode::SurfaceToHuman`].
     pub escalation_mode: EscalationMode,
+    /// Optional deferred-tool exposure (issue: native-tool-calling description
+    /// cliff / MCP scale). When `Some`, the resolved catalogue registry is wrapped
+    /// in a [`ToolSearchRegistry`](crate::tool_registry::ToolSearchRegistry): only
+    /// the configured core set + a `tool_search` meta-tool are advertised up front,
+    /// and the model loads the rest of the catalogue on demand. `None` (the
+    /// default) advertises the full catalogue, byte-for-byte today's behaviour.
+    pub tool_search: Option<crate::tool_registry::ToolSearchConfig>,
 }
 
 impl Clone for HarnessConfig {
@@ -6895,6 +7123,8 @@ impl Clone for HarnessConfig {
             content_capture: self.content_capture,
             tool_call_repair: self.tool_call_repair.clone(),
             max_repair_attempts: self.max_repair_attempts,
+            plan_empty_max_retries: self.plan_empty_max_retries,
+            tool_call_nudge: self.tool_call_nudge,
             max_stop_blocks: self.max_stop_blocks,
             error_loop_threshold: self.error_loop_threshold,
             enforce_output_schemas: self.enforce_output_schemas,
@@ -6917,6 +7147,7 @@ impl Clone for HarnessConfig {
             consult_handlers: self.consult_handlers.clone(),
             registry: self.registry.clone(),
             escalation_mode: self.escalation_mode.clone(),
+            tool_search: self.tool_search.clone(),
         }
     }
 }
@@ -6961,6 +7192,8 @@ pub struct HarnessBuilder {
     content_capture: ContentCaptureConfig,
     tool_call_repair: Option<Arc<dyn ToolCallRepair>>,
     max_repair_attempts: u32,
+    plan_empty_max_retries: u32,
+    tool_call_nudge: bool,
     max_stop_blocks: u32,
     /// Consecutive-recoverable-tool-error breaker threshold `N` (issue #137).
     /// Defaults to `3`. See [`HarnessConfig::error_loop_threshold`].
@@ -7050,6 +7283,9 @@ pub struct HarnessBuilder {
     /// [`EscalationMode::SurfaceToHuman`]. See
     /// [`escalation_mode`](HarnessBuilder::escalation_mode).
     escalation_mode: EscalationMode,
+    /// Optional deferred-tool exposure. `None` (the default) advertises the full
+    /// catalogue. See [`tool_search`](HarnessBuilder::tool_search).
+    tool_search: Option<crate::tool_registry::ToolSearchConfig>,
 }
 
 impl HarnessBuilder {
@@ -7077,6 +7313,8 @@ impl HarnessBuilder {
             content_capture: ContentCaptureConfig::default(),
             tool_call_repair: None,
             max_repair_attempts: 1,
+            plan_empty_max_retries: 0,
+            tool_call_nudge: false,
             max_stop_blocks: 8,
             error_loop_threshold: 3,
             enforce_output_schemas: false,
@@ -7101,6 +7339,7 @@ impl HarnessBuilder {
             consult_handlers: std::collections::HashMap::new(),
             registry: ExecutionRegistry::empty(),
             escalation_mode: EscalationMode::SurfaceToHuman,
+            tool_search: None,
         }
     }
 
@@ -7812,6 +8051,35 @@ impl HarnessBuilder {
         self
     }
 
+    /// Set the PlanExecute plan-empty re-ask cap (see
+    /// [`StrategyExecutor::plan_empty_max_retries`]). `0` (default) halts on the
+    /// first empty plan; `n > 0` re-asks the planner up to `n` more times for the
+    /// plan as message content before `EmptyPlan`.
+    pub fn plan_empty_max_retries(mut self, retries: u32) -> Self {
+        self.plan_empty_max_retries = retries;
+        self
+    }
+
+    /// Enable the conservative tool-call nudge (see
+    /// [`HarnessConfig::tool_call_nudge`]): nudge a model that narrates an action
+    /// in prose without calling a tool, and force one more turn. Does NOT switch to
+    /// prompt-based tool calling. `false` (default) is byte-identical.
+    pub fn tool_call_nudge(mut self, on: bool) -> Self {
+        self.tool_call_nudge = on;
+        self
+    }
+
+    /// Enable deferred-tool exposure (see
+    /// [`ToolSearchConfig`](crate::tool_registry::ToolSearchConfig)): advertise
+    /// only the configured core tools + a `tool_search` meta-tool, and let the
+    /// model load the rest of the catalogue on demand. Keeps the advertised
+    /// description prose below a local model's native-tool-calling cliff at
+    /// catalogue scale. `None` (default) advertises the full catalogue.
+    pub fn tool_search(mut self, config: crate::tool_registry::ToolSearchConfig) -> Self {
+        self.tool_search = Some(config);
+        self
+    }
+
     /// Inject a post-compaction verifier (issue #46). Defaults to
     /// [`KeyTermVerifier`].
     pub fn compaction_verifier(mut self, verifier: Arc<dyn CompactionVerifier>) -> Self {
@@ -7959,6 +8227,8 @@ impl HarnessBuilder {
             content_capture: self.content_capture,
             tool_call_repair: self.tool_call_repair,
             max_repair_attempts: self.max_repair_attempts,
+            plan_empty_max_retries: self.plan_empty_max_retries,
+            tool_call_nudge: self.tool_call_nudge,
             max_stop_blocks: self.max_stop_blocks,
             error_loop_threshold: self.error_loop_threshold,
             enforce_output_schemas: self.enforce_output_schemas,
@@ -7983,6 +8253,7 @@ impl HarnessBuilder {
             consult_handlers: self.consult_handlers,
             registry,
             escalation_mode: self.escalation_mode,
+            tool_search: self.tool_search,
         }
     }
 
@@ -8546,6 +8817,8 @@ impl StandardHarness {
                 // override (only the recursive `ReactConfig::run` does) ⇒ the
                 // window uses the global `config.system_prompt`, byte-identical.
                 None,
+                // Legacy wrapper is not a PlanExecute execute step.
+                false,
             )
             .await;
         match &result {
@@ -8600,30 +8873,48 @@ impl StandardHarness {
         session_id: &SessionId,
         toolset: &ToolsetRef,
     ) -> Arc<dyn ToolRegistry> {
+        // Reserved handle: advertise NO tools (plan-empty re-ask). Intercepted
+        // before the catalogue lookup so it never falls through to the full
+        // registry. Dispatch is unreachable — the model is offered nothing.
+        if toolset.0 == NO_TOOLS_TOOLSET {
+            return Arc::new(EmptyToolRegistry);
+        }
         // Strict per-node scoping: a non-empty handle with its own catalogue.
         if !toolset.0.is_empty() {
             if let Some(catalogue) = self.config.toolset_catalogues.get(&toolset.0) {
-                return Arc::new(crate::tool_registry::RealToolRegistry::new(
+                return self.maybe_tool_search(Arc::new(crate::tool_registry::RealToolRegistry::new(
                     catalogue.clone(),
                     self.config.sandbox.clone(),
                     session_id.clone(),
                     self.config.project_id.clone(),
                     self.config.storage.run().clone(),
                     self.config.storage.memory().clone(),
-                ));
+                )));
             }
         }
         // Fallback: empty handle (back-compat) or unregistered non-empty handle.
         match &self.config.catalogue_registry {
-            Some(catalogue) => Arc::new(crate::tool_registry::RealToolRegistry::new(
+            Some(catalogue) => self.maybe_tool_search(Arc::new(crate::tool_registry::RealToolRegistry::new(
                 catalogue.clone(),
                 self.config.sandbox.clone(),
                 session_id.clone(),
                 self.config.project_id.clone(),
                 self.config.storage.run().clone(),
                 self.config.storage.memory().clone(),
-            )),
+            ))),
             None => self.config.tool_registry.clone(),
+        }
+    }
+
+    /// Wrap a resolved catalogue registry in a
+    /// [`ToolSearchRegistry`](crate::tool_registry::ToolSearchRegistry) when
+    /// [`HarnessConfig::tool_search`] is configured; otherwise return it unchanged.
+    /// Built per turn-loop window (alongside the registry it wraps), so a searched
+    /// tool stays loaded for the rest of the window and resets on the next.
+    fn maybe_tool_search(&self, reg: Arc<dyn ToolRegistry>) -> Arc<dyn ToolRegistry> {
+        match &self.config.tool_search {
+            Some(cfg) => Arc::new(crate::tool_registry::ToolSearchRegistry::new(reg, cfg.clone())),
+            None => reg,
         }
     }
 
@@ -8660,6 +8951,9 @@ impl StandardHarness {
         // sees ONLY its own prompt (the per-leaf prompt half of SC-10; the toolset
         // half is the `toolset` arg above).
         system_prompt: Option<String>,
+        // Whether this window is a PlanExecute EXECUTE step — scopes the behavioral
+        // tool-call nudge so the plan-JSON / synthesis turns are not nudged.
+        execute_step: bool,
     ) -> RunResult {
         let session_id = task.session_id.clone();
         // Resolve the effective tool registry once per turn-loop window (all
@@ -8709,6 +9003,13 @@ impl StandardHarness {
             Some(t) => t.min(max_iterations),
             None => max_iterations,
         };
+        // Per-window cap for the behavioral tool-call nudge (see
+        // `HarnessConfig::tool_call_nudge`) so a model that keeps answering without
+        // acting can't loop forever, plus a count of tools actually called this
+        // window — the signal is "execute turn finished having called ZERO tools".
+        const MAX_TOOL_CALL_NUDGES: u32 = 2;
+        let mut tool_call_nudges_used: u32 = 0;
+        let mut tools_called_this_window: u32 = 0;
 
         loop {
             // Layer-1 budget gates before the turn.
@@ -8949,6 +9250,7 @@ impl StandardHarness {
                     }
                     TurnResult::Error { .. } => (StopReason::EndTurn, 0),
                 };
+                tools_called_this_window += tool_calls_requested;
                 let mut base = SpanBase::new_root(
                     SpanId::new(format!(
                         "{}-turn-{}",
@@ -9042,27 +9344,48 @@ impl StandardHarness {
                     budget_used.input_tokens += u.input_tokens as u64;
                     budget_used.output_tokens += u.output_tokens as u64;
 
-                    // Adaptive prompt-based tool-calling escalation. When tools
-                    // were advertised but the model answered in prose with
-                    // action-intent language (it *meant* to act), classify the
-                    // turn as a `ProseResponse` failure and escalate: set the
-                    // session flag so the wrapped model switches to prompt-based
-                    // tool calling, nudge the model, and force another turn
-                    // instead of completing. Guarded on the flag being unset so
-                    // it fires at most once per window (bounded — one extra
-                    // turn) and only on the `conversational` adaptive path.
+                    // Adaptive prompt-based tool-calling escalation. Two signals,
+                    // both meaning "tools were available but the model produced NO
+                    // native tool call":
+                    //   (a) PHRASE — the prose carries action-intent language ("I'll
+                    //       read …"), so it *meant* to act. Always active; cheap and
+                    //       conservative (biased to false negatives). This is the
+                    //       original trigger and is unchanged for every consumer.
+                    //   (b) STRUCTURAL — an EXECUTE step reached a terminal answer
+                    //       having called ZERO tools while tools were advertised and
+                    //       no output schema constrained it. This is a behavioral
+                    //       signal (no phrase-matching) that catches the failure modes
+                    //       the phrase list misses: markdown command fences
+                    //       (```bash\ncat …```), bare narration, and empty content —
+                    //       exactly how Qwen drops out of native tool-call mode at the
+                    //       cold start of an isolated execute sub-session. Gated on
+                    //       `tool_call_nudge` so it ONLY affects consumers that opted
+                    //       into behavioral repair (local models); native-tool models
+                    //       (Claude, …) keep phrase-only behavior and never flip the
+                    //       flag on a legitimately tool-free turn.
+                    // On either signal: set the session flag so the wrapped model
+                    // switches to prompt-based tool calling (the next request describes
+                    // the tools in the system prompt and clears the native channel),
+                    // nudge the model, and force another turn instead of completing.
+                    // Guarded on the flag being unset so it fires at most once per
+                    // window (bounded — one extra turn) and only on the
+                    // `conversational` adaptive path.
                     if let Some(flag) = self.config.prompt_tool_call_flag.as_ref() {
                         let already_escalated = flag.load(std::sync::atomic::Ordering::Acquire);
-                        if !already_escalated
-                            && crate::tool_call_repair::detect_prose_response(
-                                &content,
-                                tools_advertised,
-                            )
-                            .is_some()
-                        {
+                        let phrase = crate::tool_call_repair::detect_prose_response(
+                            &content,
+                            tools_advertised,
+                        )
+                        .is_some();
+                        let structural = self.config.tool_call_nudge
+                            && execute_step
+                            && tools_advertised
+                            && tools_called_this_window == 0
+                            && output_schema.is_none();
+                        if !already_escalated && (phrase || structural) {
                             flag.store(true, std::sync::atomic::Ordering::Release);
-                            // Record the model's prose, then a corrective nudge,
-                            // so the next turn has coherent context.
+                            // Record the model's last (failed) output, then a
+                            // corrective nudge, so the next turn has coherent context.
                             let assistant = Message {
                                 role: Role::Assistant,
                                 content: Content::Text {
@@ -9073,8 +9396,10 @@ impl StandardHarness {
                                 .context_manager
                                 .append_assistant_message(&mut session_state, &assistant)
                                 .await;
-                            let nudge = "You described an action but did not call a \
-tool. Use the provided tool-call format to actually invoke the tool."
+                            let nudge = "No tool call was detected in your last \
+response. The tools available to you and the exact tool-call format are described in \
+the system prompt — use that format now to actually invoke a tool, not prose or a code \
+block."
                                 .to_string();
                             self.config
                                 .context_manager
@@ -9082,6 +9407,47 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                 .await;
                             continue;
                         }
+                    }
+
+                    // Behavioral tool-call nudge (opt-in via `tool_call_nudge`). This
+                    // does NOT inspect the response text for phrases — it keys on
+                    // ACTION: an EXECUTE-phase task window finished (a terminal
+                    // answer) having called ZERO tools while tools were advertised,
+                    // i.e. the model "reported findings" without ever reading
+                    // anything. Record that answer, nudge it to actually use a tool
+                    // before reporting, and force another turn. Scoped to execute
+                    // steps so the legitimately tool-free plan-JSON turn is untouched,
+                    // skips schema-constrained turns, and bounded per window so a
+                    // model that refuses to act can't loop. Off (default) →
+                    // byte-identical.
+                    if self.config.tool_call_nudge
+                        && execute_step
+                        && tools_advertised
+                        && tools_called_this_window == 0
+                        && output_schema.is_none()
+                        && tool_call_nudges_used < MAX_TOOL_CALL_NUDGES
+                    {
+                        tool_call_nudges_used += 1;
+                        let assistant = Message {
+                            role: Role::Assistant,
+                            content: Content::Text {
+                                text: content.clone(),
+                            },
+                        };
+                        self.config
+                            .context_manager
+                            .append_assistant_message(&mut session_state, &assistant)
+                            .await;
+                        let nudge = "You have not called any tool yet, so you have not \
+actually inspected anything — your answer would be guessed, not grounded. Use the \
+available tools (list_dir, read_file, grep, …) to gather the real data NOW, then \
+report only what the tools returned."
+                            .to_string();
+                        self.config
+                            .context_manager
+                            .append_user_message(&mut session_state, &nudge)
+                            .await;
+                        continue;
                     }
 
                     if let Some(mw) = self.config.middleware.as_ref() {
@@ -9479,6 +9845,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                     is_error: true,
                                     // Q5: carry the result content.
                                     content: format!("sandbox: {violation:?}"),
+                                    revised: false,
                                     node: None,
                                 },
                             );
@@ -10077,6 +10444,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                 call_id: call.id.clone(),
                                 is_error,
                                 content: result_content,
+                                revised: false,
                                 node: None,
                             },
                         );
@@ -10108,16 +10476,43 @@ tool. Use the provided tool-call format to actually invoke the tool."
                     // model-visible error (or vice versa) without the tool itself
                     // having to invert its output.
                     if let Some(mw) = self.config.middleware.as_ref() {
+                        // Snapshot each result's stream view BEFORE the chain runs,
+                        // so on `ContinueWithModification` we re-emit ONLY the ones
+                        // it actually rewrote.
+                        let pre_views: Vec<(bool, String)> =
+                            approved_results.iter().map(|r| stream_view(&r.output)).collect();
                         match mw.fire_after_tool(&calls, &mut approved_results).await {
                             MiddlewareDecision::Continue => {}
                             MiddlewareDecision::ContinueWithModification => {
-                                for (res, &idx) in
-                                    approved_results.iter().zip(result_msg_indices.iter())
+                                for ((res, &idx), pre) in approved_results
+                                    .iter()
+                                    .zip(result_msg_indices.iter())
+                                    .zip(pre_views.iter())
                                 {
                                     self.config
                                         .context_manager
                                         .replace_tool_result(&mut session_state, idx, res)
                                         .await;
+                                    // Symmetric stream-side correction: the model
+                                    // side was patched above, but the `ToolResult`
+                                    // already on the stream still shows the stale
+                                    // content. Re-emit with `revised: true` ONLY for
+                                    // results the chain actually changed, so consumers
+                                    // correct in place rather than double-count by
+                                    // `call_id`.
+                                    let (is_error, content) = stream_view(&res.output);
+                                    if is_error != pre.0 || content != pre.1 {
+                                        Self::emit(
+                                            &on_stream,
+                                            StreamEvent::ToolResult {
+                                                call_id: res.call_id.clone(),
+                                                is_error,
+                                                content,
+                                                revised: true,
+                                                node: None,
+                                            },
+                                        );
+                                    }
                                 }
                             }
                             MiddlewareDecision::Halt { reason } => {
@@ -11308,6 +11703,7 @@ impl StrategyExecutor for StandardHarness {
         output_schema: Option<serde_json::Value>,
         output_schema_max_retries: u32,
         system_prompt: Option<String>,
+        execute_step: bool,
     ) -> BoxFut<'a, RunResult> {
         Box::pin(async move {
             self.run_react_inner(
@@ -11321,6 +11717,7 @@ impl StrategyExecutor for StandardHarness {
                 output_schema,
                 output_schema_max_retries,
                 system_prompt,
+                execute_step,
             )
             .await
         })
@@ -11412,6 +11809,10 @@ impl StrategyExecutor for StandardHarness {
         StandardHarness::plan_directive(instruction)
     }
 
+    fn plan_empty_max_retries(&self) -> u32 {
+        self.config.plan_empty_max_retries
+    }
+
     fn run_plan_subtree<'a>(
         &'a self,
         plan: &'a LoopStrategy,
@@ -11419,6 +11820,7 @@ impl StrategyExecutor for StandardHarness {
         plan_session: SessionState,
         budget_used: BudgetSnapshot,
         on_stream: Option<StreamSink>,
+        forced_output_schema: Option<serde_json::Value>,
     ) -> BoxFut<'a, Option<RunResult>> {
         Box::pin(async move {
             // #124 Q1: the planner concept is DROPPED — the plan child's leaf
@@ -11432,6 +11834,8 @@ impl StrategyExecutor for StandardHarness {
             cx.scratch.run_session = plan_session;
             cx.scratch.run_budget = budget_used;
             cx.scratch.task = Some(plan_task);
+            // #139: forced schema for the repair re-ask (consumed by the leaf).
+            cx.scratch.forced_output_schema = forced_output_schema;
             let _ = plan.run(&mut cx).await;
             cx.scratch.terminal_override.take()
         })
@@ -12847,6 +13251,7 @@ impl StandardHarness {
                                 ToolOutput::Error { message, .. } => message.clone(),
                                 _ => String::new(),
                             },
+                            revised: false,
                             node: None,
                         },
                     );
@@ -12885,6 +13290,7 @@ impl StandardHarness {
                                 ToolOutput::Error { message, .. } => message.clone(),
                                 _ => String::new(),
                             },
+                            revised: false,
                             node: None,
                         },
                     );
@@ -14162,6 +14568,7 @@ impl StandardHarness {
                 plan_session,
                 budget_used.clone(),
                 None,
+                None,
             )
             .await;
         let (plan_output, usage, turns) = match plan_result {
@@ -14619,6 +15026,8 @@ mod tests {
             content_capture: ContentCaptureConfig::default(),
             tool_call_repair: None,
             max_repair_attempts: 1,
+            plan_empty_max_retries: 0,
+            tool_call_nudge: false,
             max_stop_blocks: 8,
             error_loop_threshold: 3,
             // #139: OFF by default in the shared test config (migration gate),
@@ -14657,6 +15066,7 @@ mod tests {
             // behavior. The new HITL pause path is exercised by tests that build a
             // `SurfaceToHuman` config explicitly (see `surface_config` below).
             escalation_mode: EscalationMode::Autonomous,
+            tool_search: None,
         }
     }
 
@@ -16197,6 +16607,87 @@ mod tests {
             }
             other => panic!("expected Success, got {other:?}"),
         }
+    }
+
+    // SC-9 stream parity: when an AfterTool middleware rewrites a result
+    // (`ContinueWithModification`), the event stream must reflect it — the
+    // original `ToolResult` was already emitted PRE-middleware, so a second
+    // `ToolResult { revised: true }` carries the correction. Consumers key on
+    // `call_id` + `revised` to update in place instead of double-counting.
+    #[tokio::test]
+    async fn after_tool_rewrite_re_emits_revised_stream_event() {
+        let a = make_agent();
+        a.push(TurnResult::ToolCallRequested {
+            reasoning: None,
+            calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+            }],
+            usage: usage(),
+        });
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: "done".into(),
+            usage: usage(),
+        });
+        let mut cfg = standard_config(a);
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::Success {
+            content: "ORIGINAL".into(),
+            truncated: false,
+        });
+        cfg.tool_registry = reg;
+        let chain = StandardMiddlewareChain::new();
+        chain
+            .register(Box::new(RewriteFirstResultMw {
+                to: "REWRITTEN".into(),
+            }))
+            .unwrap();
+        cfg.middleware = Some(Arc::new(chain));
+        let h = StandardHarness::new(cfg);
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let opts = HarnessRunOptions::new(react(5))
+            .with_stream(Box::new(move |ev| sink.lock().unwrap().push(ev)));
+        match h.run(opts).await {
+            RunResult::Success { .. } => {}
+            other => panic!("expected Success, got {other:?}"),
+        }
+
+        // Only the events for our call, projected to (is_error, content, revised).
+        let results: Vec<(bool, String, bool)> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolResult {
+                    call_id,
+                    is_error,
+                    content,
+                    revised,
+                    ..
+                } if call_id == "c1" => Some((*is_error, content.clone(), *revised)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            results.len(),
+            2,
+            "expected the pre-middleware result plus one revised re-emit, got {results:?}"
+        );
+        assert_eq!(
+            results[0],
+            (false, "ORIGINAL".to_string(), false),
+            "first event is the original, un-revised success"
+        );
+        assert_eq!(
+            results[1],
+            (true, "REWRITTEN".to_string(), true),
+            "second event carries the rewrite, flagged revised"
+        );
     }
 
     /// Tool registry that records every dispatched call and echoes success.
@@ -19275,6 +19766,82 @@ mod tests {
         );
     }
 
+    // The execute agent can ADD tasks mid-walk via the `task_list` tool, and the
+    // executor SCHEDULES them instead of clobbering them. The tool and the walk
+    // share ONE project-namespaced RunStore blob; before the reload fix the
+    // executor's stale in-memory list overwrote the agent's addition on the
+    // mark-complete persist, so `next_ready` never saw it. Uses a REAL in-memory
+    // store + the REAL `task_list` tool (per [[noop-store-silently-disables-durable-behavior]],
+    // a fake path would assert the opposite while passing).
+    #[tokio::test]
+    async fn execute_agent_can_add_tasks_midwalk() {
+        use crate::tools::StandardTools;
+        let a = make_agent();
+        // Task 1: call `task_list` add_task (appends task 2), then finish.
+        a.push(TurnResult::ToolCallRequested {
+            calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "task_list".into(),
+                input: serde_json::json!({
+                    "action": "add_task",
+                    "description": "added by agent",
+                }),
+            }],
+            usage: usage(),
+            reasoning: None,
+        });
+        a.push(final_resp("did 1"));
+        // Task 2 (the agent-added one): finish.
+        a.push(final_resp("did 2"));
+
+        let session = SessionId::new("s1");
+        let cfg = catalogue_builder(a.clone())
+            .tool(StandardTools::task_list())
+            // The plan leaf is a structured slot (react_structured) — register the
+            // default-handle output schema it validates against.
+            .registry_schema("", serde_json::json!({}))
+            .build_config();
+        let h = StandardHarness::new(cfg);
+
+        // Pre-seed a single task so the plan phase is skipped (continuation).
+        let mut tl = TaskList::default();
+        tl.add("first".into(), vec![]).unwrap(); // id 1
+        h.persist_task_list(&session, &tl).await;
+
+        match h
+            .run(HarnessRunOptions::new(plan_task()).continue_task_list(true))
+            .await
+        {
+            // The agent-added task 2 RAN and was the last to complete.
+            RunResult::Success { output, .. } => {
+                assert_eq!(output, "did 2", "the agent-added task must execute")
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+
+        // Both tasks are Completed in the shared durable store — the addition was
+        // NOT clobbered by the executor's mark-complete persist.
+        let stored = h
+            .load_task_list(&session)
+            .await
+            .expect("task list persisted");
+        assert_eq!(stored.tasks.len(), 2, "the added task survived: {stored:?}");
+        assert!(
+            stored.tasks.iter().all(|t| t.status == TaskStatus::Completed),
+            "both tasks complete: {stored:?}"
+        );
+        assert_eq!(
+            stored.tasks[1].description, "added by agent",
+            "the second task is the one the agent appended"
+        );
+        // 3 agent turns total: task 1 (tool call + final) + task 2 (final).
+        assert_eq!(
+            a.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the agent-added task ran (3 total turns)"
+        );
+    }
+
     // ========================================================================
     // #126 PlanExecute DAG executor — AC1/AC2/AC4/AC5 + ledger + Tier-1 lean
     // ========================================================================
@@ -20266,6 +20833,8 @@ mod tests {
                 content_capture: ContentCaptureConfig::default(),
                 tool_call_repair: None,
                 max_repair_attempts: 1,
+                plan_empty_max_retries: 0,
+                tool_call_nudge: false,
                 max_stop_blocks: 8,
                 error_loop_threshold: 3,
                 enforce_output_schemas: false,
@@ -20288,6 +20857,7 @@ mod tests {
                 consult_handlers: std::collections::HashMap::new(),
                 registry: ExecutionRegistry::builder().agent("", worker).build(),
                 escalation_mode: EscalationMode::SurfaceToHuman,
+                tool_search: None,
             })
         }
 

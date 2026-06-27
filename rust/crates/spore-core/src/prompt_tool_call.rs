@@ -39,7 +39,7 @@ use std::sync::OnceLock;
 use crate::harness::BoxFut;
 use crate::model::{
     Content, ContentBlock, Message, ModelError, ModelInterface, ModelRequest, ModelResponse,
-    ModelStream, ProviderInfo, Role, StopReason, StreamEvent, TokenUsage, ToolCall, ToolSchema,
+    ModelStream, ProviderInfo, Role, StopReason, StreamEvent, ToolCall, ToolSchema,
 };
 
 /// Sentinel that marks an already-injected tool-prompt block. Used to make
@@ -84,15 +84,26 @@ normally in prose.",
     s
 }
 
-/// Append the tool-definition block to a request's system prompt, in place.
+/// Append the tool-definition block to a request's system prompt, in place, and
+/// clear the request's native `tools` array.
 ///
 /// - No-op when the request advertises no tools (nothing to describe).
 /// - Idempotent: if a system message already contains the
-///   [`TOOLS_BLOCK_OPEN`] sentinel, nothing is appended (so wrapping a wrapper
-///   does not double-inject).
+///   [`TOOLS_BLOCK_OPEN`] sentinel, the block is not appended a second time (so
+///   wrapping a wrapper does not double-inject).
 /// - Appends to an existing leading [`Role::System`] text message when present,
 ///   otherwise inserts a new one at the front — never clobbering the caller's
 ///   system prompt.
+/// - **Clears `request.tools`.** Prompt-based tool calling SUPERSEDES the native
+///   channel: the tools are now described in the system prompt and the model is
+///   asked to emit `<tool_call>` markers as plain text. Leaving the native
+///   `tools` array populated would make the provider ALSO render its own
+///   (different) tool-call format from the chat template — two conflicting
+///   formats in one request — and, for servers that run a native tool-call
+///   parser (e.g. vLLM `qwen3_coder`), would route the model's output through
+///   that parser instead of letting our markers pass through as text for
+///   [`parse_prose_response`] to read. Clearing makes the prompt block the SOLE
+///   tool interface.
 pub fn inject_tool_prompt(request: &mut ModelRequest) {
     if request.tools.is_empty() {
         return;
@@ -104,11 +115,13 @@ pub fn inject_tool_prompt(request: &mut ModelRequest) {
             role: Role::System,
             content: Content::Text { text },
         }) => {
-            if text.contains(TOOLS_BLOCK_OPEN) {
-                return; // already injected — idempotent.
+            // Append unless already present (idempotent); either way the native
+            // tools are cleared below so the invariant "block present ⇒ no native
+            // tools" always holds.
+            if !text.contains(TOOLS_BLOCK_OPEN) {
+                text.push_str("\n\n");
+                text.push_str(&block);
             }
-            text.push_str("\n\n");
-            text.push_str(&block);
         }
         _ => {
             request.messages.insert(
@@ -120,41 +133,106 @@ pub fn inject_tool_prompt(request: &mut ModelRequest) {
             );
         }
     }
+
+    request.tools.clear();
 }
 
 // ============================================================================
 // Response parsing
 // ============================================================================
 
-/// Extract `(name, input)` pairs from `<tool_call>` markers in model text.
+/// Extract `(name, input)` pairs from `<tool_call>` blocks in model text.
 ///
-/// A marker is `<tool_call><name>..</name><input>{json}</input></tool_call>`.
-/// Markers whose `<input>` is not valid JSON are skipped (the caller decides
-/// what to do when nothing parses). Supports multiple markers in one response.
+/// One LENIENT pass, because Qwen-family models do not commit to a single
+/// encoding inside a `<tool_call>` — even when asked for the injected one they
+/// interleave it with their trained `qwen3_coder`/Hermes format, and produce
+/// hybrids that mix the two. Rather than match a fixed shape, this splits on
+/// `<tool_call>` openings and, within each block, pulls:
+///
+/// - the **name** from `<name>NAME</name>` OR `<function=NAME>` (whichever is
+///   present), and
+/// - the **arguments** from a JSON `<input>{…}</input>` OR a set of
+///   `<parameter=KEY>value</parameter>` tags (values taken as trimmed strings;
+///   `coerce_tool_args` fixes non-string schema fields downstream on dispatch).
+///
+/// This accepts all three observed encodings with one code path:
+/// - injected:  `<tool_call><name>X</name><input>{…}</input></tool_call>`
+/// - qwen3_coder: `<tool_call><function=X><parameter=K>v</parameter>…</function></tool_call>`
+/// - hybrid:    `<tool_call><name>X</name><parameter=K>v</parameter></function></tool_call>`
+///
+/// Malformed/dangling close tags (`</function>`, missing `</tool_call>`) are
+/// ignored. A block whose `<input>` is present but not valid JSON, with no
+/// `<parameter>` fallback, is skipped — so a genuinely prose response with no
+/// real call still falls through as prose (graceful degradation).
 fn extract_tool_calls(text: &str) -> Vec<(String, serde_json::Value)> {
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        regex::Regex::new(
-            r"(?s)<tool_call>\s*<name>(.*?)</name>\s*<input>(.*?)</input>\s*</tool_call>",
-        )
-        .expect("tool-call marker regex is valid")
-    });
-
     let mut out = Vec::new();
-    for caps in re.captures_iter(text) {
-        let name = caps.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
-        let raw_input = caps.get(2).map(|m| m.as_str().trim()).unwrap_or_default();
-        if name.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<serde_json::Value>(raw_input) {
-            Ok(input) => out.push((name.to_string(), input)),
-            // Malformed input JSON: skip this marker. If no marker parses, the
-            // whole response falls through as prose (graceful degradation).
-            Err(_) => continue,
+    // Each call begins at a `<tool_call>` opening; its body runs to the matching
+    // `</tool_call>` when present (trailing prose is dropped), else to the next
+    // opening / end of text.
+    for raw in text.split("<tool_call>").skip(1) {
+        let block = match raw.find("</tool_call>") {
+            Some(i) => &raw[..i],
+            None => raw,
+        };
+        if let Some(call) = parse_tool_call_block(block) {
+            out.push(call);
         }
     }
     out
+}
+
+/// Parse ONE `<tool_call>` block's inner text into `(name, input)`, tolerant of
+/// the injected, qwen3_coder, and hybrid encodings. See [`extract_tool_calls`].
+fn parse_tool_call_block(block: &str) -> Option<(String, serde_json::Value)> {
+    static NAME: OnceLock<regex::Regex> = OnceLock::new();
+    static FUNC: OnceLock<regex::Regex> = OnceLock::new();
+    static INPUT: OnceLock<regex::Regex> = OnceLock::new();
+    static PARAM: OnceLock<regex::Regex> = OnceLock::new();
+    let name_re = NAME.get_or_init(|| regex::Regex::new(r"(?s)<name>(.*?)</name>").unwrap());
+    let func_re = FUNC.get_or_init(|| regex::Regex::new(r"<function=(.*?)>").unwrap());
+    let input_re = INPUT.get_or_init(|| regex::Regex::new(r"(?s)<input>(.*?)</input>").unwrap());
+    let param_re =
+        PARAM.get_or_init(|| regex::Regex::new(r"(?s)<parameter=(.*?)>(.*?)</parameter>").unwrap());
+
+    // Name: `<name>…</name>` (injected/hybrid) else `<function=…>` (qwen3_coder).
+    let name = name_re
+        .captures(block)
+        .and_then(|c| c.get(1))
+        .or_else(|| func_re.captures(block).and_then(|c| c.get(1)))
+        .map(|m| m.as_str().trim().to_string())
+        .filter(|n| !n.is_empty())?;
+
+    // Args, preferring an explicit JSON `<input>` block.
+    let has_input = input_re.is_match(block);
+    if let Some(caps) = input_re.captures(block) {
+        if let Some(m) = caps.get(1) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(m.as_str().trim()) {
+                return Some((name, v));
+            }
+        }
+    }
+    // Else reconstruct from `<parameter=KEY>value</parameter>` pairs.
+    let mut map = serde_json::Map::new();
+    for p in param_re.captures_iter(block) {
+        let (Some(k), Some(v)) = (p.get(1), p.get(2)) else {
+            continue;
+        };
+        let key = k.as_str().trim();
+        if key.is_empty() {
+            continue;
+        }
+        map.insert(key.to_string(), serde_json::Value::String(v.as_str().trim().to_string()));
+    }
+    if !map.is_empty() {
+        return Some((name, serde_json::Value::Object(map)));
+    }
+    // No usable args. If an `<input>` was present but unparseable (and no params
+    // rescued it), treat the whole thing as prose. Otherwise it is a zero-arg
+    // call — let it fire so a no-argument tool still dispatches.
+    if has_input {
+        return None;
+    }
+    Some((name, serde_json::Value::Object(serde_json::Map::new())))
 }
 
 /// Rewrite a model response so `<tool_call>` markers in its text become native
@@ -214,119 +292,12 @@ pub fn parse_prose_response(response: ModelResponse) -> ModelResponse {
 }
 
 // ============================================================================
-// Stream buffering helpers
+// Stream re-emission helper
 // ============================================================================
 
-/// Reassemble a [`ModelResponse`] from a buffered stream of [`StreamEvent`]s.
-/// Mirrors the agent's accumulator, kept local so this module owns its own
-/// buffering for the parse-then-re-emit path.
-#[derive(Default)]
-struct ResponseBuffer {
-    blocks: Vec<(u32, BufBlock)>,
-    usage: TokenUsage,
-    stop_reason: Option<StopReason>,
-}
-
-enum BufBlock {
-    Text(String),
-    Thinking(String),
-    Tool {
-        id: String,
-        name: String,
-        json: String,
-    },
-}
-
-impl ResponseBuffer {
-    fn entry(&mut self, index: u32, make: impl FnOnce() -> BufBlock) -> &mut BufBlock {
-        if let Some(pos) = self.blocks.iter().position(|(i, _)| *i == index) {
-            &mut self.blocks[pos].1
-        } else {
-            self.blocks.push((index, make()));
-            &mut self.blocks.last_mut().expect("just pushed").1
-        }
-    }
-
-    fn fold(&mut self, event: StreamEvent) {
-        match event {
-            StreamEvent::MessageStart => {}
-            StreamEvent::ContentBlockDelta { index, delta } => {
-                if let BufBlock::Text(s) = self.entry(index, || BufBlock::Text(String::new())) {
-                    s.push_str(&delta);
-                }
-            }
-            StreamEvent::ThinkingDelta { index, delta } => {
-                if let BufBlock::Thinking(s) =
-                    self.entry(index, || BufBlock::Thinking(String::new()))
-                {
-                    s.push_str(&delta);
-                }
-            }
-            StreamEvent::ToolUseStart { index, id, name } => {
-                if let BufBlock::Tool {
-                    id: bid,
-                    name: bname,
-                    ..
-                } = self.entry(index, || BufBlock::Tool {
-                    id: String::new(),
-                    name: String::new(),
-                    json: String::new(),
-                }) {
-                    *bid = id;
-                    *bname = name;
-                }
-            }
-            StreamEvent::ToolUseDelta {
-                index,
-                partial_json,
-            } => {
-                if let BufBlock::Tool { json, .. } = self.entry(index, || BufBlock::Tool {
-                    id: String::new(),
-                    name: String::new(),
-                    json: String::new(),
-                }) {
-                    json.push_str(&partial_json);
-                }
-            }
-            StreamEvent::ContentBlockStop { .. } => {}
-            StreamEvent::MessageStop { usage, stop_reason } => {
-                self.usage = usage;
-                self.stop_reason = Some(stop_reason);
-            }
-        }
-    }
-
-    fn into_response(self) -> ModelResponse {
-        let content = self
-            .blocks
-            .into_iter()
-            .map(|(index, block)| match block {
-                BufBlock::Text(text) => ContentBlock::Text { text },
-                BufBlock::Thinking(text) => ContentBlock::Thinking { text },
-                BufBlock::Tool { id, name, json } => {
-                    let input = serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
-                    ContentBlock::ToolUse(ToolCall {
-                        id: if id.is_empty() {
-                            format!("call_{index}")
-                        } else {
-                            id
-                        },
-                        name,
-                        input,
-                    })
-                }
-            })
-            .collect();
-        ModelResponse {
-            content,
-            usage: self.usage,
-            stop_reason: self.stop_reason.unwrap_or(StopReason::EndTurn),
-        }
-    }
-}
-
 /// Re-emit a [`ModelResponse`] as a stream of [`StreamEvent`]s the harness
-/// accumulator understands. The inverse of [`ResponseBuffer`].
+/// accumulator understands. Lets the prompt-based `call_streaming` path satisfy
+/// the streaming interface from a single non-streaming inner call.
 fn response_to_stream(response: ModelResponse) -> ModelStream {
     let mut events: Vec<Result<StreamEvent, ModelError>> = vec![Ok(StreamEvent::MessageStart)];
     for (index, block) in response.content.into_iter().enumerate() {
@@ -365,14 +336,21 @@ async fn streaming_prompt_call<M: ModelInterface + 'static>(
     inner: &Arc<M>,
     mut request: ModelRequest,
 ) -> Result<ModelStream, ModelError> {
-    use futures_util::StreamExt;
     inject_tool_prompt(&mut request);
-    let mut stream = inner.call_streaming(request).await?;
-    let mut buf = ResponseBuffer::default();
-    while let Some(item) = stream.next().await {
-        buf.fold(item?);
-    }
-    let parsed = parse_prose_response(buf.into_response());
+    // Prompt-based mode buffers the WHOLE response before it can parse `<tool_call>`
+    // markers, so per-token streaming offers nothing here — and it actively hurts on
+    // some servers. With a server-side reasoning parser active (vLLM + a Qwen
+    // reasoning model), a STREAMED request routes the model's entire output into the
+    // reasoning channel: the model "thinks" the tool call and stops, and the injected
+    // markers never reach the text content this function parses (observed:
+    // `reasoning_len≈350, content_len=0`). The SAME request issued NON-streaming
+    // returns the assistant message whole with the reasoning/content split applied
+    // server-side, so the markers land in text content (observed: reliable marker in
+    // `content`). Issue one non-streaming call, parse, then re-emit as a stream for
+    // the harness accumulator.
+    request.stream = false;
+    let response = inner.call(request).await?;
+    let parsed = parse_prose_response(response);
     Ok(response_to_stream(parsed))
 }
 
@@ -519,7 +497,7 @@ impl<M: ModelInterface + 'static> ModelInterface for AdaptiveToolCallModelInterf
 mod tests {
     use super::*;
     use crate::model::mock::MockModelInterface;
-    use crate::model::{Content, Message, ModelParams, Role};
+    use crate::model::{Content, Message, ModelParams, Role, TokenUsage};
 
     fn provider() -> ProviderInfo {
         ProviderInfo {
@@ -634,6 +612,24 @@ mod tests {
         assert_eq!(req.messages, before);
     }
 
+    #[test]
+    fn injection_clears_native_tools() {
+        // Prompt-based mode supersedes the native channel: after injecting the
+        // prompt block, the native `tools` array must be empty so the provider's
+        // chat template / server-side parser does not ALSO emit (and intercept) a
+        // second, conflicting tool-call format. The tool stays described in the
+        // system prompt block.
+        let mut req = req_with_tools(Some("base"));
+        assert_eq!(req.tools.len(), 1);
+        inject_tool_prompt(&mut req);
+        assert!(req.tools.is_empty(), "native tools must be cleared");
+        let sys = match &req.messages[0].content {
+            Content::Text { text } => text,
+            _ => panic!("system message must be text"),
+        };
+        assert!(sys.contains("<name>calculator</name>"), "tool still described in prompt");
+    }
+
     // --- parsing -------------------------------------------------------------
 
     #[test]
@@ -722,6 +718,116 @@ mod tests {
         let out = parse_prose_response(resp);
         assert!(matches!(out.content[0], ContentBlock::Thinking { .. }));
         assert!(matches!(out.content[1], ContentBlock::ToolUse(_)));
+    }
+
+    // --- qwen3_coder / Hermes <function=..><parameter=..> format -------------
+
+    #[test]
+    fn parses_xml_function_format_single_param() {
+        // Qwen emits its native trained format even when asked for <name>/<input>.
+        let text = "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/App.jsx\n</parameter>\n</function>\n</tool_call>";
+        let out = parse_prose_response(prose(text, StopReason::EndTurn));
+        assert_eq!(out.stop_reason, StopReason::ToolUse);
+        match &out.content[..] {
+            [ContentBlock::ToolUse(tc)] => {
+                assert_eq!(tc.name, "read_file");
+                assert_eq!(tc.input, serde_json::json!({ "path": "src/App.jsx" }));
+            }
+            other => panic!("expected one tool-use block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_xml_function_format_multiline_params() {
+        // edit_file with a multi-line new_string — the exact shape that broke
+        // the live Qwen run before this parser was added.
+        let text = "<tool_call>\n<function=edit_file>\n\
+<parameter=path>\nsrc/App.jsx\n</parameter>\n\
+<parameter=old_string>\nfunction App() {\n</parameter>\n\
+<parameter=new_string>\n/**\n * Renders a todo app.\n */\nfunction App() {\n</parameter>\n\
+</function>\n</tool_call>";
+        let out = parse_prose_response(prose(text, StopReason::EndTurn));
+        assert_eq!(out.stop_reason, StopReason::ToolUse);
+        match &out.content[..] {
+            [ContentBlock::ToolUse(tc)] => {
+                assert_eq!(tc.name, "edit_file");
+                assert_eq!(tc.input["path"], serde_json::json!("src/App.jsx"));
+                assert_eq!(tc.input["old_string"], serde_json::json!("function App() {"));
+                assert_eq!(
+                    tc.input["new_string"],
+                    serde_json::json!("/**\n * Renders a todo app.\n */\nfunction App() {")
+                );
+            }
+            other => panic!("expected one tool-use block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_hybrid_name_plus_parameter_format() {
+        // The exact mangle Qwen leaked to the REPL: <name> (injected) for the tool
+        // name but <parameter=> + a dangling </function> (qwen3_coder) for args.
+        let text = "<tool_call>\n  <name>list_dir</name>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>";
+        let out = parse_prose_response(prose(text, StopReason::EndTurn));
+        assert_eq!(out.stop_reason, StopReason::ToolUse);
+        match &out.content[..] {
+            [ContentBlock::ToolUse(tc)] => {
+                assert_eq!(tc.name, "list_dir");
+                assert_eq!(tc.input, serde_json::json!({ "path": "." }));
+            }
+            other => panic!("expected one tool-use block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_two_hybrid_calls_in_one_response() {
+        let text = "<tool_call>\n  <name>list_dir</name>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>\n\
+<tool_call>\n  <name>read_file</name>\n<parameter=path>\npackage.json\n</parameter>\n</function>\n</tool_call>";
+        let out = parse_prose_response(prose(text, StopReason::EndTurn));
+        let calls: Vec<_> = out
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse(tc) => Some((tc.name.clone(), tc.input.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                ("list_dir".to_string(), serde_json::json!({ "path": "." })),
+                ("read_file".to_string(), serde_json::json!({ "path": "package.json" })),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_zero_arg_call() {
+        // A named call with no <input> and no <parameter> → zero-arg dispatch.
+        let out = parse_prose_response(prose(
+            "<tool_call><name>list_dir</name></tool_call>",
+            StopReason::EndTurn,
+        ));
+        match &out.content[..] {
+            [ContentBlock::ToolUse(tc)] => {
+                assert_eq!(tc.name, "list_dir");
+                assert_eq!(tc.input, serde_json::json!({}));
+            }
+            other => panic!("expected one tool-use block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn marker_format_wins_when_both_present() {
+        // A clean injected marker is never reinterpreted as the xml-function form.
+        let text = "<tool_call><name>a</name><input>{\"x\":1}</input></tool_call>";
+        let out = parse_prose_response(prose(text, StopReason::EndTurn));
+        match &out.content[..] {
+            [ContentBlock::ToolUse(tc)] => {
+                assert_eq!(tc.name, "a");
+                assert_eq!(tc.input, serde_json::json!({ "x": 1 }));
+            }
+            other => panic!("expected one tool-use block, got {other:?}"),
+        }
     }
 
     // --- always-on wrapper ---------------------------------------------------

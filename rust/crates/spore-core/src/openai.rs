@@ -222,6 +222,15 @@ struct OpenAIRequest {
     stop: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OpenAITool>,
+    /// Issue #139 (OpenAI side): when the harness sets
+    /// [`ModelParams::output_schema`](crate::model::ModelParams::output_schema)
+    /// for a turn, deliver it as the OpenAI/vLLM guided-decoding constraint
+    /// (`{"type":"json_schema","json_schema":{...}}`). Absent (skipped) otherwise,
+    /// so unconstrained turns stay byte-identical. This is the OpenAI counterpart
+    /// of the Ollama `format` channel — without it, `output_schema` was ignored on
+    /// this adapter, so vLLM models were never actually constrained.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -401,6 +410,16 @@ fn build_request(
         None
     };
 
+    // Issue #139: translate the harness-delivered output schema into the
+    // OpenAI/vLLM guided-decoding constraint. `None` (the default) emits no
+    // `response_format`, keeping unconstrained turns byte-identical.
+    let response_format = req.params.output_schema.as_ref().map(|schema| {
+        serde_json::json!({
+            "type": "json_schema",
+            "json_schema": { "name": "output", "schema": schema },
+        })
+    });
+
     OpenAIRequest {
         model: model_id.into(),
         messages,
@@ -411,6 +430,7 @@ fn build_request(
         top_p,
         stop,
         tools,
+        response_format,
         stream,
         stream_options: if stream {
             Some(StreamOptions {
@@ -736,6 +756,11 @@ impl ModelInterface for OpenAIModelInterface {
 /// JSON-fragment strings. The stream ends with `data: [DONE]`. When
 /// `stream_options.include_usage` was set, the final non-`[DONE]` chunk also
 /// carries `usage`.
+/// Dedicated block index for streamed reasoning/thinking deltas — kept disjoint
+/// from text content (index 0) and tool blocks (`i + 1`) so a reasoning model's
+/// `content` is never dropped onto a `Thinking` block. See the use site.
+const THINKING_BLOCK_INDEX: u32 = u32::MAX;
+
 fn sse_to_events(
     resp: reqwest::Response,
 ) -> impl futures_core::Stream<Item = Result<StreamEvent, ModelError>> + Send + 'static {
@@ -814,8 +839,18 @@ fn sse_to_events(
                 }
                 if let Some(reasoning) = delta.get("reasoning").and_then(|v| v.as_str()) {
                     if !reasoning.is_empty() {
+                        // Reasoning is a SEPARATE block from text — it MUST NOT share
+                        // `content_index`. A reasoning model (e.g. Qwen on vLLM)
+                        // streams `reasoning` deltas BEFORE `content`; if both used
+                        // index 0, the thinking deltas claim that block as `Thinking`
+                        // and the consumer (which only appends Text deltas to a Text
+                        // block) silently DROPS every later `content` delta — the
+                        // answer is generated but lost, surfacing as empty content.
+                        // A dedicated high index never collides with text (0) or tool
+                        // blocks (`i + 1`); block order in the response is by insertion
+                        // (reasoning streams first), not by index value.
                         yield Ok(StreamEvent::ThinkingDelta {
-                            index: content_index,
+                            index: THINKING_BLOCK_INDEX,
                             delta: reasoning.into(),
                         });
                     }
@@ -924,6 +959,30 @@ mod tests {
         let body = build_request("gpt-4o", &r, false, &OpenAICompat::default());
         assert_eq!(body.max_tokens, Some(256));
         assert_eq!(body.max_completion_tokens, None);
+    }
+
+    #[test]
+    fn build_request_emits_response_format_for_output_schema() {
+        // Issue #139 (OpenAI side): a turn carrying `output_schema` must deliver it
+        // as the guided-decoding `response_format`; without a schema, none is sent.
+        let mut r = req(vec![user("plan it")]);
+        assert!(
+            build_request("gpt-4o", &r, false, &OpenAICompat::default())
+                .response_format
+                .is_none(),
+            "no output_schema -> no response_format (byte-identical)"
+        );
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "tasks": { "type": "array", "items": { "type": "string" } } },
+            "required": ["tasks"]
+        });
+        r.params.output_schema = Some(schema.clone());
+        let rf = build_request("gpt-4o", &r, false, &OpenAICompat::default())
+            .response_format
+            .expect("output_schema -> response_format");
+        assert_eq!(rf["type"], "json_schema");
+        assert_eq!(rf["json_schema"]["schema"], schema);
     }
 
     #[test]
@@ -1405,6 +1464,57 @@ mod tests {
             }
             other => panic!("expected MessageStop, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn streaming_reasoning_then_content_keeps_both_blocks() {
+        // Regression: a reasoning model (Qwen on vLLM) streams `reasoning` deltas
+        // BEFORE `content`. Reasoning and content MUST land on DIFFERENT block
+        // indices — if both used index 0, the reasoning claims it as a `Thinking`
+        // block and the consumer drops every later `content` delta onto it, so the
+        // answer is generated but lost (empty content -> EmptyPlan).
+        let sse = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"let me think\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"the answer\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(sse)
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenAIModelInterface::new("k", "gpt-4o").with_base_url(server.uri());
+        let mut stream = client.call_streaming(req(vec![user("hi")])).await.unwrap();
+        let mut events: Vec<StreamEvent> = vec![];
+        while let Some(ev) = stream.next().await {
+            events.push(ev.unwrap());
+        }
+        let thinking = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::ThinkingDelta { index, delta } => Some((*index, delta.clone())),
+                _ => None,
+            })
+            .expect("a ThinkingDelta for the reasoning");
+        let content = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::ContentBlockDelta { index, delta } => Some((*index, delta.clone())),
+                _ => None,
+            })
+            .expect("a ContentBlockDelta for the answer — content must NOT be dropped");
+        assert_eq!(thinking.1, "let me think");
+        assert_eq!(content.1, "the answer");
+        assert_ne!(
+            thinking.0, content.0,
+            "reasoning and content must use DIFFERENT block indices"
+        );
     }
 
     #[tokio::test]
