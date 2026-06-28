@@ -74,6 +74,9 @@ async fn tool_error_loop_breaker_hard_stops_at_two_n() {
         max_stop_blocks: 8,
         // N == 3 → inject at 3 identical errors, hard-stop at 6.
         error_loop_threshold: 3,
+        plan_empty_max_retries: 0,
+        tool_call_nudge: false,
+        tool_search: None,
         enforce_output_schemas: false,
         output_schema_max_retries: 2,
         hooks: None,
