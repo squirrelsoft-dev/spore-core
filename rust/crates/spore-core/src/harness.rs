@@ -6458,6 +6458,22 @@ pub enum HaltReason {
         tool: String,
         consecutive_errors: u32,
     },
+    /// The repeated-identical-call breaker tripped: the model called the SAME
+    /// tool with structurally-identical arguments `2 * error_loop_threshold`
+    /// times in a row, each SUCCEEDING — i.e. it is spinning (repeating an action
+    /// that makes no progress and never reaching a terminal answer). DISTINCT
+    /// from [`ToolErrorLoop`](Self::ToolErrorLoop) (which counts recoverable
+    /// ERRORS) and from [`BudgetExceeded`](Self::BudgetExceeded) (genuine budget
+    /// exhaustion): the loop halted EARLY on a detected no-progress repeat, not on
+    /// errors or a spent step budget. A single corrective nudge is injected at the
+    /// `N` threshold first; this terminal fires only if the model keeps repeating
+    /// to `2 * N`. Carries the offending tool name and the consecutive-repeat
+    /// count at the hard stop. The run does NOT auto-continue (more budget would
+    /// just feed the same loop) — it ends so the caller/operator can redirect.
+    RepeatedToolCall {
+        tool: String,
+        count: u32,
+    },
     /// Returned by [`StandardHarness`] (issue #139) when output-schema
     /// enforcement is ON (`HarnessConfig::enforce_output_schemas`) for a
     /// `ReactConfig` leaf carrying `output = Some(..)`, and the leaf's terminal
@@ -6919,6 +6935,12 @@ pub struct HarnessConfig {
     /// budget — terminating with [`HaltReason::ToolErrorLoop`] (never
     /// [`HaltReason::BudgetExceeded`]). The `2×` hard-stop multiplier is FIXED,
     /// not an independent field. Defaults to `3`.
+    ///
+    /// The SAME `N`/`2N` thresholds also drive the repeated-identical-call
+    /// breaker (the no-progress twin of the error breaker): the model calling one
+    /// tool with identical args and SUCCEEDING `N` times in a row is nudged once,
+    /// and at `2N` the run hard-stops with [`HaltReason::RepeatedToolCall`]. `0`
+    /// disables BOTH breakers.
     pub error_loop_threshold: u32,
     /// MIGRATION GATE (issue #139) — NOT a permanent feature flag. When `true`,
     /// a [`ReactConfig`] leaf carrying `output = Some(..)` has its resolved
@@ -8981,6 +9003,15 @@ impl StandardHarness {
         let error_loop_n = self.config.error_loop_threshold;
         let mut error_runs: std::collections::HashMap<String, ErrorRun> =
             std::collections::HashMap::new();
+        // Repeated-identical-SUCCESSFUL-call breaker state (the no-progress twin
+        // of the error breaker above), loop-local to this window like `error_runs`.
+        // Tracks the LAST successful (tool, args) signature and how many times in a
+        // row it has recurred; a different successful call resets the run. Shares
+        // `error_loop_n`'s `N`/`2N` thresholds. The error breaker owns ERRORS; this
+        // owns SUCCESSES, so the two partition cleanly and never double-count.
+        let mut last_success_sig: Option<(String, serde_json::Value)> = None;
+        let mut repeat_count: u32 = 0;
+        let mut repeat_injected = false;
         // Output-schema enforcement state (issue #139), loop-local to this
         // window. `output_schema_retries_used` counts the EXTRA retry turns spent
         // on validation feedback; the budget for them is `output_schema_max_retries`
@@ -10329,8 +10360,61 @@ report only what the tools returned."
                                 pending_corrective = Some(corrective);
                             }
                         } else {
-                            // AC1: ANY success for this tool resets its run.
+                            // AC1: ANY success for this tool resets its error run.
                             error_runs.remove(&call.name);
+
+                            // ── Repeated-identical-successful-call breaker ──
+                            // A model that calls the SAME tool with the SAME args
+                            // and keeps SUCCEEDING is spinning: it makes no
+                            // progress and never reaches a terminal answer (the
+                            // plan-phase loop that silently burned the budget).
+                            // Track consecutive identical successes; nudge once at
+                            // `N`, hard-stop at `2N`. `send_message` is exempt
+                            // (benign narration a model may legitimately repeat).
+                            if error_loop_n > 0
+                                && call.name != crate::tools::SendMessageTool::NAME
+                            {
+                                let sig = (call.name.clone(), call.input.clone());
+                                if last_success_sig.as_ref() == Some(&sig) {
+                                    repeat_count += 1;
+                                } else {
+                                    last_success_sig = Some(sig);
+                                    repeat_count = 1;
+                                    repeat_injected = false;
+                                }
+                                let two_n = error_loop_n.saturating_mul(2);
+                                // 2N: HARD STOP. Do NOT append this result or
+                                // continue — end with a typed terminal so the
+                                // caller/operator can redirect. The run does NOT
+                                // auto-continue (more budget would just feed the
+                                // same loop), and no remaining budget is burned.
+                                if repeat_count >= two_n {
+                                    return RunResult::Failure {
+                                        reason: HaltReason::RepeatedToolCall {
+                                            tool: call.name.clone(),
+                                            count: repeat_count,
+                                        },
+                                        session_id,
+                                        usage,
+                                        turns: budget_used.turns,
+                                        session_state: session_state.clone(),
+                                    };
+                                }
+                                // N: inject ONE corrective USER message (the same
+                                // channel the error breaker / Stop-block breaker
+                                // use), once per run, appended after this result.
+                                if repeat_count >= error_loop_n && !repeat_injected {
+                                    repeat_injected = true;
+                                    pending_corrective = Some(format!(
+                                        "You have called the `{tool}` tool with the same arguments \
+{count} times in a row, each returning the same result. Repeating an identical call will not make \
+progress. Take a DIFFERENT action now — or, if you already have what you need, produce your final \
+response (finalize the plan / answer the task).",
+                                        tool = call.name,
+                                        count = repeat_count,
+                                    ));
+                                }
+                            }
                         }
 
                         // Tool-call span (issue #12), child of the current turn.
@@ -11825,19 +11909,38 @@ impl StrategyExecutor for StandardHarness {
         Box::pin(async move {
             // #124 Q1: the planner concept is DROPPED — the plan child's leaf
             // `ReactConfig.agent` is authoritative and resolved by the recursing
-            // leaf itself. The child's `.run(cx)` drives the WHOLE plan loop.
-            let mut cx = ExecutionContext::new(&self.config.registry);
-            cx.executor = Some(self);
-            // #stream: thread the (already `plan_execute`-wrapped) sink into the
-            // plan sub-drive so the plan leaf's turns stream and stay attributed.
-            cx.stream = on_stream;
-            cx.scratch.run_session = plan_session;
-            cx.scratch.run_budget = budget_used;
-            cx.scratch.task = Some(plan_task);
-            // #139: forced schema for the repair re-ask (consumed by the leaf).
-            cx.scratch.forced_output_schema = forced_output_schema;
-            let _ = plan.run(&mut cx).await;
-            cx.scratch.terminal_override.take()
+            // leaf itself. `plan_task.loop_strategy == plan` (the caller stamps it),
+            // so the WHOLE plan loop runs by driving that task.
+            //
+            // Drive it through `drive_strategy_with_resume_seed` — the SAME single
+            // budget-resolution site the top level uses — instead of a bare
+            // `plan.run(cx)` that read only `terminal_override`. A plan phase that
+            // exhausts its turn budget propagates a `BudgetExhausted` StrategyOutcome
+            // (rule 6: the leaf never self-resolves), which the bare drive DISCARDED,
+            // returning `None` → the opaque `PlanPhaseFailed{"plan sub-strategy
+            // produced no terminal"}`. Routing through the resolver makes the plan
+            // phase auto-continue (Continue / AutoContinue) and then surface a
+            // `WaitingForHuman{BudgetExhausted}` under `SurfaceToHuman` — exactly
+            // like the execute phase — so the host can grant more budget and the
+            // run continues (the plan-phase resume seed, #138 AC3, re-attaches the
+            // stalled planner conversation). A plan that COMPLETES still returns its
+            // `Success` terminal verbatim (byte-identical to before). `plan` is
+            // unused now (the task carries the same strategy); kept for the trait
+            // signature / call-site symmetry.
+            let _ = plan;
+            let result = self
+                .drive_strategy_with_resume_seed(
+                    plan_task,
+                    plan_session,
+                    budget_used,
+                    on_stream,
+                    None,  // resume_continues
+                    None,  // resume_seed (the plan child plans fresh each attempt)
+                    false, // continue_task_list
+                    forced_output_schema,
+                )
+                .await;
+            Some(result)
         })
     }
 
@@ -12433,6 +12536,7 @@ impl StandardHarness {
                     Some(session_state),
                     // resume_seed carries the continuation signal.
                     false,
+                    None,
                 )
                 .await;
         }
@@ -12633,6 +12737,7 @@ impl StandardHarness {
             // Model (A): a fresh `run()` plans fresh unless the caller explicitly
             // opts in to continuing a prior run's durable task list.
             continue_task_list,
+            None,
         )
         .await
     }
@@ -12674,6 +12779,11 @@ impl StandardHarness {
         // resolution). The seed-carrying resume paths pass `false` — a
         // `resume_seed` already implies continuation; a fresh run passes `false`.
         continue_task_list: bool,
+        // #139: a one-shot FORCED output schema for the FIRST round's leaf (the
+        // plan-empty repair re-ask, threaded by `run_plan_subtree`). Consumed by
+        // the first round only — mirrors `resume_seed`/`resume_continues`. `None`
+        // on every other drive path (byte-identical to before).
+        forced_output_schema: Option<serde_json::Value>,
     ) -> RunResult {
         // #129: the BARE-LEAF resolution site is `drive_strategy` (a bare leaf
         // never self-resolves inside its own body — rule 6 — it PROPAGATES a typed
@@ -12704,6 +12814,10 @@ impl StandardHarness {
         // FIRST round (an in-process `Continue` re-drive is a bare-leaf ReAct and
         // never reads it, so this is belt-and-suspenders against re-asserting it).
         let mut continue_task_list = continue_task_list;
+        // #139: the forced output schema is consumed by the FIRST round's leaf
+        // only (the plan-empty repair re-ask); later in-process continue rounds
+        // run without it.
+        let mut forced_output_schema = forced_output_schema;
         // SC-5: auto-grants spent at the BARE-LEAF Escalate site under
         // `EscalationMode::AutoContinue`. The scope is rebuilt each round here
         // (unlike the in-loop combinator scopes, which carry their own
@@ -12723,6 +12837,9 @@ impl StandardHarness {
             cx.scratch.resume_continues = resume_continues.take();
             cx.scratch.resume_seed = resume_seed.take();
             cx.scratch.continue_task_list = std::mem::take(&mut continue_task_list);
+            // #139: one-shot forced schema for the first round's leaf (the
+            // plan-empty repair re-ask); `take()` so continue rounds run without it.
+            cx.scratch.forced_output_schema = forced_output_schema.take();
 
             let outcome = task.loop_strategy.run(&mut cx).await;
 
@@ -12998,6 +13115,7 @@ impl StandardHarness {
                             // resume_seed (when present) carries the continuation
                             // signal; a bare ReAct leaf needs none.
                             false,
+                            None,
                         )
                         .await;
                 }
@@ -13026,6 +13144,7 @@ impl StandardHarness {
                                 None,
                                 None,
                                 true,
+                                None,
                             )
                             .await;
                     }
@@ -13139,6 +13258,7 @@ impl StandardHarness {
                             Some(session_state),
                             // resume_seed carries the continuation signal.
                             false,
+                            None,
                         )
                         .await;
                 }
@@ -13341,6 +13461,7 @@ impl StandardHarness {
                     Some(session_state),
                     // resume_seed carries the continuation signal.
                     false,
+                    None,
                 )
                 .await;
         }
@@ -19067,6 +19188,88 @@ mod tests {
             .await
             .expect("run store get ok")
             .is_none());
+    }
+
+    /// A planner that never finalizes BURNS its plan-leaf turn budget (the
+    /// PerLoop(2) leaf cap binds, not the global backstop). The leaf PROPAGATES a
+    /// `BudgetExhausted` (rule 6) with NO terminal — which `run_plan_subtree` used
+    /// to DISCARD, returning `None` → the opaque
+    /// `PlanPhaseFailed{"plan sub-strategy produced no terminal"}`. It must now go
+    /// through the SAME budget-resolution as the execute phase. Under `Autonomous`
+    /// that is a clean, typed `Failure{BudgetExceeded}` (NOT `PlanPhaseFailed`).
+    #[tokio::test]
+    async fn plan_phase_leaf_budget_exhaustion_fails_cleanly_not_no_terminal() {
+        let a = make_agent();
+        // The planner only ever calls a tool — it never emits a final plan, so the
+        // plan leaf runs to its PerLoop(2) cap without producing a terminal.
+        for _ in 0..4 {
+            a.push(TurnResult::ToolCallRequested {
+                reasoning: None,
+                calls: vec![ToolCall { id: "c".into(), name: "x".into(), input: serde_json::json!({}) }],
+                usage: usage(),
+            });
+        }
+        let h = StandardHarness::new(standard_config(a)); // Autonomous
+        let t = task(LoopStrategy::PlanExecute(PlanExecuteConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            // Small PLAN-leaf cap so the LEAF binds; the global backstop (100) is
+            // the larger bound, and the execute slot never runs.
+            plan: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(2))),
+            execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+            plan_model: None,
+        }))
+        .with_budget(BudgetLimits { max_turns: Some(100), ..Default::default() });
+        let mut state = SessionState::default();
+        let err = h
+            .run_plan_phase(&t, &mut state, BudgetSnapshot::default(), &None)
+            .await
+            .expect_err("plan phase exhausted its leaf budget");
+        match err {
+            RunResult::Failure {
+                reason: HaltReason::BudgetExceeded { .. },
+                ..
+            } => {}
+            RunResult::Failure { reason: HaltReason::PlanPhaseFailed { .. }, .. } => {
+                panic!("regression: plan-leaf exhaustion collapsed to PlanPhaseFailed")
+            }
+            other => panic!("expected a clean BudgetExceeded failure, got {other:?}"),
+        }
+    }
+
+    /// As above but under `SurfaceToHuman` (looper's default escalation mode): a
+    /// plan-leaf exhaustion now PAUSES with `HumanRequest::BudgetExhausted` so the
+    /// host can grant more budget and the run CONTINUES (auto-continue parity with
+    /// the execute phase) — instead of dying with "produced no terminal".
+    #[tokio::test]
+    async fn plan_phase_leaf_budget_exhaustion_surfaces_for_continuation() {
+        let a = make_agent();
+        for _ in 0..4 {
+            a.push(TurnResult::ToolCallRequested {
+                reasoning: None,
+                calls: vec![ToolCall { id: "c".into(), name: "x".into(), input: serde_json::json!({}) }],
+                usage: usage(),
+            });
+        }
+        let h = StandardHarness::new(surface_config(a)); // SurfaceToHuman
+        let t = task(LoopStrategy::PlanExecute(PlanExecuteConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            plan: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(2))),
+            execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+            plan_model: None,
+        }))
+        .with_budget(BudgetLimits { max_turns: Some(100), ..Default::default() });
+        let mut state = SessionState::default();
+        let err = h
+            .run_plan_phase(&t, &mut state, BudgetSnapshot::default(), &None)
+            .await
+            .expect_err("plan phase paused for a budget grant");
+        match err {
+            RunResult::WaitingForHuman {
+                request: HumanRequest::BudgetExhausted { .. },
+                ..
+            } => {}
+            other => panic!("expected a BudgetExhausted pause, got {other:?}"),
+        }
     }
 
     // R11: an OnPlanCreated hook can rewrite the plan before storage; the
@@ -27220,6 +27423,74 @@ mod tests {
         match h.run(HarnessRunOptions::new(react(20))).await {
             RunResult::Success { output, .. } => assert_eq!(output, "fin"),
             other => panic!("expected Success (breaker off), got {other:?}"),
+        }
+    }
+
+    // ── Repeated-identical-SUCCESSFUL-call breaker (no-progress twin of #137) ──
+
+    /// A model that calls the SAME tool with the SAME args and keeps SUCCEEDING is
+    /// spinning. The breaker hard-stops at `2 * error_loop_threshold` identical
+    /// successes with `HaltReason::RepeatedToolCall` (default N=3 → stop at 6),
+    /// instead of letting it grind out the whole turn budget (the plan-spin).
+    #[tokio::test]
+    async fn repeated_identical_successful_calls_hard_stop() {
+        let a = make_agent();
+        // Eight identical SUCCESSFUL tool calls in a row (the planner never
+        // finalizes). standard_config's ScriptedToolRegistry returns "ok" success
+        // for every dispatch, so these all succeed — the error breaker never fires.
+        for _ in 0..8 {
+            a.push(TurnResult::ToolCallRequested {
+                reasoning: None,
+                calls: vec![ToolCall {
+                    id: "c".into(),
+                    name: "spin_tool".into(),
+                    input: serde_json::json!({"k": "v"}),
+                }],
+                usage: usage(),
+            });
+        }
+        // Generous per-loop budget so the REPEAT breaker — not the budget cap —
+        // is what stops it. error_loop_threshold = 3 ⇒ hard stop at 2*3 = 6.
+        let h = StandardHarness::new(standard_config(a));
+        match h.run(HarnessRunOptions::new(react(50))).await {
+            RunResult::Failure {
+                reason: HaltReason::RepeatedToolCall { tool, count },
+                ..
+            } => {
+                assert_eq!(tool, "spin_tool");
+                assert_eq!(count, 6, "hard stop at 2 * N (N = 3)");
+            }
+            other => panic!("expected RepeatedToolCall, got {other:?}"),
+        }
+    }
+
+    /// Reset semantics: ALTERNATING calls (no two consecutive identical) never
+    /// trip the breaker — proving it counts CONSECUTIVE identical successes, not a
+    /// global tally. The run finalizes normally.
+    #[tokio::test]
+    async fn repeat_breaker_does_not_trip_on_alternating_calls() {
+        let a = make_agent();
+        for i in 0..4 {
+            a.push(TurnResult::ToolCallRequested {
+                reasoning: None,
+                calls: vec![ToolCall {
+                    id: "c".into(),
+                    name: "spin_tool".into(),
+                    // Alternate the args each turn → no two consecutive identical.
+                    input: serde_json::json!({"k": i % 2}),
+                }],
+                usage: usage(),
+            });
+        }
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: "done".into(),
+            usage: usage(),
+        });
+        let h = StandardHarness::new(standard_config(a));
+        match h.run(HarnessRunOptions::new(react(50))).await {
+            RunResult::Success { output, .. } => assert_eq!(output, "done"),
+            other => panic!("expected Success (alternating never trips), got {other:?}"),
         }
     }
 
