@@ -1,6 +1,7 @@
 //! [`EvalHarness`] — the runner (Rules 14-25) — plus its fluent builder and the
 //! deferred [`TraceAnalyzer`] interface (Rule 30).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use spore_core::harness::{
@@ -174,7 +175,7 @@ impl EvalHarness {
             verifier_score: verification.score,
         };
 
-        for (metric, vec) in self.metrics.iter().zip(samples.per_metric.iter_mut()) {
+        for metric in &self.metrics {
             // Skip success-rate / verification-score samples for WaitingForHuman
             // runs (Rule 18); resource metrics still count.
             if waiting
@@ -185,7 +186,9 @@ impl EvalHarness {
             {
                 continue;
             }
-            vec.push(sample_for(metric, &session_metrics, &trace, &inputs));
+            if let Some(vec) = samples.per_metric.get_mut(&metric.name()) {
+                vec.push(sample_for(metric, &session_metrics, &trace, &inputs));
+            }
         }
 
         // Rule 25: collect trace links for failed or non-passing runs.
@@ -206,9 +209,11 @@ impl EvalHarness {
         config_id: &ConfigId,
     ) -> ComparisonReport {
         let mut comparisons = Vec::new();
-        for (i, metric) in self.metrics.iter().enumerate() {
-            let base = &baseline.per_metric[i];
-            let cand = &candidate.per_metric[i];
+        let empty: Vec<f64> = Vec::new();
+        for metric in &self.metrics {
+            let key = metric.name();
+            let base = baseline.per_metric.get(&key).unwrap_or(&empty);
+            let cand = candidate.per_metric.get(&key).unwrap_or(&empty);
             let base_stats = MetricStats::from_samples(base); // Rule 19
             let cand_stats = MetricStats::from_samples(cand);
             let delta = cand_stats.mean - base_stats.mean;
@@ -303,9 +308,11 @@ fn empty_session_metrics(session_id: &SessionId, task_id: &TaskId) -> SessionMet
     }
 }
 
-/// Per-config metric samples + the metadata the comparison needs.
+/// Per-config metric samples + the metadata the comparison needs. Samples are
+/// keyed by [`EvalMetric::name`] so baseline/candidate align by metric identity
+/// rather than by a positional index that a metric reordering could desync.
 struct ConfigSamples {
-    per_metric: Vec<Vec<f64>>,
+    per_metric: BTreeMap<String, Vec<f64>>,
     trace_links: Vec<String>,
     waiting_for_human: u32,
 }
@@ -313,7 +320,7 @@ struct ConfigSamples {
 impl ConfigSamples {
     fn new(metrics: &[EvalMetric]) -> Self {
         Self {
-            per_metric: metrics.iter().map(|_| Vec::new()).collect(),
+            per_metric: metrics.iter().map(|m| (m.name(), Vec::new())).collect(),
             trace_links: Vec::new(),
             waiting_for_human: 0,
         }

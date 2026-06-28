@@ -52,8 +52,9 @@
 //!     newest-first** per scope (recency semantics, now per-scope).
 //!   - [`RunStore`]: `get`, `put`, `delete`, `list_keys` — opaque JSON blobs;
 //!     scope-flat, UNCHANGED.
-//!   - [`ObservabilityStore`]: `append_span`, `get_spans`, `get_sessions`,
-//!     `flush_session` — append-only span storage. Scope-flat, UNCHANGED.
+//!   - [`ObservabilityStore`]: `append_span`, `get_spans`, `flush_session` —
+//!     append-only span storage. Scope-flat. (The `SessionMetrics` roll-up
+//!     query lives on `ObservabilityProvider`, not here — ISP.)
 //!
 //! ## Rules enforced
 //!   - **No-op fallback.** Unconfigured domains — and, for memory, unconfigured
@@ -135,10 +136,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
-use crate::guide_registry::SessionOutcome;
 use crate::harness::{BoxFut, PausedState, SessionId};
 use crate::memory::Timestamp;
-use crate::observability::SessionMetrics;
 
 /// Re-export of the canonical [`StorageScope`] (its home is `prompt_assembly`,
 /// decision A2). This keeps `spore_core::storage::StorageScope` resolvable
@@ -640,7 +639,10 @@ pub trait RunStore: Send + Sync {
 }
 
 /// Append-only span storage. Distinct from the other three: no get-by-key,
-/// queried by session and time range.
+/// queried by session. The `SessionMetrics` roll-up query (`get_sessions`)
+/// deliberately lives on [`crate::observability::ObservabilityProvider`], not
+/// here — a raw span store cannot compute it, so it is not part of this
+/// interface (ISP).
 pub trait ObservabilityStore: Send + Sync {
     fn append_span<'a>(
         &'a self,
@@ -651,12 +653,6 @@ pub trait ObservabilityStore: Send + Sync {
         &'a self,
         session_id: &'a SessionId,
     ) -> BoxFut<'a, Result<Vec<JsonValue>, StorageError>>;
-    fn get_sessions<'a>(
-        &'a self,
-        since: Timestamp,
-        domain: Option<String>,
-        outcome: Option<SessionOutcome>,
-    ) -> BoxFut<'a, Result<Vec<SessionMetrics>, StorageError>>;
     fn flush_session<'a>(
         &'a self,
         session_id: &'a SessionId,
@@ -849,14 +845,6 @@ impl ObservabilityStore for NoOpStorageProvider {
     ) -> BoxFut<'a, Result<Vec<JsonValue>, StorageError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
-    fn get_sessions<'a>(
-        &'a self,
-        _since: Timestamp,
-        _domain: Option<String>,
-        _outcome: Option<SessionOutcome>,
-    ) -> BoxFut<'a, Result<Vec<SessionMetrics>, StorageError>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
     fn flush_session<'a>(
         &'a self,
         _session_id: &'a SessionId,
@@ -1034,16 +1022,6 @@ impl ObservabilityStore for InMemoryStorageProvider {
                 .cloned()
                 .unwrap_or_default())
         })
-    }
-    fn get_sessions<'a>(
-        &'a self,
-        _since: Timestamp,
-        _domain: Option<String>,
-        _outcome: Option<SessionOutcome>,
-    ) -> BoxFut<'a, Result<Vec<SessionMetrics>, StorageError>> {
-        // The in-memory span store does not roll up SessionMetrics — that is the
-        // ObservabilityProvider's job. Storage-only query returns empty.
-        Box::pin(async { Ok(Vec::new()) })
     }
     fn flush_session<'a>(
         &'a self,
@@ -1346,16 +1324,6 @@ impl ObservabilityStore for FileSystemStorageProvider {
         session_id: &'a SessionId,
     ) -> BoxFut<'a, Result<Vec<JsonValue>, StorageError>> {
         Box::pin(async move { read_jsonl(&self.trace_path(session_id)) })
-    }
-    fn get_sessions<'a>(
-        &'a self,
-        _since: Timestamp,
-        _domain: Option<String>,
-        _outcome: Option<SessionOutcome>,
-    ) -> BoxFut<'a, Result<Vec<SessionMetrics>, StorageError>> {
-        // SessionMetrics roll-up is owned by the ObservabilityProvider, not the
-        // raw on-disk span store. Storage-only query returns empty.
-        Box::pin(async { Ok(Vec::new()) })
     }
     fn flush_session<'a>(
         &'a self,
