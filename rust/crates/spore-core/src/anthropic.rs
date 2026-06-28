@@ -99,17 +99,7 @@ impl AnthropicModelInterface {
     /// Read API key from environment variable. Returns
     /// `ModelError::ProviderError` if the variable is unset or empty.
     pub fn from_env(env_var: &str, model_id: impl Into<String>) -> Result<Self, ModelError> {
-        let key = std::env::var(env_var).map_err(|_| ModelError::ProviderError {
-            code: 0,
-            message: format!("env var `{env_var}` not set"),
-        })?;
-        if key.trim().is_empty() {
-            return Err(ModelError::ProviderError {
-                code: 0,
-                message: format!("env var `{env_var}` is empty"),
-            });
-        }
-        Ok(Self::new(key, model_id))
+        Ok(Self::new(crate::provider_http::key_from_env(env_var)?, model_id))
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -270,18 +260,6 @@ struct AnthropicCountTokensResponse {
     input_tokens: u32,
 }
 
-#[derive(Debug, Deserialize)]
-struct AnthropicErrorBody {
-    #[serde(default)]
-    error: Option<AnthropicErrorInner>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicErrorInner {
-    #[serde(default)]
-    message: Option<String>,
-}
-
 // ============================================================================
 // Conversions (ModelRequest -> Anthropic wire, Anthropic wire -> ModelResponse)
 // ============================================================================
@@ -402,77 +380,19 @@ fn parse_stop_reason(s: Option<&str>) -> StopReason {
 // HTTP plumbing with retry
 // ============================================================================
 
-/// Quietly suppress two clippy nits relevant inside the loop.
-#[allow(clippy::too_many_lines)]
-async fn send_with_retry(
-    request_builder: impl Fn() -> reqwest::RequestBuilder,
-    max_retries: u32,
-    timeout: Duration,
-) -> Result<reqwest::Response, ModelError> {
-    let mut attempt: u32 = 0;
-    loop {
-        let req = request_builder().timeout(timeout);
-        let result = req.send().await;
-        match result {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    return Ok(resp);
-                }
-                let code = status.as_u16();
-                // Decide whether to retry based on status code.
-                let retryable = matches!(code, 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529);
-                if retryable && attempt < max_retries {
-                    let retry_after = resp
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|h| h.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .map(Duration::from_secs);
-                    let delay = retry_after.unwrap_or_else(|| backoff_delay(attempt));
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                    continue;
-                }
-                return Err(map_status_error(resp).await);
-            }
-            Err(e) if e.is_timeout() && attempt < max_retries => {
-                tokio::time::sleep(backoff_delay(attempt)).await;
-                attempt += 1;
-                continue;
-            }
-            Err(e) if e.is_timeout() => return Err(ModelError::Timeout),
-            Err(e) => {
-                return Err(ModelError::Transport {
-                    message: format!("HTTP transport error: {e}"),
-                })
-            }
-        }
-    }
+/// Anthropic retries the shared transient set PLUS `529` (overloaded).
+fn retryable(code: u16) -> bool {
+    crate::provider_http::is_retryable_status(code) || code == 529
 }
 
-/// Exponential backoff with a small jitter ceiling. Pure function so it's
-/// easy to test.
-fn backoff_delay(attempt: u32) -> Duration {
-    // 0.5s, 1s, 2s, 4s, ... up to 30s.
-    let base_ms: u64 = 500u64.saturating_mul(1u64 << attempt.min(6));
-    Duration::from_millis(base_ms.min(30_000))
-}
-
+/// Map a non-success Anthropic response to a `ModelError`. `529` is Anthropic's
+/// overload signal (rate-limit with no `retry-after`).
 async fn map_status_error(resp: reqwest::Response) -> ModelError {
-    let status = resp.status();
-    let code = status.as_u16();
-    let retry_after = resp
-        .headers()
-        .get("retry-after")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_secs);
-    let body_text = resp.text().await.unwrap_or_default();
-    let message = serde_json::from_str::<AnthropicErrorBody>(&body_text)
-        .ok()
-        .and_then(|b| b.error.and_then(|e| e.message))
-        .unwrap_or_else(|| body_text.chars().take(500).collect());
+    let crate::provider_http::ErrorParts {
+        code,
+        retry_after,
+        message,
+    } = crate::provider_http::error_parts(resp).await;
     match code {
         429 => ModelError::RateLimited { retry_after },
         529 => ModelError::RateLimited { retry_after: None },
@@ -491,12 +411,9 @@ impl ModelInterface for AnthropicModelInterface {
         let body = build_request(&self.model_id, &request, false);
         let url = format!("{}/v1/messages", self.base_url);
         let api_key = self.api_key.clone();
-        let body = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
-            code: 0,
-            message: format!("request encode failed: {e}"),
-        })?;
+        let body = crate::provider_http::encode_body(&body)?;
         let client = self.http_client.clone();
-        let resp = send_with_retry(
+        let resp = crate::provider_http::send_with_retry(
             || {
                 client
                     .post(&url)
@@ -507,6 +424,8 @@ impl ModelInterface for AnthropicModelInterface {
             },
             self.max_retries,
             self.timeout,
+            retryable,
+            map_status_error,
         )
         .await?;
         let parsed: AnthropicResponse =
@@ -525,17 +444,14 @@ impl ModelInterface for AnthropicModelInterface {
         Box::pin(async move {
         let body = build_request(&self.model_id, &request, true);
         let url = format!("{}/v1/messages", self.base_url);
-        let body = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
-            code: 0,
-            message: format!("request encode failed: {e}"),
-        })?;
+        let body = crate::provider_http::encode_body(&body)?;
         let client = self.http_client.clone();
         let api_key = self.api_key.clone();
         // Route through `send_with_retry` so opening a stream gets the same
         // retry/backoff on transient failures (timeouts, 429/5xx/529) as the
         // non-streaming paths. Retries happen BEFORE the body is consumed; the
         // closure rebuilds the request each attempt (`body.clone()`).
-        let resp = send_with_retry(
+        let resp = crate::provider_http::send_with_retry(
             || {
                 client
                     .post(&url)
@@ -547,6 +463,8 @@ impl ModelInterface for AnthropicModelInterface {
             },
             self.max_retries,
             self.timeout,
+            retryable,
+            map_status_error,
         )
         .await?;
         Ok::<ModelStream, ModelError>(Box::pin(sse_to_events(resp)))
@@ -566,7 +484,7 @@ impl ModelInterface for AnthropicModelInterface {
         })?;
         let api_key = self.api_key.clone();
         let client = self.http_client.clone();
-        let resp = send_with_retry(
+        let resp = crate::provider_http::send_with_retry(
             || {
                 client
                     .post(&url)
@@ -577,6 +495,8 @@ impl ModelInterface for AnthropicModelInterface {
             },
             self.max_retries,
             self.timeout,
+            retryable,
+            map_status_error,
         )
         .await?;
         let parsed: AnthropicCountTokensResponse =
@@ -925,17 +845,6 @@ mod tests {
         // Unknown / null → EndTurn (safe default).
         assert_eq!(parse_stop_reason(None), StopReason::EndTurn);
         assert_eq!(parse_stop_reason(Some("???")), StopReason::EndTurn);
-    }
-
-    // ── backoff ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn backoff_grows_then_caps() {
-        let d0 = backoff_delay(0);
-        let d3 = backoff_delay(3);
-        let dmax = backoff_delay(20);
-        assert!(d3 > d0);
-        assert!(dmax <= Duration::from_millis(30_000));
     }
 
     // ── context_window ──────────────────────────────────────────────────────

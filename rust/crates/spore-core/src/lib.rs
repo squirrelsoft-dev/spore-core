@@ -42,6 +42,7 @@ pub mod plan;
 pub mod prompt_assembly;
 pub mod prompt_chunk_registry;
 pub mod prompt_tool_call;
+pub(crate) mod provider_http;
 pub mod sandbox;
 pub mod sensor;
 pub mod skills;

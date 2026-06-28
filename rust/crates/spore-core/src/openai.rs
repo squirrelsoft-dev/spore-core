@@ -121,17 +121,7 @@ impl OpenAIModelInterface {
     }
 
     pub fn from_env(env_var: &str, model_id: impl Into<String>) -> Result<Self, ModelError> {
-        let key = std::env::var(env_var).map_err(|_| ModelError::ProviderError {
-            code: 0,
-            message: format!("env var `{env_var}` not set"),
-        })?;
-        if key.trim().is_empty() {
-            return Err(ModelError::ProviderError {
-                code: 0,
-                message: format!("env var `{env_var}` is empty"),
-            });
-        }
-        Ok(Self::new(key, model_id))
+        Ok(Self::new(crate::provider_http::key_from_env(env_var)?, model_id))
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -365,18 +355,6 @@ struct PromptTokensDetails {
     cached_tokens: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
-struct OpenAIErrorBody {
-    #[serde(default)]
-    error: Option<OpenAIErrorInner>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIErrorInner {
-    #[serde(default)]
-    message: Option<String>,
-}
-
 // ============================================================================
 // Conversions
 // ============================================================================
@@ -594,71 +572,13 @@ fn parse_stop_reason(s: Option<&str>) -> StopReason {
 // HTTP plumbing with retry
 // ============================================================================
 
-async fn send_with_retry(
-    request_builder: impl Fn() -> reqwest::RequestBuilder,
-    max_retries: u32,
-    timeout: Duration,
-) -> Result<reqwest::Response, ModelError> {
-    let mut attempt: u32 = 0;
-    loop {
-        let req = request_builder().timeout(timeout);
-        let result = req.send().await;
-        match result {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    return Ok(resp);
-                }
-                let code = status.as_u16();
-                let retryable = matches!(code, 408 | 425 | 429 | 500 | 502 | 503 | 504);
-                if retryable && attempt < max_retries {
-                    let retry_after = resp
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|h| h.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .map(Duration::from_secs);
-                    let delay = retry_after.unwrap_or_else(|| backoff_delay(attempt));
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                    continue;
-                }
-                return Err(map_status_error(resp).await);
-            }
-            Err(e) if e.is_timeout() && attempt < max_retries => {
-                tokio::time::sleep(backoff_delay(attempt)).await;
-                attempt += 1;
-                continue;
-            }
-            Err(e) if e.is_timeout() => return Err(ModelError::Timeout),
-            Err(e) => {
-                return Err(ModelError::Transport {
-                    message: format!("HTTP transport error: {e}"),
-                })
-            }
-        }
-    }
-}
-
-fn backoff_delay(attempt: u32) -> Duration {
-    let base_ms: u64 = 500u64.saturating_mul(1u64 << attempt.min(6));
-    Duration::from_millis(base_ms.min(30_000))
-}
-
+/// Map a non-success OpenAI response to a `ModelError`.
 async fn map_status_error(resp: reqwest::Response) -> ModelError {
-    let status = resp.status();
-    let code = status.as_u16();
-    let retry_after = resp
-        .headers()
-        .get("retry-after")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_secs);
-    let body_text = resp.text().await.unwrap_or_default();
-    let message = serde_json::from_str::<OpenAIErrorBody>(&body_text)
-        .ok()
-        .and_then(|b| b.error.and_then(|e| e.message))
-        .unwrap_or_else(|| body_text.chars().take(500).collect());
+    let crate::provider_http::ErrorParts {
+        code,
+        retry_after,
+        message,
+    } = crate::provider_http::error_parts(resp).await;
     match code {
         429 => ModelError::RateLimited { retry_after },
         408 | 504 => ModelError::Timeout,
@@ -676,12 +596,9 @@ impl ModelInterface for OpenAIModelInterface {
         let body = build_request(&self.model_id, &request, false, &self.compat);
         let url = format!("{}/chat/completions", self.base_url);
         let api_key = self.api_key.clone();
-        let body = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
-            code: 0,
-            message: format!("request encode failed: {e}"),
-        })?;
+        let body = crate::provider_http::encode_body(&body)?;
         let client = self.http_client.clone();
-        let resp = send_with_retry(
+        let resp = crate::provider_http::send_with_retry(
             || {
                 client
                     .post(&url)
@@ -691,6 +608,8 @@ impl ModelInterface for OpenAIModelInterface {
             },
             self.max_retries,
             self.timeout,
+            crate::provider_http::is_retryable_status,
+            map_status_error,
         )
         .await?;
         let parsed: OpenAIResponse = resp.json().await.map_err(|e| ModelError::ProviderError {
@@ -708,17 +627,14 @@ impl ModelInterface for OpenAIModelInterface {
         Box::pin(async move {
         let body = build_request(&self.model_id, &request, true, &self.compat);
         let url = format!("{}/chat/completions", self.base_url);
-        let body = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
-            code: 0,
-            message: format!("request encode failed: {e}"),
-        })?;
+        let body = crate::provider_http::encode_body(&body)?;
         let client = self.http_client.clone();
         let api_key = self.api_key.clone();
         // Route through `send_with_retry` so opening a stream gets the same
         // retry/backoff on transient failures (timeouts, 429/5xx) as the
         // non-streaming `call` path. Retries happen BEFORE the body is consumed;
         // the closure rebuilds the request each attempt (`body.clone()`).
-        let resp = send_with_retry(
+        let resp = crate::provider_http::send_with_retry(
             || {
                 client
                     .post(&url)
@@ -729,6 +645,8 @@ impl ModelInterface for OpenAIModelInterface {
             },
             self.max_retries,
             self.timeout,
+            crate::provider_http::is_retryable_status,
+            map_status_error,
         )
         .await?;
         Ok::<ModelStream, ModelError>(Box::pin(sse_to_events(resp)))
@@ -740,20 +658,10 @@ impl ModelInterface for OpenAIModelInterface {
         request: &'a ModelRequest,
     ) -> BoxFut<'a, Result<u32, ModelError>> {
         Box::pin(async move {
-        // OpenAI has no count_tokens endpoint. Use the bytes/4 heuristic
-        // consistent with ReplayModelInterface — sufficient for compaction
+        // OpenAI has no count_tokens endpoint. Use the shared bytes/4 heuristic
+        // (consistent with ReplayModelInterface) — sufficient for compaction
         // decisions; exact counts come back via response usage.
-        let n: usize = request
-            .messages
-            .iter()
-            .map(|m| match &m.content {
-                Content::Text { text } => text.len(),
-                Content::ToolCall(tc) => tc.name.len() + tc.input.to_string().len(),
-                Content::ToolResult(tr) => tr.content.len(),
-                Content::Image { .. } => 0,
-            })
-            .sum();
-        Ok((n / 4) as u32)
+        Ok(crate::model::estimate_tokens(request))
         })
     }
 

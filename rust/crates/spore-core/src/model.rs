@@ -485,6 +485,26 @@ pub struct RecordedExchange {
 /// whitespace) and SHA-256 hashing the resulting bytes, then hex-encoding
 /// the first 8 bytes (16 hex chars representing the leading u64).
 ///
+/// Heuristic token estimate (~4 chars/token), summing per-message content
+/// lengths (images contribute 0). The single owner of the bytes/4 fallback
+/// shared by [`ReplayModelInterface::count_tokens`] and the OpenAI provider
+/// (which has no token endpoint), so the two agree by construction. Ollama
+/// keeps its own `concat_request_text`-based estimate (it shapes tool calls
+/// differently), so it is intentionally not a caller.
+pub(crate) fn estimate_tokens(req: &ModelRequest) -> u32 {
+    let n: usize = req
+        .messages
+        .iter()
+        .map(|m| match &m.content {
+            Content::Text { text } => text.len(),
+            Content::ToolCall(tc) => tc.name.len() + tc.input.to_string().len(),
+            Content::ToolResult(tr) => tr.content.len(),
+            Content::Image { .. } => 0,
+        })
+        .sum();
+    (n / 4) as u32
+}
+
 /// All four language implementations of `RecordingModelInterface` and
 /// `ReplayModelInterface` must produce the same hash for the same request.
 /// The cross-language consistency fixture lives at
@@ -707,17 +727,7 @@ impl ModelInterface for ReplayModelInterface {
                 return Ok(e.response.usage.input_tokens);
             }
         }
-        let n: usize = request
-            .messages
-            .iter()
-            .map(|m| match &m.content {
-                Content::Text { text } => text.len(),
-                Content::ToolCall(tc) => tc.name.len() + tc.input.to_string().len(),
-                Content::ToolResult(tr) => tr.content.len(),
-                Content::Image { .. } => 0,
-            })
-            .sum();
-        Ok((n / 4) as u32) // ~4 chars/token rule-of-thumb (fallback)
+        Ok(estimate_tokens(request)) // ~4 chars/token rule-of-thumb (fallback)
         })
     }
 
