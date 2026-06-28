@@ -27,6 +27,7 @@ pub mod execution_registry;
 pub mod guide_registry;
 pub mod harness;
 pub mod hooks;
+pub mod image;
 pub mod macros;
 pub mod memory;
 pub mod metric;

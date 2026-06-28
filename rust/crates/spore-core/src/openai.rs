@@ -246,11 +246,38 @@ struct StreamOptions {
 struct OpenAIMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<OpenAIContent>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<OpenAIToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+}
+
+/// OpenAI chat-completions message content: either a bare string (the common
+/// case) or an array of typed parts (a multimodal turn carrying an image).
+/// `#[serde(untagged)]` so `Text` serializes as a plain JSON string and `Parts`
+/// as a JSON array — the two shapes the API accepts.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum OpenAIContent {
+    Text(String),
+    Parts(Vec<OpenAIContentPart>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpenAIContentPart {
+    // Only `image_url` parts are emitted today (text rides as a separate message);
+    // a `Text { text }` variant can be added when a combined text+image part is
+    // needed (e.g. an OpenAI tool-result image follow-up).
+    ImageUrl { image_url: OpenAIImageUrl },
+}
+
+/// An `image_url` part — for inline images the `url` is a base64 data URL
+/// (`data:<media_type>;base64,<data>`).
+#[derive(Debug, Serialize)]
+struct OpenAIImageUrl {
+    url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -466,7 +493,7 @@ fn message_to_openai(m: &crate::model::Message, compat: &OpenAICompat) -> OpenAI
     match &m.content {
         Content::Text { text } => OpenAIMessage {
             role: role.into(),
-            content: Some(text.clone()),
+            content: Some(OpenAIContent::Text(text.clone())),
             tool_calls: vec![],
             tool_call_id: None,
         },
@@ -485,17 +512,21 @@ fn message_to_openai(m: &crate::model::Message, compat: &OpenAICompat) -> OpenAI
         },
         Content::ToolResult(r) => OpenAIMessage {
             role: "tool".into(),
-            content: Some(r.content.clone()),
+            content: Some(OpenAIContent::Text(r.content.clone())),
             tool_calls: vec![],
             tool_call_id: Some(r.tool_use_id.clone()),
         },
-        // OpenAI's chat-completions image input uses a content-parts array
-        // (`{type: "image_url", image_url: {url: "data:..."}}`). The harness
-        // does not currently emit image content into requests, so we serialize
-        // a textual placeholder rather than introduce a heterogeneous shape.
-        Content::Image { media_type, .. } => OpenAIMessage {
+        // OpenAI chat-completions image input is a content-parts array carrying
+        // an `image_url` whose `url` is a base64 data URL. Only a vision-capable
+        // served model will consume it; a text model ignores/errors per its
+        // server, but the request shape is correct.
+        Content::Image { media_type, data } => OpenAIMessage {
             role: role.into(),
-            content: Some(format!("[image: {media_type}]")),
+            content: Some(OpenAIContent::Parts(vec![OpenAIContentPart::ImageUrl {
+                image_url: OpenAIImageUrl {
+                    url: format!("data:{media_type};base64,{data}"),
+                },
+            }])),
             tool_calls: vec![],
             tool_call_id: None,
         },
@@ -950,6 +981,30 @@ mod tests {
         assert_eq!(body.messages.len(), 2);
         assert_eq!(body.messages[0].role, "system");
         assert_eq!(body.messages[1].role, "user");
+    }
+
+    #[test]
+    fn image_message_serializes_as_image_url_data_url() {
+        let img = Message {
+            role: Role::User,
+            content: Content::Image { media_type: "image/png".into(), data: "aGk=".into() },
+        };
+        let body = build_request("gpt-4o", &req(vec![img]), false, &OpenAICompat::default());
+        let json = serde_json::to_value(&body.messages[0]).unwrap();
+        // content is an ARRAY of parts carrying an image_url data URL — not a string.
+        let parts = json["content"].as_array().expect("content should be a parts array");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "image_url");
+        assert_eq!(parts[0]["image_url"]["url"], "data:image/png;base64,aGk=");
+    }
+
+    #[test]
+    fn text_message_still_serializes_as_a_plain_string() {
+        // The untagged content enum must keep ordinary text as a bare JSON string,
+        // not wrap it in a parts array (would change every existing request).
+        let body = build_request("gpt-4o", &req(vec![user("hello")]), false, &OpenAICompat::default());
+        let json = serde_json::to_value(&body.messages[0]).unwrap();
+        assert_eq!(json["content"], "hello");
     }
 
     #[test]

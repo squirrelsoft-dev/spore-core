@@ -21,6 +21,9 @@ walkdir = "2"
 ignore = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 sha2 = "0.11.0"
+# Multimodal image input: base64-encode image bytes for the Content::Image data
+# the vision adapters (Anthropic image source / OpenAI image_url) forward.
+base64 = "0.22"
 opentelemetry = "0.30"
 opentelemetry_sdk = { version = "0.30", features = ["rt-tokio", "trace"] }
 opentelemetry-otlp = { version = "0.30", default-features = false, features = ["grpc-tonic", "trace"] }
