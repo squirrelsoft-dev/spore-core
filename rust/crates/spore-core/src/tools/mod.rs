@@ -52,6 +52,13 @@ pub use web::{
     SearchMethod, UrlPolicy, WebFetchTool, WebSearchConfig, WebSearchConfigError, WebSearchTool,
 };
 
+/// Process-wide shared `reqwest` client for the HTTP-shaped tool families
+/// (`http`, `web`). Pooled once so connections are reused across tool calls.
+pub(crate) fn shared_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
 /// Threshold (in bytes/chars) above which tool output is routed through
 /// `SandboxProvider::handle_large_output` instead of returned inline.
 pub const LARGE_OUTPUT_THRESHOLD: usize = 64 * 1024;

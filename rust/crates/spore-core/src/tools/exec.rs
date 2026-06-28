@@ -28,6 +28,7 @@ use serde_json::json;
 
 use crate::harness::{BoxFut, Operation, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
+use crate::text_util::{ceil_char_boundary, floor_char_boundary};
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::error::ToolExecutionError;
 use crate::tools::finish_with_possible_truncation;
@@ -363,21 +364,6 @@ fn truncate_for_message(s: &str) -> String {
         &s[..head_end],
         &s[tail_start..]
     )
-}
-
-fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
-    idx = idx.min(s.len());
-    while idx > 0 && !s.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
-}
-
-fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
-    while idx < s.len() && !s.is_char_boundary(idx) {
-        idx += 1;
-    }
-    idx
 }
 
 // ============================================================================

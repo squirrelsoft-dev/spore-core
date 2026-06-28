@@ -208,12 +208,11 @@ pub const STEP_LEDGER_ELISION_MARKER: &str = "[older ledger entries elided]";
 /// (so the caller can render the static [`STEP_LEDGER_ELISION_MARKER`]).
 pub fn push_step_ledger(ledger: &mut Vec<StepLedgerEntry>, entry: StepLedgerEntry) -> bool {
     ledger.push(entry);
-    let mut dropped = false;
-    while ledger.len() > STEP_LEDGER_MAX_ENTRIES {
-        ledger.remove(0);
-        dropped = true;
-    }
-    dropped
+    let excess = ledger.len().saturating_sub(STEP_LEDGER_MAX_ENTRIES);
+    // Drop the oldest entries from the front in one shift instead of repeated
+    // O(n) `remove(0)` calls; the retained tail and its order are identical.
+    ledger.drain(..excess);
+    excess > 0
 }
 
 /// Render the Tier-2 ledger as a compact, deterministic text block for seeding

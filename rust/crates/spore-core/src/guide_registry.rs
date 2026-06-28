@@ -42,6 +42,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use crate::sync_util::MutexExt;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -305,7 +306,7 @@ impl StandardGuideRegistry {
     /// Pin the "now" timestamp for `analyze_performance` window math. Tests
     /// use this to keep results deterministic without a real clock.
     pub fn set_now(&self, now: Timestamp) {
-        self.inner.lock().unwrap().now_override = Some(now);
+        self.inner.lock_recover().now_override = Some(now);
     }
 }
 
@@ -363,60 +364,9 @@ fn in_window(t: &Timestamp, cutoff: &Option<Timestamp>) -> bool {
 /// Returns `None` if `now` doesn't parse as `YYYY-MM-DDTHH:MM:SS[.fff]Z`,
 /// in which case the standard impl treats every record as in-window.
 fn rfc3339_subtract(now: &Timestamp, window: Duration) -> Option<Timestamp> {
-    let secs = parse_rfc3339_secs(&now.0)?;
+    let secs = Timestamp::parse_rfc3339_secs(&now.0)?;
     let cutoff_secs = secs.checked_sub(window.as_secs() as i64)?;
-    Some(Timestamp::new(format_rfc3339_secs(cutoff_secs)))
-}
-
-/// Parse `YYYY-MM-DDTHH:MM:SSZ` (and tolerated millisecond variants) to
-/// seconds since UNIX epoch. Pure arithmetic — no external dependency.
-fn parse_rfc3339_secs(s: &str) -> Option<i64> {
-    let s = s.trim_end_matches('Z');
-    let (date, time) = s.split_once('T')?;
-    let mut date_parts = date.split('-');
-    let y: i64 = date_parts.next()?.parse().ok()?;
-    let mo: i64 = date_parts.next()?.parse().ok()?;
-    let d: i64 = date_parts.next()?.parse().ok()?;
-    let time = time.split('.').next()?;
-    let mut tp = time.split(':');
-    let hh: i64 = tp.next()?.parse().ok()?;
-    let mm: i64 = tp.next()?.parse().ok()?;
-    let ss: i64 = tp.next()?.parse().ok()?;
-    Some(days_from_civil(y, mo, d) * 86400 + hh * 3600 + mm * 60 + ss)
-}
-
-fn format_rfc3339_secs(secs: i64) -> String {
-    let (y, mo, d, hh, mm, ss) = civil_from_days_secs(secs);
-    format!("{y:04}-{mo:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
-}
-
-/// Howard Hinnant's days_from_civil algorithm — proleptic Gregorian.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
-fn civil_from_days_secs(total_secs: i64) -> (i64, u32, u32, u32, u32, u32) {
-    let days = total_secs.div_euclid(86400);
-    let rem = total_secs.rem_euclid(86400);
-    let hh = (rem / 3600) as u32;
-    let mm = ((rem % 3600) / 60) as u32;
-    let ss = (rem % 60) as u32;
-    let z = days + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d, hh, mm, ss)
+    Some(Timestamp::new(Timestamp::format_rfc3339_secs(cutoff_secs)))
 }
 
 fn now_rfc3339() -> Timestamp {
@@ -424,7 +374,7 @@ fn now_rfc3339() -> Timestamp {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    Timestamp::new(format_rfc3339_secs(secs))
+    Timestamp::new(Timestamp::format_rfc3339_secs(secs))
 }
 
 impl GuideRegistry for StandardGuideRegistry {
@@ -450,12 +400,12 @@ impl GuideRegistry for StandardGuideRegistry {
         }
 
         let id = guide.id.clone();
-        self.inner.lock().unwrap().guides.insert(id.clone(), guide);
+        self.inner.lock_recover().guides.insert(id.clone(), guide);
         Ok(id)
     }
 
     async fn select(&self, query: GuideQuery) -> Result<Vec<Guide>, GuideRegistryError> {
-        let store = self.inner.lock().unwrap();
+        let store = self.inner.lock_recover();
         let mut scored: Vec<(f32, Guide)> = store
             .guides
             .values()
@@ -473,7 +423,7 @@ impl GuideRegistry for StandardGuideRegistry {
     }
 
     async fn record_usage(&self, record: GuideUsageRecord) -> Result<(), GuideRegistryError> {
-        let mut store = self.inner.lock().unwrap();
+        let mut store = self.inner.lock_recover();
         if !store.guides.contains_key(&record.guide_id) {
             return Err(GuideRegistryError::NotFound(record.guide_id));
         }
@@ -489,7 +439,7 @@ impl GuideRegistry for StandardGuideRegistry {
         &self,
         id: &GuideId,
     ) -> Result<Vec<GuideUsageRecord>, GuideRegistryError> {
-        let store = self.inner.lock().unwrap();
+        let store = self.inner.lock_recover();
         if !store.guides.contains_key(id) {
             return Err(GuideRegistryError::NotFound(id.clone()));
         }
@@ -502,7 +452,7 @@ impl GuideRegistry for StandardGuideRegistry {
     }
 
     async fn deprecate(&self, id: &GuideId, reason: &str) -> Result<(), GuideRegistryError> {
-        let mut store = self.inner.lock().unwrap();
+        let mut store = self.inner.lock_recover();
         let now = store.now_override.clone().unwrap_or_else(now_rfc3339);
         let g = store
             .guides
@@ -520,7 +470,7 @@ impl GuideRegistry for StandardGuideRegistry {
         id: &GuideId,
         reason: PendingReason,
     ) -> Result<(), GuideRegistryError> {
-        let mut store = self.inner.lock().unwrap();
+        let mut store = self.inner.lock_recover();
         let now = store.now_override.clone().unwrap_or_else(now_rfc3339);
         let g = store
             .guides
@@ -531,7 +481,7 @@ impl GuideRegistry for StandardGuideRegistry {
     }
 
     async fn promote_to_active(&self, id: &GuideId) -> Result<(), GuideRegistryError> {
-        let mut store = self.inner.lock().unwrap();
+        let mut store = self.inner.lock_recover();
         let g = store
             .guides
             .get_mut(id)
@@ -551,7 +501,7 @@ impl GuideRegistry for StandardGuideRegistry {
         min_failure_rate_delta: f32,
         min_pattern_occurrences: u32,
     ) -> Vec<ImprovementSignal> {
-        let store = self.inner.lock().unwrap();
+        let store = self.inner.lock_recover();
         let now = store.now_override.clone().unwrap_or_else(now_rfc3339);
         let cutoff = rfc3339_subtract(&now, window);
 
@@ -641,7 +591,7 @@ impl GuideRegistry for StandardGuideRegistry {
     }
 
     async fn check_conflicts(&self, content: &str, domain: Option<&str>) -> Vec<GuideConflict> {
-        let store = self.inner.lock().unwrap();
+        let store = self.inner.lock_recover();
         let mut out = Vec::new();
         for g in store.guides.values() {
             if !matches!(g.status, GuideStatus::Active) {
@@ -731,7 +681,7 @@ mod tests {
         // Not Active → not in select.
         assert!(sel.iter().all(|g| g.id.0 != "g1"));
         // mark_pending_review trail is correct.
-        let store = r.inner.lock().unwrap();
+        let store = r.inner.lock_recover();
         let g = &store.guides[&GuideId::new("g1")];
         assert!(matches!(
             g.status,
@@ -760,7 +710,7 @@ mod tests {
         r.register(a).await.unwrap();
         r.register(b).await.unwrap();
         // Inject c directly to bypass status validation in register.
-        r.inner.lock().unwrap().guides.insert(GuideId::new("c"), c);
+        r.inner.lock_recover().guides.insert(GuideId::new("c"), c);
 
         let res = r
             .select(GuideQuery {
@@ -844,7 +794,7 @@ mod tests {
         r.record_usage(u).await.unwrap();
         let hist = r.usage_history(&GuideId::new("a")).await.unwrap();
         assert_eq!(hist.len(), 1);
-        let store = r.inner.lock().unwrap();
+        let store = r.inner.lock_recover();
         assert_eq!(
             store.guides[&GuideId::new("a")]
                 .last_used
@@ -863,7 +813,7 @@ mod tests {
         r.register(make_guide("a", "x")).await.unwrap();
         r.deprecate(&GuideId::new("a"), "obsolete").await.unwrap();
         {
-            let store = r.inner.lock().unwrap();
+            let store = r.inner.lock_recover();
             match &store.guides[&GuideId::new("a")].status {
                 GuideStatus::Deprecated { reason, .. } => assert_eq!(reason, "obsolete"),
                 s => panic!("expected Deprecated, got {s:?}"),
@@ -890,7 +840,7 @@ mod tests {
         .await
         .unwrap();
         r.promote_to_active(&GuideId::new("a")).await.unwrap();
-        let store = r.inner.lock().unwrap();
+        let store = r.inner.lock_recover();
         assert!(matches!(
             store.guides[&GuideId::new("a")].status,
             GuideStatus::Active
@@ -1038,8 +988,8 @@ mod tests {
 
     #[test]
     fn rfc3339_round_trip() {
-        let s = parse_rfc3339_secs("2026-05-16T12:34:56Z").unwrap();
-        let f = format_rfc3339_secs(s);
+        let s = Timestamp::parse_rfc3339_secs("2026-05-16T12:34:56Z").unwrap();
+        let f = Timestamp::format_rfc3339_secs(s);
         assert_eq!(f, "2026-05-16T12:34:56Z");
     }
 }

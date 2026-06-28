@@ -44,7 +44,10 @@
 //!   removal + executor migration to registry resolution lands in #124. The
 //!   registry coexists with the deprecated fields this slice and is not yet read
 //!   by the run bodies (that's #123/#124).
-//! - The registry has exactly FIVE maps (no sixth).
+//! - The registry has five handle maps: `agents`, `toolsets`, `schemas`,
+//!   `verifiers`, and `metric_evaluators` (the last added for HillClimbing
+//!   metric evaluators, #124 Q2 — referred to as "the sixth map" in older
+//!   comments). All share one resolution path via `check_handle`.
 //! - [`EscalationMode`] has NO `Default` impl (mirrors the budget-types
 //!   discipline); the builder picks an explicit default (`SurfaceToHuman`).
 //! - [`EscalationMode`] is STORED only this slice (#130 consumes it) and is NOT
@@ -367,63 +370,46 @@ impl ExecutionRegistry {
         }
     }
 
-    fn check_agent(&self, r: &AgentRef) -> Result<(), HarnessError> {
-        if self.agents.contains_key(&r.0) {
+    /// Shared resolution check for every handle map: present ⇒ `Ok`, else the
+    /// uniform [`HarnessError::UnresolvedHandle`]. The typed `check_*` wrappers
+    /// keep the `AgentRef`/`ToolsetRef`/`SchemaRef` distinction at call sites.
+    fn check_handle<V>(
+        map: &HashMap<String, V>,
+        key: &str,
+        kind: &'static str,
+    ) -> Result<(), HarnessError> {
+        if map.contains_key(key) {
             Ok(())
         } else {
             Err(HarnessError::UnresolvedHandle {
-                kind: "agent".to_string(),
-                key: r.0.clone(),
+                kind: kind.to_string(),
+                key: key.to_string(),
             })
         }
+    }
+
+    fn check_agent(&self, r: &AgentRef) -> Result<(), HarnessError> {
+        Self::check_handle(&self.agents, &r.0, "agent")
     }
 
     fn check_toolset(&self, r: &ToolsetRef) -> Result<(), HarnessError> {
-        if self.toolsets.contains_key(&r.0) {
-            Ok(())
-        } else {
-            Err(HarnessError::UnresolvedHandle {
-                kind: "toolset".to_string(),
-                key: r.0.clone(),
-            })
-        }
+        Self::check_handle(&self.toolsets, &r.0, "toolset")
     }
 
     fn check_schema(&self, r: &SchemaRef) -> Result<(), HarnessError> {
-        if self.schemas.contains_key(&r.0) {
-            Ok(())
-        } else {
-            Err(HarnessError::UnresolvedHandle {
-                kind: "schema".to_string(),
-                key: r.0.clone(),
-            })
-        }
+        Self::check_handle(&self.schemas, &r.0, "schema")
     }
 
     /// #124 Q1: a SelfVerifying `evaluator` (a `SchemaRef` on the wire) resolves
     /// against the `verifiers` map.
     fn check_verifier(&self, r: &SchemaRef) -> Result<(), HarnessError> {
-        if self.verifiers.contains_key(&r.0) {
-            Ok(())
-        } else {
-            Err(HarnessError::UnresolvedHandle {
-                kind: "verifier".to_string(),
-                key: r.0.clone(),
-            })
-        }
+        Self::check_handle(&self.verifiers, &r.0, "verifier")
     }
 
     /// #124 Q2: a HillClimbing `evaluator` (an `AgentRef` on the wire) resolves
     /// against the sixth `metric_evaluators` map.
     fn check_metric_evaluator(&self, r: &AgentRef) -> Result<(), HarnessError> {
-        if self.metric_evaluators.contains_key(&r.0) {
-            Ok(())
-        } else {
-            Err(HarnessError::UnresolvedHandle {
-                kind: "metric_evaluator".to_string(),
-                key: r.0.clone(),
-            })
-        }
+        Self::check_handle(&self.metric_evaluators, &r.0, "metric_evaluator")
     }
 }
 

@@ -582,7 +582,7 @@ struct EmbedResponse {
 
 fn build_request(
     model_id: &str,
-    keep_alive: &Option<String>,
+    keep_alive: Option<&str>,
     num_ctx: Option<u32>,
     req: &ModelRequest,
     stream: bool,
@@ -675,12 +675,8 @@ fn build_request(
         model: model_id.into(),
         messages,
         stream,
-        keep_alive: keep_alive.clone(),
-        options: if options.is_empty() {
-            None
-        } else {
-            Some(options)
-        },
+        keep_alive: keep_alive.map(str::to_owned),
+        options: (!options.is_empty()).then_some(options),
         tools,
         think,
         format,
@@ -722,9 +718,10 @@ fn system_message(content: String) -> OllamaMessage {
 /// instructions. This — together with the `format` schema's `tool` enum — keeps
 /// tool calls on the constrained-JSON channel and away from `<|python_tag|>`.
 fn structured_tools_preamble(tools: &[ToolSchema]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::from("You have access to the following tools:\n");
     for t in tools {
-        out.push_str(&format!("\n- {}: {}", t.name, t.description));
+        let _ = write!(out, "\n- {}: {}", t.name, t.description);
         if let Some(props) = t.input_schema.get("properties").and_then(|p| p.as_object()) {
             if !props.is_empty() {
                 let params: Vec<String> = props
@@ -734,7 +731,7 @@ fn structured_tools_preamble(tools: &[ToolSchema]) -> String {
                         format!("{name} ({ty})")
                     })
                     .collect();
-                out.push_str(&format!("\n  parameters: {}", params.join(", ")));
+                let _ = write!(out, "\n  parameters: {}", params.join(", "));
             }
         }
     }
@@ -973,7 +970,7 @@ impl ModelInterface for OllamaModelInterface {
         self.guard_tool_support(&request, meta)?;
         let mut body = build_request(
             &self.model_id,
-            &self.keep_alive,
+            self.keep_alive.as_deref(),
             self.num_ctx,
             &request,
             false,
@@ -1016,7 +1013,7 @@ impl ModelInterface for OllamaModelInterface {
         self.guard_tool_support(&request, meta)?;
         let mut body = build_request(
             &self.model_id,
-            &self.keep_alive,
+            self.keep_alive.as_deref(),
             self.num_ctx,
             &request,
             true,
@@ -1472,7 +1469,7 @@ mod tests {
         r.params.temperature = Some(0.7);
         r.params.top_p = Some(0.9);
         r.params.stop_sequences = vec!["END".into()];
-        let body = build_request("llama3.2", &Some("10m".into()), None, &r, false);
+        let body = build_request("llama3.2", Some("10m"), None, &r, false);
         let s = serde_json::to_string(&body).unwrap();
         assert!(s.contains("\"keep_alive\":\"10m\""), "wire: {s}");
         assert!(s.contains("\"num_predict\":256"), "wire: {s}");
@@ -1547,7 +1544,7 @@ mod tests {
         let r = req(vec![user("hi")]);
         // num_ctx is the ONLY option set — exercises both the serialized field
         // and `OllamaOptions::is_empty` (the options object must still be emitted).
-        let body = build_request("llama3.2", &None, Some(256_000), &r, false);
+        let body = build_request("llama3.2", None, Some(256_000), &r, false);
         let s = serde_json::to_string(&body).unwrap();
         assert!(s.contains("\"options\":{"), "options object present: {s}");
         assert!(s.contains("\"num_ctx\":256000"), "wire: {s}");
@@ -1558,7 +1555,7 @@ mod tests {
         // No sampling params and no num_ctx → no `options` key at all, keeping
         // the bare request byte-identical to before num_ctx existed.
         let r = req(vec![user("hi")]);
-        let body = build_request("llama3.2", &None, None, &r, false);
+        let body = build_request("llama3.2", None, None, &r, false);
         let s = serde_json::to_string(&body).unwrap();
         assert!(
             !s.contains("\"options\""),
@@ -1574,7 +1571,7 @@ mod tests {
             description: "search the web".into(),
             input_schema: serde_json::json!({"type":"object"}),
         });
-        let body = build_request("llama3.2", &None, None, &r, false);
+        let body = build_request("llama3.2", None, None, &r, false);
         let s = serde_json::to_string(&body).unwrap();
         assert!(s.contains("\"tools\":["), "wire: {s}");
         assert!(s.contains("\"name\":\"search\""), "wire: {s}");
@@ -1591,7 +1588,7 @@ mod tests {
                 input: serde_json::json!({"url":"x"}),
             }),
         }]);
-        let body = build_request("llama3.2", &None, None, &r, false);
+        let body = build_request("llama3.2", None, None, &r, false);
         let s = serde_json::to_string(&body.messages[0]).unwrap();
         // arguments must be an object, NOT a JSON-encoded string
         assert!(s.contains("\"arguments\":{\"url\":\"x\"}"), "wire: {s}");
@@ -1608,7 +1605,7 @@ mod tests {
                 is_error: false,
             }),
         }]);
-        let body = build_request("llama3.2", &None, None, &r, false);
+        let body = build_request("llama3.2", None, None, &r, false);
         let m = &body.messages[0];
         assert_eq!(m.role, "tool");
         assert_eq!(m.content, "ok");
@@ -1621,7 +1618,7 @@ mod tests {
         // (request side). Confirm a normal request round-trips with no
         // "thinking" key, which proves we never emit one.
         let r = req(vec![user("hi")]);
-        let body = build_request("llama3.2", &None, None, &r, false);
+        let body = build_request("llama3.2", None, None, &r, false);
         let s = serde_json::to_string(&body).unwrap();
         assert!(!s.contains("thinking"), "wire: {s}");
     }
@@ -1632,7 +1629,7 @@ mod tests {
     fn build_request_omits_think_without_reasoning_budget() {
         // Default request (no reasoning_budget) carries no `think` key.
         let r = req(vec![user("hi")]);
-        let body = build_request("llama3.2", &None, None, &r, false);
+        let body = build_request("llama3.2", None, None, &r, false);
         assert_eq!(body.think, None);
         let s = serde_json::to_string(&body).unwrap();
         assert!(!s.contains("\"think\""), "wire: {s}");
@@ -1644,7 +1641,7 @@ mod tests {
         // magnitude has no Ollama analogue). Capability gating is separate.
         let mut r = req(vec![user("hi")]);
         r.params.reasoning_budget = Some(2048);
-        let body = build_request("llama3.2", &None, None, &r, false);
+        let body = build_request("llama3.2", None, None, &r, false);
         assert_eq!(body.think, Some(OllamaThink::Enabled(true)));
         let s = serde_json::to_string(&body).unwrap();
         assert!(s.contains("\"think\":true"), "wire: {s}");
@@ -1655,7 +1652,7 @@ mod tests {
         // Some(0) is "no reasoning" — must not enable thinking.
         let mut r = req(vec![user("hi")]);
         r.params.reasoning_budget = Some(0);
-        let body = build_request("llama3.2", &None, None, &r, false);
+        let body = build_request("llama3.2", None, None, &r, false);
         assert_eq!(body.think, None);
     }
 
@@ -1670,7 +1667,7 @@ mod tests {
         ] {
             let mut r = req(vec![user("hi")]);
             r.params.reasoning_effort = Some(effort);
-            let body = build_request("gpt-oss", &None, None, &r, false);
+            let body = build_request("gpt-oss", None, None, &r, false);
             assert_eq!(body.think, Some(OllamaThink::Level(wire)));
             let s = serde_json::to_string(&body).unwrap();
             assert!(
@@ -1687,7 +1684,7 @@ mod tests {
         let mut r = req(vec![user("hi")]);
         r.params.reasoning_budget = Some(2048);
         r.params.reasoning_effort = Some(ReasoningEffort::High);
-        let body = build_request("gpt-oss", &None, None, &r, false);
+        let body = build_request("gpt-oss", None, None, &r, false);
         assert_eq!(body.think, Some(OllamaThink::Level("high")));
     }
 
@@ -1710,7 +1707,7 @@ mod tests {
         ] {
             let mut r = req(vec![user("hi")]);
             r.params = params;
-            let mut body = build_request("llama3.2", &None, None, &r, false);
+            let mut body = build_request("llama3.2", None, None, &r, false);
             assert!(body.think.is_some());
             let meta = ModelMeta {
                 context_length: None,
@@ -1727,7 +1724,7 @@ mod tests {
     fn gate_thinking_keeps_flag_when_capability_present() {
         let mut r = req(vec![user("hi")]);
         r.params.reasoning_effort = Some(ReasoningEffort::Max);
-        let mut body = build_request("gpt-oss", &None, None, &r, false);
+        let mut body = build_request("gpt-oss", None, None, &r, false);
         let meta = ModelMeta {
             context_length: None,
             capabilities: vec!["thinking".into()],
@@ -1747,7 +1744,7 @@ mod tests {
         // No reasoning requested at all: the flag was never set, nothing to drop,
         // no warning signal (SC-16).
         let r = req(vec![user("hi")]);
-        let mut body = build_request("llama3.2", &None, None, &r, false);
+        let mut body = build_request("llama3.2", None, None, &r, false);
         assert_eq!(body.think, None);
         let meta = ModelMeta {
             context_length: None,
@@ -1792,7 +1789,7 @@ mod tests {
     #[test]
     fn build_request_structured_sets_format_drops_tools_adds_system() {
         let r = structured_tool_req();
-        let body = build_request("llama3.2", &None, None, &r, false);
+        let body = build_request("llama3.2", None, None, &r, false);
         // Native tools dropped in structured mode.
         assert!(body.tools.is_empty(), "native tools must be empty");
         // format schema present with tool enum = tool names + "final".
@@ -1824,7 +1821,7 @@ mod tests {
                 },
             },
         );
-        let body = build_request("llama3.2", &None, None, &r, false);
+        let body = build_request("llama3.2", None, None, &r, false);
         // Only one system message; original content preserved + preamble merged.
         let system_count = body.messages.iter().filter(|m| m.role == "system").count();
         assert_eq!(system_count, 1);
@@ -1837,7 +1834,7 @@ mod tests {
         // Flag on but no tools → unchanged behavior, no format.
         let mut r = req(vec![user("hi")]);
         r.params.structured_tool_calls = true;
-        let body = build_request("llama3.2", &None, None, &r, false);
+        let body = build_request("llama3.2", None, None, &r, false);
         assert!(body.format.is_none());
     }
 
@@ -1850,7 +1847,7 @@ mod tests {
             description: "search the web".into(),
             input_schema: serde_json::json!({"type":"object"}),
         });
-        let body = build_request("llama3.2", &None, None, &r, false);
+        let body = build_request("llama3.2", None, None, &r, false);
         assert!(body.format.is_none());
         assert_eq!(body.tools.len(), 1);
     }
@@ -1869,7 +1866,7 @@ mod tests {
             "required": ["status"]
         });
         r.params.output_schema = Some(schema.clone());
-        let body = build_request("llama3.2", &None, None, &r, false);
+        let body = build_request("llama3.2", None, None, &r, false);
         assert_eq!(
             body.format.as_ref(),
             Some(&schema),
@@ -1882,7 +1879,7 @@ mod tests {
         // Absent output_schema (the default) keeps `format` None — byte-identical
         // to pre-#139.
         let r = req(vec![user("hi")]);
-        let body = build_request("llama3.2", &None, None, &r, false);
+        let body = build_request("llama3.2", None, None, &r, false);
         assert!(body.format.is_none());
     }
 

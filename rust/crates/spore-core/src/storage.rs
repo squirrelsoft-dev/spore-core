@@ -129,6 +129,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use crate::sync_util::MutexExt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -238,7 +239,11 @@ impl WorkspaceId {
         hasher.update(canonical.as_bytes());
         let digest = hasher.finalize();
         // First 8 hex chars = first 4 bytes.
-        let hex8: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+        use std::fmt::Write as _;
+        let mut hex8 = String::with_capacity(8);
+        for b in digest.iter().take(4) {
+            let _ = write!(hex8, "{b:02x}");
+        }
 
         let basename = canonical.rsplit('/').next().unwrap_or("");
         let sanitized = sanitize_basename(basename);
@@ -885,7 +890,7 @@ impl SessionStore for InMemoryStorageProvider {
         id: &'a SessionId,
     ) -> BoxFut<'a, Result<Option<PausedState>, StorageError>> {
         Box::pin(async move {
-            let map = self.sessions.lock().unwrap();
+            let map = self.sessions.lock_recover();
             Ok(map.get(id).cloned())
         })
     }
@@ -896,21 +901,20 @@ impl SessionStore for InMemoryStorageProvider {
     ) -> BoxFut<'a, Result<(), StorageError>> {
         Box::pin(async move {
             self.sessions
-                .lock()
-                .unwrap()
+                .lock_recover()
                 .insert(id.clone(), state.clone());
             Ok(())
         })
     }
     fn delete_session<'a>(&'a self, id: &'a SessionId) -> BoxFut<'a, Result<(), StorageError>> {
         Box::pin(async move {
-            self.sessions.lock().unwrap().remove(id);
+            self.sessions.lock_recover().remove(id);
             Ok(())
         })
     }
     fn list_sessions(&self) -> BoxFut<'_, Result<Vec<SessionId>, StorageError>> {
         Box::pin(async move {
-            let mut keys: Vec<SessionId> = self.sessions.lock().unwrap().keys().cloned().collect();
+            let mut keys: Vec<SessionId> = self.sessions.lock_recover().keys().cloned().collect();
             keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
             Ok(keys)
         })
@@ -926,8 +930,7 @@ impl MemoryStore for InMemoryStorageProvider {
     ) -> BoxFut<'a, Result<(), StorageError>> {
         Box::pin(async move {
             self.memory
-                .lock()
-                .unwrap()
+                .lock_recover()
                 .entry((scope, session_id.clone()))
                 .or_default()
                 .push(entry);
@@ -941,7 +944,7 @@ impl MemoryStore for InMemoryStorageProvider {
         limit: usize,
     ) -> BoxFut<'a, Result<Vec<MemoryEntry>, StorageError>> {
         Box::pin(async move {
-            let map = self.memory.lock().unwrap();
+            let map = self.memory.lock_recover();
             let all = map
                 .get(&(scope, session_id.clone()))
                 .cloned()
@@ -958,7 +961,7 @@ impl RunStore for InMemoryStorageProvider {
         key: &'a str,
     ) -> BoxFut<'a, Result<Option<JsonValue>, StorageError>> {
         Box::pin(async move {
-            let map = self.run.lock().unwrap();
+            let map = self.run.lock_recover();
             Ok(map.get(&(session_id.clone(), key.to_string())).cloned())
         })
     }
@@ -970,8 +973,7 @@ impl RunStore for InMemoryStorageProvider {
     ) -> BoxFut<'a, Result<(), StorageError>> {
         Box::pin(async move {
             self.run
-                .lock()
-                .unwrap()
+                .lock_recover()
                 .insert((session_id.clone(), key.to_string()), value);
             Ok(())
         })
@@ -983,8 +985,7 @@ impl RunStore for InMemoryStorageProvider {
     ) -> BoxFut<'a, Result<(), StorageError>> {
         Box::pin(async move {
             self.run
-                .lock()
-                .unwrap()
+                .lock_recover()
                 .remove(&(session_id.clone(), key.to_string()));
             Ok(())
         })
@@ -994,7 +995,7 @@ impl RunStore for InMemoryStorageProvider {
         session_id: &'a SessionId,
     ) -> BoxFut<'a, Result<Vec<String>, StorageError>> {
         Box::pin(async move {
-            let map = self.run.lock().unwrap();
+            let map = self.run.lock_recover();
             let mut keys: Vec<String> = map
                 .keys()
                 .filter(|(s, _)| s == session_id)
@@ -1014,8 +1015,7 @@ impl ObservabilityStore for InMemoryStorageProvider {
     ) -> BoxFut<'a, Result<(), StorageError>> {
         Box::pin(async move {
             self.spans
-                .lock()
-                .unwrap()
+                .lock_recover()
                 .entry(session_id.clone())
                 .or_default()
                 .push(span);
@@ -1029,8 +1029,7 @@ impl ObservabilityStore for InMemoryStorageProvider {
         Box::pin(async move {
             Ok(self
                 .spans
-                .lock()
-                .unwrap()
+                .lock_recover()
                 .get(session_id)
                 .cloned()
                 .unwrap_or_default())

@@ -273,12 +273,12 @@ pub fn classify_response(response: ModelResponse) -> TurnResult {
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut text_parts: Vec<String> = Vec::new();
     let mut reasoning_parts: Vec<String> = Vec::new();
-    for block in &response.content {
+    for block in response.content {
         match block {
-            ContentBlock::ToolUse(tc) => tool_calls.push(tc.clone()),
-            ContentBlock::Text { text } => text_parts.push(text.clone()),
+            ContentBlock::ToolUse(tc) => tool_calls.push(tc),
+            ContentBlock::Text { text } => text_parts.push(text),
             // Q4: accumulate thinking text instead of discarding it.
-            ContentBlock::Thinking { text } => reasoning_parts.push(text.clone()),
+            ContentBlock::Thinking { text } => reasoning_parts.push(text),
         }
     }
     let reasoning = if reasoning_parts.is_empty() {

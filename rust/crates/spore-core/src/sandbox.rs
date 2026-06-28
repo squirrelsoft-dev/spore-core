@@ -189,13 +189,9 @@ impl WorkspaceScopedSandbox {
                 });
             }
         };
-        if canonical != config.root && !path_equiv(&canonical, &config.root) {
-            // Accept non-canonical input but record the canonical form so
-            // downstream comparisons are stable.
-            config.root = canonical;
-        } else {
-            config.root = canonical;
-        }
+        // Accept non-canonical input but record the canonical form so
+        // downstream comparisons are stable.
+        config.root = canonical;
 
         // SC-13: canonicalize the optional write_root the same way so the
         // boundary `starts_with` check compares canonical paths.
@@ -384,10 +380,6 @@ impl WorkspaceScopedSandbox {
 
         Ok(canonical)
     }
-}
-
-fn path_equiv(a: &Path, b: &Path) -> bool {
-    a == b
 }
 
 // ============================================================================

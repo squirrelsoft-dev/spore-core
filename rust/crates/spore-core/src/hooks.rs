@@ -96,6 +96,7 @@
 //! Each has a `fire_*` method that is exercised directly by unit tests.
 
 use std::sync::{Arc, Mutex};
+use crate::sync_util::MutexExt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -749,10 +750,17 @@ fn string_from_value(data: JsonValue) -> Result<String, String> {
 pub trait Hook: Send + Sync {
     /// Handle one firing. The context borrows the live data; pre-hooks may
     /// mutate the mutable field directly OR return [`HookDecision::Mutate`].
-    fn handle<'a>(
-        &'a self,
-        ctx: &'a mut HookContext<'a>,
-    ) -> BoxFut<'a, Result<HookDecision, HookError>>;
+    ///
+    /// The call/borrow lifetime `'c` is intentionally decoupled from the data
+    /// lifetime inside [`HookContext`] (the elided `'_`). Tying them together
+    /// (`&'a mut HookContext<'a>`) makes the context invariant and forces the
+    /// chain to reborrow it across a sequence of hooks, which previously
+    /// required an `unsafe` transmute. Keeping them separate lets the chain use
+    /// an ordinary `&mut *ctx` reborrow.
+    fn handle<'c>(
+        &'c self,
+        ctx: &'c mut HookContext<'_>,
+    ) -> BoxFut<'c, Result<HookDecision, HookError>>;
 
     /// The events this hook subscribes to.
     fn events(&self) -> Vec<HookEvent>;
@@ -795,10 +803,10 @@ pub trait HookChain: Send + Sync {
     /// Fire a pre/post event whose context is fully owned by the caller. The
     /// chain threads mutations through `ctx` in place and returns the aggregate
     /// outcome (first Block/Deny wins; Injects are newline-joined).
-    fn fire<'a>(
-        &'a self,
-        ctx: &'a mut HookContext<'a>,
-    ) -> BoxFut<'a, Result<FireOutcome, HookError>>;
+    fn fire<'c>(
+        &'c self,
+        ctx: &'c mut HookContext<'_>,
+    ) -> BoxFut<'c, Result<FireOutcome, HookError>>;
 }
 
 // ============================================================================
@@ -827,7 +835,7 @@ impl StandardHookChain {
     /// registration order. Cheap `Arc` clones; releases the lock before firing
     /// so handlers never re-enter the chain under the lock.
     fn hooks_for(&self, event: HookEvent) -> Vec<Arc<dyn Hook>> {
-        let guard = self.entries.lock().expect("hook chain mutex poisoned");
+        let guard = self.entries.lock_recover();
         guard
             .iter()
             .filter(|e| e.hook.events().contains(&event))
@@ -854,16 +862,15 @@ impl HookChain for StandardHookChain {
             }
         }
         self.entries
-            .lock()
-            .expect("hook chain mutex poisoned")
+            .lock_recover()
             .push(Entry { hook });
         Ok(())
     }
 
-    fn fire<'a>(
-        &'a self,
-        ctx: &'a mut HookContext<'a>,
-    ) -> BoxFut<'a, Result<FireOutcome, HookError>> {
+    fn fire<'c>(
+        &'c self,
+        ctx: &'c mut HookContext<'_>,
+    ) -> BoxFut<'c, Result<FireOutcome, HookError>> {
         Box::pin(async move {
             let event = ctx.event();
             let hooks = self.hooks_for(event);
@@ -888,11 +895,14 @@ impl HookChain for StandardHookChain {
                     continue;
                 }
 
-                // SAFETY-FREE reborrow: `ctx` is `&mut HookContext<'a>`; the
-                // hook borrows it for the duration of the await, then we regain
+                // Ordinary reborrow: `ctx` is `&mut HookContext<'_>`; the hook
+                // borrows it for the duration of the await, then we regain
                 // exclusive access for the next hook (sequential, never
-                // overlapping). This threads R2 mutation chaining.
-                let decision = hook.handle(reborrow(ctx)).await?;
+                // overlapping). This threads R2 mutation chaining. Because the
+                // context's data lifetime is decoupled from the call lifetime
+                // (see `Hook::handle`), `&mut *ctx` shortens only the outer
+                // borrow — no `unsafe` needed.
+                let decision = hook.handle(&mut *ctx).await?;
                 decision.validate_for(event)?; // R24
 
                 match decision {
@@ -915,17 +925,6 @@ impl HookChain for StandardHookChain {
     }
 }
 
-/// Reborrow a `&mut HookContext<'a>` for a hook's `handle` call. The lifetimes
-/// line up because each call is sequential and exclusive.
-fn reborrow<'a, 'b>(ctx: &'b mut HookContext<'a>) -> &'b mut HookContext<'b>
-where
-    'a: 'b,
-{
-    // The variants only ever shorten the borrow; this is sound because every
-    // field is covariant in its lifetime and accesses are sequential.
-    unsafe { std::mem::transmute(ctx) }
-}
-
 /// Spawn a detached fire-and-forget task on the current tokio runtime if one is
 /// present; otherwise drop the future (test contexts without a runtime). The
 /// harness always runs under tokio, so production async hooks always spawn.
@@ -943,8 +942,9 @@ where
 // FunctionHook — inline closure handler
 // ============================================================================
 
-type HookFn =
-    dyn for<'a> Fn(&'a mut HookContext<'a>) -> Result<HookDecision, HookError> + Send + Sync;
+type HookFn = dyn for<'c, 'd> Fn(&'c mut HookContext<'d>) -> Result<HookDecision, HookError>
+    + Send
+    + Sync;
 
 /// A [`Hook`] backed by an inline closure. The primary handler type for harness
 /// builders (R23). The closure runs synchronously inside `handle`.
@@ -958,7 +958,7 @@ pub struct FunctionHook {
 impl FunctionHook {
     pub fn new<F>(name: impl Into<String>, events: Vec<HookEvent>, func: F) -> Self
     where
-        F: for<'a> Fn(&'a mut HookContext<'a>) -> Result<HookDecision, HookError>
+        F: for<'c, 'd> Fn(&'c mut HookContext<'d>) -> Result<HookDecision, HookError>
             + Send
             + Sync
             + 'static,
@@ -980,10 +980,10 @@ impl FunctionHook {
 }
 
 impl Hook for FunctionHook {
-    fn handle<'a>(
-        &'a self,
-        ctx: &'a mut HookContext<'a>,
-    ) -> BoxFut<'a, Result<HookDecision, HookError>> {
+    fn handle<'c>(
+        &'c self,
+        ctx: &'c mut HookContext<'_>,
+    ) -> BoxFut<'c, Result<HookDecision, HookError>> {
         let result = (self.func)(ctx);
         Box::pin(async move { result })
     }
@@ -1102,10 +1102,10 @@ impl CommandHook {
 }
 
 impl Hook for CommandHook {
-    fn handle<'a>(
-        &'a self,
-        ctx: &'a mut HookContext<'a>,
-    ) -> BoxFut<'a, Result<HookDecision, HookError>> {
+    fn handle<'c>(
+        &'c self,
+        ctx: &'c mut HookContext<'_>,
+    ) -> BoxFut<'c, Result<HookDecision, HookError>> {
         let result = self.run(ctx);
         Box::pin(async move { result })
     }
@@ -1164,10 +1164,10 @@ pub mod mock {
     }
 
     impl Hook for MockHook {
-        fn handle<'a>(
-            &'a self,
-            _ctx: &'a mut HookContext<'a>,
-        ) -> BoxFut<'a, Result<HookDecision, HookError>> {
+        fn handle<'c>(
+            &'c self,
+            _ctx: &'c mut HookContext<'_>,
+        ) -> BoxFut<'c, Result<HookDecision, HookError>> {
             self.fired.fetch_add(1, Ordering::SeqCst);
             let d = self.decision.clone();
             Box::pin(async move { Ok(d) })
@@ -1214,7 +1214,7 @@ mod tests {
                     vec![HookEvent::PostTurn],
                     move |_ctx| {
                         counter.fetch_add(1, Ordering::SeqCst);
-                        order.lock().unwrap().push(label.clone());
+                        order.lock_recover().push(label.clone());
                         Ok(HookDecision::Continue)
                     },
                 )))
@@ -1228,7 +1228,7 @@ mod tests {
             output: &out,
         };
         chain.fire(&mut ctx).await.unwrap();
-        assert_eq!(*order.lock().unwrap(), vec!["a", "b", "c"]);
+        assert_eq!(*order.lock_recover(), vec!["a", "b", "c"]);
     }
 
     // ── R1 / R16: pre-hook mutation in place ───────────────────────────────

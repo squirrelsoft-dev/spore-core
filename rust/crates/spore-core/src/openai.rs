@@ -191,8 +191,7 @@ impl OpenAIModelInterface {
     /// True if this is an o-series reasoning model (different parameter
     /// constraints — no `temperature`, uses `max_completion_tokens`).
     pub fn is_reasoning_model(model_id: &str) -> bool {
-        let id = model_id;
-        id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4")
+        model_id.starts_with("o1") || model_id.starts_with("o3") || model_id.starts_with("o4")
     }
 }
 
@@ -586,7 +585,7 @@ fn parse_stop_reason(s: Option<&str>) -> StopReason {
     match s {
         Some("tool_calls") | Some("function_call") => StopReason::ToolUse,
         Some("length") => StopReason::MaxTokens,
-        Some("stop") => StopReason::EndTurn,
+        // Everything else (including the canonical "stop") is a normal turn end.
         _ => StopReason::EndTurn,
     }
 }

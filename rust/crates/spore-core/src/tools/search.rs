@@ -51,6 +51,37 @@ impl Default for GrepFilesTool {
     }
 }
 
+/// Walk `root` (recursively when `recursive`, otherwise a single file or the
+/// immediate directory) and collect `(path, line_no, line)` matches for `re`.
+/// Shared by `GrepFilesTool` and `GrepTool`.
+fn collect_matches(
+    root: &Path,
+    re: &regex::Regex,
+    recursive: bool,
+) -> Vec<(String, usize, String)> {
+    let mut matches: Vec<(String, usize, String)> = Vec::new();
+    if recursive {
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if entry.file_type().is_file() {
+                scan_file(entry.path(), re, &mut matches);
+            }
+        }
+    } else if root.is_file() {
+        scan_file(root, re, &mut matches);
+    } else if let Ok(rd) = std::fs::read_dir(root) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_file() {
+                scan_file(&p, re, &mut matches);
+            }
+        }
+    }
+    matches
+}
+
 fn scan_file(path: &Path, re: &regex::Regex, out: &mut Vec<(String, usize, String)>) {
     let Ok(content) = std::fs::read_to_string(path) else {
         return;
@@ -159,26 +190,7 @@ impl Tool for GrepFilesTool {
                 Ok(p) => p,
                 Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
             };
-            let mut matches: Vec<(String, usize, String)> = Vec::new();
-            if params.recursive {
-                for entry in walkdir::WalkDir::new(&root)
-                    .into_iter()
-                    .filter_map(Result::ok)
-                {
-                    if entry.file_type().is_file() {
-                        scan_file(entry.path(), &re, &mut matches);
-                    }
-                }
-            } else if root.is_file() {
-                scan_file(&root, &re, &mut matches);
-            } else if let Ok(rd) = std::fs::read_dir(&root) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if p.is_file() {
-                        scan_file(&p, &re, &mut matches);
-                    }
-                }
-            }
+            let mut matches = collect_matches(&root, &re, params.recursive);
             matches.sort_by(|a, b| (a.0.as_str(), a.1).cmp(&(b.0.as_str(), b.1)));
             let body = matches
                 .iter()
@@ -360,26 +372,7 @@ impl Tool for GrepTool {
             let use_context =
                 params.context_lines > 0 && params.output_mode == GrepOutputMode::Content;
 
-            let mut matches: Vec<(String, usize, String)> = Vec::new();
-            if params.recursive {
-                for entry in walkdir::WalkDir::new(&root)
-                    .into_iter()
-                    .filter_map(Result::ok)
-                {
-                    if entry.file_type().is_file() {
-                        scan_file(entry.path(), &re, &mut matches);
-                    }
-                }
-            } else if root.is_file() {
-                scan_file(&root, &re, &mut matches);
-            } else if let Ok(rd) = std::fs::read_dir(&root) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if p.is_file() {
-                        scan_file(&p, &re, &mut matches);
-                    }
-                }
-            }
+            let mut matches = collect_matches(&root, &re, params.recursive);
             matches.sort_by(|a, b| (a.0.as_str(), a.1).cmp(&(b.0.as_str(), b.1)));
 
             let body = match params.output_mode {

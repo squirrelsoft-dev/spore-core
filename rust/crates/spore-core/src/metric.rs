@@ -30,7 +30,7 @@
 //!     improvement. Equal scores are discarded.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -213,7 +213,7 @@ fn parse_metric(output: &str, pattern: &str) -> Result<f64, MetricError> {
         })
 }
 
-async fn write_log(sandbox: &dyn SandboxProvider, path: &PathBuf, body: &str) {
+async fn write_log(sandbox: &dyn SandboxProvider, path: &Path, body: &str) {
     let _ = tokio::fs::write(sandbox.workspace_root().join(path), body).await;
 }
 

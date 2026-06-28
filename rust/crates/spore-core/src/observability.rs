@@ -82,6 +82,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use crate::sync_util::MutexExt;
 
 use serde::{Deserialize, Serialize};
 
@@ -339,10 +340,7 @@ pub fn truncate_field(s: &str, max: usize) -> (String, bool) {
         return (s.to_string(), false);
     }
     // Back off to the largest char boundary <= max.
-    let mut boundary = max;
-    while boundary > 0 && !s.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
+    let boundary = crate::text_util::floor_char_boundary(s, max);
     let mut out = String::with_capacity(boundary + TRUNCATION_MARKER.len());
     out.push_str(&s[..boundary]);
     out.push_str(TRUNCATION_MARKER);
@@ -948,8 +946,7 @@ impl InMemoryObservabilityProvider {
     /// issue #70) without reconstructing them from the heterogeneous trace.
     pub fn turn_spans(&self, session_id: &SessionId) -> Vec<TurnSpan> {
         self.inner
-            .lock()
-            .unwrap()
+            .lock_recover()
             .turns
             .iter()
             .filter(|t| t.base.session_id == *session_id)
@@ -962,8 +959,7 @@ impl InMemoryObservabilityProvider {
     /// [`PatchType`] without reconstructing them from the heterogeneous trace.
     pub fn patch_spans(&self, session_id: &SessionId) -> Vec<PatchSpan> {
         self.inner
-            .lock()
-            .unwrap()
+            .lock_recover()
             .patches
             .iter()
             .filter(|p| p.base.session_id == *session_id)
@@ -976,8 +972,7 @@ impl InMemoryObservabilityProvider {
     /// reconstructing them from the heterogeneous trace.
     pub fn warn_spans(&self, session_id: &SessionId) -> Vec<WarnSpan> {
         self.inner
-            .lock()
-            .unwrap()
+            .lock_recover()
             .warns
             .iter()
             .filter(|w| w.base.session_id == *session_id)
@@ -990,8 +985,7 @@ impl InMemoryObservabilityProvider {
     /// [`ContextOperation`] to inspect compaction reclamation (issue #57).
     pub fn context_spans(&self, session_id: &SessionId) -> Vec<ContextSpan> {
         self.inner
-            .lock()
-            .unwrap()
+            .lock_recover()
             .contexts
             .iter()
             .filter(|c| c.base.session_id == *session_id)
@@ -1002,8 +996,7 @@ impl InMemoryObservabilityProvider {
     /// Record the guides selected for a session. Called once at session start.
     pub fn record_guides_used(&self, session_id: &SessionId, guides: Vec<GuideId>) {
         self.inner
-            .lock()
-            .unwrap()
+            .lock_recover()
             .guides_used
             .insert(session_id.clone(), guides);
     }
@@ -1019,7 +1012,7 @@ fn push_order(store: &mut Store, sid: &SessionId, kind: SpanKind, span_id: SpanI
 
 impl ObservabilityProvider for InMemoryObservabilityProvider {
     fn emit_turn(&self, span: TurnSpan) {
-        let mut s = self.inner.lock().unwrap();
+        let mut s = self.inner.lock_recover();
         push_order(
             &mut s,
             &span.base.session_id,
@@ -1029,7 +1022,7 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
         s.turns.push(span);
     }
     fn emit_tool_call(&self, span: ToolCallSpan) {
-        let mut s = self.inner.lock().unwrap();
+        let mut s = self.inner.lock_recover();
         push_order(
             &mut s,
             &span.base.session_id,
@@ -1039,7 +1032,7 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
         s.tool_calls.push(span);
     }
     fn emit_sensor(&self, span: SensorSpan) {
-        let mut s = self.inner.lock().unwrap();
+        let mut s = self.inner.lock_recover();
         push_order(
             &mut s,
             &span.base.session_id,
@@ -1049,7 +1042,7 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
         s.sensors.push(span);
     }
     fn emit_context(&self, span: ContextSpan) {
-        let mut s = self.inner.lock().unwrap();
+        let mut s = self.inner.lock_recover();
         let kind = match span.operation {
             ContextOperation::Compaction { .. } => SpanKind::Compaction,
             _ => SpanKind::ContextAssembly,
@@ -1063,7 +1056,7 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
         s.contexts.push(span);
     }
     fn emit_middleware(&self, span: MiddlewareSpan) {
-        let mut s = self.inner.lock().unwrap();
+        let mut s = self.inner.lock_recover();
         push_order(
             &mut s,
             &span.base.session_id,
@@ -1073,7 +1066,7 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
         s.middlewares.push(span);
     }
     fn emit_patch(&self, span: PatchSpan) {
-        let mut s = self.inner.lock().unwrap();
+        let mut s = self.inner.lock_recover();
         push_order(
             &mut s,
             &span.base.session_id,
@@ -1083,7 +1076,7 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
         s.patches.push(span);
     }
     fn emit_warn(&self, span: WarnSpan) {
-        let mut s = self.inner.lock().unwrap();
+        let mut s = self.inner.lock_recover();
         push_order(
             &mut s,
             &span.base.session_id,
@@ -1095,15 +1088,14 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
 
     fn set_session_outcome(&self, session_id: &SessionId, outcome: SessionOutcome) {
         self.inner
-            .lock()
-            .unwrap()
+            .lock_recover()
             .outcomes
             .insert(session_id.clone(), outcome);
     }
 
     fn flush_session<'a>(&'a self, session_id: &'a SessionId) -> BoxFut<'a, ()> {
         Box::pin(async move {
-            let mut s = self.inner.lock().unwrap();
+            let mut s = self.inner.lock_recover();
             s.flushed.insert(session_id.clone(), true);
         })
     }
@@ -1113,7 +1105,7 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
         session_id: &'a SessionId,
     ) -> BoxFut<'a, Option<SessionMetrics>> {
         Box::pin(async move {
-            let s = self.inner.lock().unwrap();
+            let s = self.inner.lock_recover();
             let turns: Vec<&TurnSpan> = s
                 .turns
                 .iter()
@@ -1217,7 +1209,7 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
         Box::pin(async move {
             // Collect distinct session ids that have spans with started_at >= since.
             let mut session_ids: Vec<SessionId> = {
-                let s = self.inner.lock().unwrap();
+                let s = self.inner.lock_recover();
                 let mut ids: Vec<SessionId> = s
                     .turns
                     .iter()
@@ -1246,7 +1238,7 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
 
     fn get_trace<'a>(&'a self, session_id: &'a SessionId) -> BoxFut<'a, Vec<Box<dyn Span>>> {
         Box::pin(async move {
-            let s = self.inner.lock().unwrap();
+            let s = self.inner.lock_recover();
             let order = match s.trace_order.get(session_id) {
                 Some(v) => v.clone(),
                 None => return Vec::new(),
@@ -1789,7 +1781,7 @@ mod tests {
         assert_eq!(trace.len(), 1);
         assert_eq!(trace[0].base().kind, SpanKind::Patch);
         // R3: both original and patched present and different.
-        let patches = obs.inner.lock().unwrap();
+        let patches = obs.inner.lock_recover();
         let p = &patches.patches[0];
         assert_ne!(p.original_parameters, p.patched_parameters);
     }

@@ -39,6 +39,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use crate::sync_util::MutexExt;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -286,35 +287,8 @@ impl StandardSensorChain {
     /// Pin the "now" timestamp recorded on result history. Tests use this for
     /// determinism; otherwise the system clock is consulted.
     pub fn set_now(&self, now: Timestamp) {
-        self.inner.lock().unwrap().now_override = Some(now);
+        self.inner.lock_recover().now_override = Some(now);
     }
-}
-
-fn now_rfc3339() -> Timestamp {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    Timestamp::new(format_rfc3339_secs(secs))
-}
-
-fn format_rfc3339_secs(secs: i64) -> String {
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let hh = (rem / 3600) as u32;
-    let mm = ((rem % 3600) / 60) as u32;
-    let ss = (rem % 60) as u32;
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y0 = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let y = if m <= 2 { y0 + 1 } else { y0 };
-    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
 /// Decide whether an inferential sensor should run on this input, given its
@@ -354,7 +328,7 @@ impl StandardSensorChain {
                 reason: "sensor must declare at least one trigger".into(),
             });
         }
-        let mut store = self.inner.lock().unwrap();
+        let mut store = self.inner.lock_recover();
         if store.sensors.iter().any(|e| e.config.id == cfg.id) {
             return Err(SensorError::AlreadyRegistered(cfg.id));
         }
@@ -370,7 +344,7 @@ impl StandardSensorChain {
         // them outside the lock so `evaluate` cannot deadlock by re-entering
         // the chain.
         let candidates: Vec<(SensorId, Arc<dyn Sensor>)> = {
-            let mut store = self.inner.lock().unwrap();
+            let mut store = self.inner.lock_recover();
             store.sessions_seen.insert(input.session_id.clone());
             store
                 .sensors
@@ -384,7 +358,7 @@ impl StandardSensorChain {
         let mut results = Vec::with_capacity(candidates.len());
         for (sensor_id, sensor) in candidates {
             let result = sensor.evaluate(input).await;
-            let mut store = self.inner.lock().unwrap();
+            let mut store = self.inner.lock_recover();
             store.history.push(HistoryRecord {
                 sensor_id: sensor_id.clone(),
                 session_id: input.session_id.clone(),
@@ -394,7 +368,6 @@ impl StandardSensorChain {
             results.push(result);
         }
 
-        let _ = now_rfc3339; // keep symbol live for impls that want it
         results
     }
 
@@ -407,7 +380,7 @@ impl StandardSensorChain {
             halt: u32,
             last: Option<Timestamp>,
         }
-        let store = self.inner.lock().unwrap();
+        let store = self.inner.lock_recover();
         let mut by_sensor: HashMap<SensorId, Agg> = HashMap::new();
 
         for entry in &store.sensors {
@@ -473,7 +446,7 @@ impl StandardSensorChain {
     }
 
     fn signal_quality_report_impl(&self, min_sessions: u32) -> Vec<SensorSignalFlag> {
-        let store = self.inner.lock().unwrap();
+        let store = self.inner.lock_recover();
         let sessions_observed = store.sessions_seen.len() as u32;
         let mut out = Vec::new();
 

@@ -87,11 +87,12 @@
 //!   stubs (canonical type lands with issue #6).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::RwLock;
+
+use crate::sync_util::RwLockExt;
 
 use crate::harness::{
     BoxFut, SandboxProvider, SandboxViolation, SessionId, ToolOutput,
@@ -354,9 +355,11 @@ struct Registered {
     schema: ToolSchema,
 }
 
-/// Default in-memory registry. Concurrency-safe: register/lookup go through
-/// an async `RwLock`. The lock is held briefly (lookup + clone of `Arc`); the
-/// tool itself executes lock-free.
+/// Default in-memory registry. Concurrency-safe: register/lookup go through a
+/// `std::sync::RwLock`. The lock is held briefly (lookup + clone of `Arc`) and
+/// never across an `.await`, so a blocking lock is correct and avoids the
+/// panic-on-contention of `try_read()`/`try_write()`; the tool itself executes
+/// lock-free.
 pub struct StandardToolRegistry {
     tools: RwLock<HashMap<String, Registered>>,
     sets: RwLock<Vec<ToolSet>>,
@@ -436,8 +439,8 @@ impl StandardToolRegistry {
         Ok(())
     }
 
-    async fn lookup(&self, name: &str) -> Option<(Arc<dyn Tool>, ToolSchema)> {
-        let guard = self.tools.read().await;
+    fn lookup(&self, name: &str) -> Option<(Arc<dyn Tool>, ToolSchema)> {
+        let guard = self.tools.read_recover();
         guard.get(name).map(|r| (r.tool.clone(), r.schema.clone()))
     }
 }
@@ -462,10 +465,7 @@ impl ToolRegistry for StandardToolRegistry {
         }
         Self::validate_schema(&schema)?;
         Self::validate_annotations(&schema)?;
-        let mut guard = self
-            .tools
-            .try_write()
-            .expect("tool registration must not contend with dispatch");
+        let mut guard = self.tools.write_recover();
         // Last-wins upsert (issue #81, Q1): registering a tool whose name is
         // already present OVERWRITES the prior registration. This is what lets
         // an architect override a standard tool by registering their own after
@@ -484,10 +484,7 @@ impl ToolRegistry for StandardToolRegistry {
                 reason: "tool set name must not be empty".into(),
             });
         }
-        let mut guard = self
-            .sets
-            .try_write()
-            .expect("set registration must not contend with dispatch");
+        let mut guard = self.sets.write_recover();
         if guard.iter().any(|s| s.name == set.name) {
             return Err(RegistrationError::DuplicateName {
                 tool: set.name.clone(),
@@ -498,14 +495,8 @@ impl ToolRegistry for StandardToolRegistry {
     }
 
     fn active_schemas(&self, phase: Option<TaskPhase>) -> Vec<ToolSchema> {
-        let tools = self
-            .tools
-            .try_read()
-            .expect("active_schemas should not contend with dispatch in tests");
-        let sets = self
-            .sets
-            .try_read()
-            .expect("active_schemas should not contend with dispatch in tests");
+        let tools = self.tools.read_recover();
+        let sets = self.sets.read_recover();
 
         let mut out: Vec<ToolSchema> = match phase {
             None => tools.values().map(|r| r.schema.clone()).collect(),
@@ -547,7 +538,7 @@ impl ToolRegistry for StandardToolRegistry {
         ctx: &'a ToolContext,
     ) -> BoxFut<'a, Result<ToolResult, DispatchError>> {
         Box::pin(async move {
-            let (tool, schema) = match self.lookup(&call.name).await {
+            let (tool, schema) = match self.lookup(&call.name) {
                 Some(t) => t,
                 None => {
                     return Err(DispatchError::UnregisteredTool {
@@ -585,7 +576,7 @@ impl ToolRegistry for StandardToolRegistry {
             // sequential failures.
             let mut classifications: Vec<bool> = Vec::with_capacity(calls.len()); // true = concurrent
             for call in &calls {
-                let concurrent = match self.lookup(&call.name).await {
+                let concurrent = match self.lookup(&call.name) {
                     Some((_, schema)) => {
                         let a = schema.annotations;
                         a.read_only && !a.destructive && !a.open_world
@@ -635,10 +626,7 @@ impl ToolRegistry for StandardToolRegistry {
     }
 
     fn has_subagent_tools(&self) -> bool {
-        let guard = self
-            .tools
-            .try_read()
-            .expect("has_subagent_tools should not contend with dispatch in tests");
+        let guard = self.tools.read_recover();
         guard.values().any(|r| r.tool.is_subagent_tool())
     }
 }

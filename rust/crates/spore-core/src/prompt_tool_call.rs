@@ -53,6 +53,7 @@ const TOOLS_BLOCK_OPEN: &str = "<available_tools>";
 /// Render the tool-definition + response-format block appended to the system
 /// prompt when prompt-based tool calling is active.
 fn build_tool_prompt(tools: &[ToolSchema]) -> String {
+    use std::fmt::Write as _;
     let mut s = String::new();
     s.push_str(
         "You have access to the following tools. Use them when they would help \
@@ -61,14 +62,11 @@ complete the task.\n\n",
     s.push_str("<available_tools>\n");
     for tool in tools {
         s.push_str("<tool>\n");
-        s.push_str(&format!("  <name>{}</name>\n", tool.name));
-        s.push_str(&format!(
-            "  <description>{}</description>\n",
-            tool.description
-        ));
+        let _ = writeln!(s, "  <name>{}</name>", tool.name);
+        let _ = writeln!(s, "  <description>{}</description>", tool.description);
         let schema_json =
             serde_json::to_string(&tool.input_schema).unwrap_or_else(|_| "{}".to_string());
-        s.push_str(&format!("  <input_schema>{schema_json}</input_schema>\n"));
+        let _ = writeln!(s, "  <input_schema>{schema_json}</input_schema>");
         s.push_str("</tool>\n");
     }
     s.push_str("</available_tools>\n\n");

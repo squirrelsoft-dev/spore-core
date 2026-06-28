@@ -4947,6 +4947,45 @@ impl SandboxViolation {
     }
 }
 
+impl std::fmt::Display for SandboxViolation {
+    /// Stable, model-facing rendering. Used wherever a violation is surfaced to
+    /// the model as a tool-error message (instead of leaking the Rust `Debug`
+    /// enum syntax). This output is a cross-language contract — keep it in sync
+    /// with the TS/Py/Go ports.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SandboxViolation::PathEscape { path } => {
+                write!(f, "path escapes the workspace: {path}")
+            }
+            SandboxViolation::NetworkViolation { host } => {
+                write!(f, "network access blocked: {host}")
+            }
+            SandboxViolation::PathDenied { path, matched_rule } => {
+                if matched_rule.is_empty() {
+                    write!(f, "path denied: {path}")
+                } else {
+                    write!(f, "path denied: {path} (rule: {matched_rule})")
+                }
+            }
+            SandboxViolation::ReadOnlyViolation { path } => {
+                write!(f, "write to read-only path: {path}")
+            }
+            SandboxViolation::ExtensionDenied { path, extension } => {
+                write!(f, "file extension '{extension}' not allowed: {path}")
+            }
+            SandboxViolation::FileSizeExceeded { path, size, limit } => {
+                write!(f, "file size {size} exceeds limit {limit}: {path}")
+            }
+            SandboxViolation::DisallowedCommand { command } => {
+                write!(f, "command not allowed: {command}")
+            }
+            SandboxViolation::ExecSpawnFailed { command, message } => {
+                write!(f, "failed to spawn command '{command}': {message}")
+            }
+        }
+    }
+}
+
 /// How the harness treats a [`SandboxViolation`] surfaced by a tool (or the
 /// pre-dispatch `validate` check): coach the model and let it retry, or halt the
 /// run outright.
@@ -5518,7 +5557,7 @@ pub enum VcsError {
     #[error("vcs command failed: {message}")]
     CommandFailed { message: String },
     /// The VCS command was blocked or could not be spawned by the sandbox.
-    #[error("vcs command blocked by sandbox: {0:?}")]
+    #[error("vcs command blocked by sandbox: {0}")]
     Sandbox(SandboxViolation),
 }
 
@@ -6618,10 +6657,10 @@ struct RalphStopHook {
 }
 
 impl crate::hooks::Hook for RalphStopHook {
-    fn handle<'a>(
-        &'a self,
-        ctx: &'a mut crate::hooks::HookContext<'a>,
-    ) -> BoxFut<'a, Result<crate::hooks::HookDecision, crate::hooks::HookError>> {
+    fn handle<'c>(
+        &'c self,
+        ctx: &'c mut crate::hooks::HookContext<'_>,
+    ) -> BoxFut<'c, Result<crate::hooks::HookDecision, crate::hooks::HookError>> {
         Box::pin(async move {
             // Only act on `Stop`; any other event is a no-op `Continue`.
             if !matches!(ctx, crate::hooks::HookContext::Stop { .. }) {
@@ -6873,6 +6912,7 @@ impl std::fmt::Debug for MemoryConfig {
 /// Every component, including the agent, is held erased behind `Arc<dyn _>`.
 /// The `Agent` trait (issue #2) is dyn-compatible via the hand-rolled `BoxFut`
 /// pattern, so no type parameter is needed (issue #45).
+#[derive(Clone)]
 pub struct HarnessConfig {
     pub tool_registry: Arc<dyn ToolRegistry>,
     pub sandbox: Arc<dyn SandboxProvider>,
@@ -7127,51 +7167,6 @@ pub struct HarnessConfig {
     /// and the model loads the rest of the catalogue on demand. `None` (the
     /// default) advertises the full catalogue, byte-for-byte today's behaviour.
     pub tool_search: Option<crate::tool_registry::ToolSearchConfig>,
-}
-
-impl Clone for HarnessConfig {
-    fn clone(&self) -> Self {
-        Self {
-            tool_registry: self.tool_registry.clone(),
-            sandbox: self.sandbox.clone(),
-            sandbox_violation_policy: self.sandbox_violation_policy,
-            context_manager: self.context_manager.clone(),
-            termination_policy: self.termination_policy.clone(),
-            middleware: self.middleware.clone(),
-            observability: self.observability.clone(),
-            compaction_verifier: self.compaction_verifier.clone(),
-            max_compaction_attempts: self.max_compaction_attempts,
-            pricing: self.pricing.clone(),
-            content_capture: self.content_capture,
-            tool_call_repair: self.tool_call_repair.clone(),
-            max_repair_attempts: self.max_repair_attempts,
-            plan_empty_max_retries: self.plan_empty_max_retries,
-            tool_call_nudge: self.tool_call_nudge,
-            max_stop_blocks: self.max_stop_blocks,
-            error_loop_threshold: self.error_loop_threshold,
-            enforce_output_schemas: self.enforce_output_schemas,
-            output_schema_max_retries: self.output_schema_max_retries,
-            hooks: self.hooks.clone(),
-            storage: self.storage.clone(),
-            project_id: self.project_id.clone(),
-            chunk_provider: self.chunk_provider.clone(),
-            max_resets: self.max_resets,
-            vcs_provider: self.vcs_provider.clone(),
-            catalogue_registry: self.catalogue_registry.clone(),
-            toolset_catalogues: self.toolset_catalogues.clone(),
-            system_prompt: self.system_prompt.clone(),
-            guides: self.guides.clone(),
-            skills: self.skills.clone(),
-            memory: self.memory.clone(),
-            model_params: self.model_params.clone(),
-            auto_persist_sessions: self.auto_persist_sessions,
-            prompt_tool_call_flag: self.prompt_tool_call_flag.clone(),
-            consult_handlers: self.consult_handlers.clone(),
-            registry: self.registry.clone(),
-            escalation_mode: self.escalation_mode.clone(),
-            tool_search: self.tool_search.clone(),
-        }
-    }
 }
 
 /// Fluent assembler for a [`HarnessConfig`] / [`StandardHarness`].
@@ -8300,7 +8295,7 @@ pub struct StandardHarness {
 }
 
 impl StandardHarness {
-    pub fn new(config: HarnessConfig) -> Self {
+    pub fn new(mut config: HarnessConfig) -> Self {
         // Ralph completion mechanism (issue #58, B1): register a `Stop` hook
         // that drives multi-context-window continuation off the Ralph checkpoint.
         // #142: the checkpoint moved off `.spore/progress.json` onto the durable
@@ -8308,17 +8303,16 @@ impl StandardHarness {
         // hook only BLOCKS when the progress checkpoint key is PRESENT and reports
         // incomplete tasks; when it is absent (the common case for ReAct / other
         // strategies) it returns `Continue`, so existing strategies are unaffected.
-        let chain: Arc<dyn crate::hooks::HookChain> = match config.hooks.clone() {
-            Some(c) => c,
-            None => Arc::new(crate::hooks::StandardHookChain::new()),
-        };
+        let chain: Arc<dyn crate::hooks::HookChain> = config
+            .hooks
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::hooks::StandardHookChain::new()));
         // Best-effort: a duplicate/invalid registration must never panic the
         // constructor. The hook subscribes only to the can-block `Stop` event.
         let _ = chain.register(Arc::new(RalphStopHook {
             run_store: config.storage.run().clone(),
             project_id: config.project_id.clone(),
         }));
-        let mut config = config;
         config.hooks = Some(chain);
         Self {
             config,
@@ -8417,7 +8411,7 @@ impl StandardHarness {
             ToolOutput::SandboxViolation { violation } => {
                 let recoverable = !self.sandbox_violation_halts(&violation);
                 ToolOutput::Error {
-                    message: format!("sandbox violation: {violation:?}"),
+                    message: format!("sandbox violation: {violation}"),
                     recoverable,
                 }
             }
@@ -9865,7 +9859,7 @@ report only what the tools returned."
                             let tr = ToolResult {
                                 call_id: call.id.clone(),
                                 output: ToolOutput::Error {
-                                    message: format!("sandbox: {violation:?}"),
+                                    message: format!("sandbox: {violation}"),
                                     recoverable: true,
                                 },
                             };
@@ -9875,7 +9869,7 @@ report only what the tools returned."
                                     call_id: call.id.clone(),
                                     is_error: true,
                                     // Q5: carry the result content.
-                                    content: format!("sandbox: {violation:?}"),
+                                    content: format!("sandbox: {violation}"),
                                     revised: false,
                                     node: None,
                                 },
@@ -9984,7 +9978,7 @@ report only what the tools returned."
                                     session_state: session_state.clone(),
                                 };
                             }
-                            let message = format!("sandbox violation: {violation:?}");
+                            let message = format!("sandbox violation: {violation}");
                             output = ToolOutput::Error {
                                 message,
                                 recoverable: true,
@@ -13534,7 +13528,7 @@ pub mod testing {
                     ToolOutput::Success { content, .. } => content.clone(),
                     ToolOutput::Error { message, .. } => format!("[error] {message}"),
                     ToolOutput::SandboxViolation { violation } => {
-                        format!("[error] sandbox violation: {violation:?}")
+                        format!("[error] sandbox violation: {violation}")
                     }
                     ToolOutput::WaitingForHuman { .. } => "[waiting]".into(),
                     ToolOutput::Escalate { .. } => "[escalate]".into(),
@@ -21675,10 +21669,10 @@ mod tests {
         fired: std::sync::atomic::AtomicU32,
     }
     impl crate::hooks::Hook for CountingStopHook {
-        fn handle<'a>(
-            &'a self,
-            _ctx: &'a mut crate::hooks::HookContext<'a>,
-        ) -> BoxFut<'a, Result<crate::hooks::HookDecision, crate::hooks::HookError>> {
+        fn handle<'c>(
+            &'c self,
+            _ctx: &'c mut crate::hooks::HookContext<'_>,
+        ) -> BoxFut<'c, Result<crate::hooks::HookDecision, crate::hooks::HookError>> {
             let n = self.fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let decision = if n < self.block_first_n {
                 crate::hooks::HookDecision::Block {
@@ -22083,9 +22077,10 @@ mod tests {
         // phase's write (over the writable sandbox) was NOT rejected, so exactly
         // ONE ReadOnlyViolation appears across the worker's contexts.
         let seen = build.seen_text();
+        // Matches the `SandboxViolation: Display` rendering of `ReadOnlyViolation`.
         let violations = seen
             .iter()
-            .filter(|c| c.contains("ReadOnlyViolation"))
+            .filter(|c| c.contains("write to read-only path"))
             .count();
         assert_eq!(
             violations, 1,

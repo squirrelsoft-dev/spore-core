@@ -1,19 +1,12 @@
 //! HTTP tools: HttpGet, HttpPost.
 
-use std::sync::OnceLock;
-
 use serde_json::{json, Value};
 
 use crate::harness::{BoxFut, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
-use crate::tools::finish_with_possible_truncation;
 use crate::tools::params::{parse_params, HttpGetParams, HttpPostParams};
-
-fn shared_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
-}
+use crate::tools::{finish_with_possible_truncation, shared_client};
 
 fn apply_headers(
     mut req: reqwest::RequestBuilder,

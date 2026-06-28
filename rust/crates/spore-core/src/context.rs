@@ -976,13 +976,15 @@ impl<M: ModelInterface + 'static> ContextManager for StandardContextManager<M> {
         // Block-3 ephemeral injection: append to system prompt content, do
         // not modify message history, do not invalidate Block 1 or Block 2
         // (their hashes are untouched).
+        use std::fmt::Write as _;
         if !context.system_prompt.content.ends_with('\n') {
             context.system_prompt.content.push('\n');
         }
-        context
-            .system_prompt
-            .content
-            .push_str(&format!("[SKILL:{}]\n{}", skill.id.0, skill.content));
+        let _ = write!(
+            context.system_prompt.content,
+            "[SKILL:{}]\n{}",
+            skill.id.0, skill.content
+        );
         context.meta.skills_injected.push(skill.id.clone());
         Ok(())
     }

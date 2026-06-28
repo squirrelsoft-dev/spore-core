@@ -32,6 +32,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use crate::sync_util::MutexExt;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -89,22 +90,66 @@ impl Timestamp {
     /// Format `secs` since the Unix epoch plus `millis` as RFC 3339 UTC.
     /// Exposed at crate level so deterministic tests can pin a value.
     pub(crate) fn format_rfc3339(secs: i64, millis: u32) -> String {
-        let days = secs.div_euclid(86_400);
-        let rem = secs.rem_euclid(86_400);
-        let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-        // civil_from_days (Hinnant): days since 1970-01-01 → (y, m, d).
-        let z = days + 719_468;
-        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-        let doe = z - era * 146_097; // [0, 146096]
-        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-        let y = yoe + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-        let mp = (5 * doy + 2) / 153; // [0, 11]
-        let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-        let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-        let y = if m <= 2 { y + 1 } else { y };
+        let (y, m, d, hh, mm, ss) = civil_from_days_secs(secs);
         format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{millis:03}Z")
     }
+
+    /// Format `secs` since the Unix epoch as RFC 3339 UTC with **second**
+    /// precision (no fractional part), e.g. `2026-05-16T12:34:56Z`. The single
+    /// owner for second-granularity timestamps across the crate.
+    pub(crate) fn format_rfc3339_secs(secs: i64) -> String {
+        let (y, m, d, hh, mm, ss) = civil_from_days_secs(secs);
+        format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+    }
+
+    /// Parse `YYYY-MM-DDTHH:MM:SSZ` (tolerating a fractional-second suffix) to
+    /// seconds since the Unix epoch. Pure arithmetic — no external dependency.
+    pub(crate) fn parse_rfc3339_secs(s: &str) -> Option<i64> {
+        let s = s.trim_end_matches('Z');
+        let (date, time) = s.split_once('T')?;
+        let mut date_parts = date.split('-');
+        let y: i64 = date_parts.next()?.parse().ok()?;
+        let mo: i64 = date_parts.next()?.parse().ok()?;
+        let d: i64 = date_parts.next()?.parse().ok()?;
+        let time = time.split('.').next()?;
+        let mut tp = time.split(':');
+        let hh: i64 = tp.next()?.parse().ok()?;
+        let mm: i64 = tp.next()?.parse().ok()?;
+        let ss: i64 = tp.next()?.parse().ok()?;
+        Some(days_from_civil(y, mo, d) * 86400 + hh * 3600 + mm * 60 + ss)
+    }
+}
+
+/// Howard Hinnant's `days_from_civil` algorithm — proleptic Gregorian. Days
+/// since 1970-01-01 for the given civil (y, m, d).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Inverse of [`days_from_civil`]: total seconds since the epoch →
+/// `(year, month, day, hour, minute, second)` in UTC.
+fn civil_from_days_secs(total_secs: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = total_secs.div_euclid(86_400);
+    let rem = total_secs.rem_euclid(86_400);
+    let hh = (rem / 3600) as u32;
+    let mm = ((rem % 3600) / 60) as u32;
+    let ss = (rem % 60) as u32;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d, hh, mm, ss)
 }
 
 #[cfg(test)]
@@ -387,7 +432,7 @@ impl StandardMemoryProvider {
     /// Pin the "now" timestamp used to stamp lifecycle transitions
     /// (`deprecate` / `mark_pending_review`). Tests use this for determinism.
     pub fn set_now(&self, now: Timestamp) {
-        self.inner.lock().unwrap().now_override = Some(now);
+        self.inner.lock_recover().now_override = Some(now);
     }
 
     fn next_archive_id(store: &mut Store, original: &MemoryId) -> MemoryId {
@@ -448,7 +493,7 @@ impl MemoryProvider for StandardMemoryProvider {
     ) -> BoxFut<'a, Result<MemoryId, MemoryError>> {
         Box::pin(async move {
             validate_content(&memory.content)?;
-            let mut store = self.inner.lock().unwrap();
+            let mut store = self.inner.lock_recover();
             let id = memory.id.clone();
             store
                 .episodic
@@ -464,7 +509,7 @@ impl MemoryProvider for StandardMemoryProvider {
         session_id: &'a SessionId,
     ) -> BoxFut<'a, Result<Vec<EpisodicMemory>, MemoryError>> {
         Box::pin(async move {
-            let store = self.inner.lock().unwrap();
+            let store = self.inner.lock_recover();
             Ok(store.episodic.get(session_id).cloned().unwrap_or_default())
         })
     }
@@ -478,7 +523,7 @@ impl MemoryProvider for StandardMemoryProvider {
             validate_content(&memory.content)?;
             enforce_meta_agent_review(&mut memory);
 
-            let mut store = self.inner.lock().unwrap();
+            let mut store = self.inner.lock_recover();
             let id = memory.id.clone();
 
             if let Some(existing) = store.semantic.get(&id).cloned() {
@@ -525,7 +570,7 @@ impl MemoryProvider for StandardMemoryProvider {
         id: &'a MemoryId,
     ) -> BoxFut<'a, Result<SemanticMemory, MemoryError>> {
         Box::pin(async move {
-            let store = self.inner.lock().unwrap();
+            let store = self.inner.lock_recover();
             store
                 .semantic
                 .get(id)
@@ -536,7 +581,7 @@ impl MemoryProvider for StandardMemoryProvider {
 
     fn query<'a>(&'a self, query: MemoryQuery) -> BoxFut<'a, Result<Vec<MemoryItem>, MemoryError>> {
         Box::pin(async move {
-            let store = self.inner.lock().unwrap();
+            let store = self.inner.lock_recover();
             let mut scored: Vec<MemoryItem> = store
                 .semantic
                 .values()
@@ -568,7 +613,7 @@ impl MemoryProvider for StandardMemoryProvider {
         reason: &'a str,
     ) -> BoxFut<'a, Result<(), MemoryError>> {
         Box::pin(async move {
-            let mut store = self.inner.lock().unwrap();
+            let mut store = self.inner.lock_recover();
             // Stamp the transition with "now", not the stale `updated_at` (which
             // predates this deprecation).
             let now = store.now_override.clone().unwrap_or_else(Timestamp::now);
@@ -589,7 +634,7 @@ impl MemoryProvider for StandardMemoryProvider {
         id: &'a MemoryId,
     ) -> BoxFut<'a, Result<Vec<SemanticMemory>, MemoryError>> {
         Box::pin(async move {
-            let store = self.inner.lock().unwrap();
+            let store = self.inner.lock_recover();
             let head = store
                 .semantic
                 .get(id)
@@ -606,7 +651,7 @@ impl MemoryProvider for StandardMemoryProvider {
 
     fn mark_pending_review<'a>(&'a self, id: &'a MemoryId) -> BoxFut<'a, Result<(), MemoryError>> {
         Box::pin(async move {
-            let mut store = self.inner.lock().unwrap();
+            let mut store = self.inner.lock_recover();
             // Stamp the transition with "now", not the stale `updated_at`.
             let now = store.now_override.clone().unwrap_or_else(Timestamp::now);
             let m = store

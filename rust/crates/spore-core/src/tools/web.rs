@@ -56,22 +56,18 @@
 //!    empty secret. Resolved secrets are held only in a private, non-serializable
 //!    struct whose `Debug` impl redacts them.
 
-use std::sync::OnceLock;
-
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 
 use crate::harness::{BoxFut, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
+use crate::text_util::floor_char_boundary;
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::finish_with_possible_truncation;
 use crate::tools::params::{parse_params, WebFetchParams, WebSearchParams};
 
-fn shared_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
-}
+use crate::tools::shared_client;
 
 // ============================================================================
 // SSRF guard — outbound URL policy (validate_fetch_url seam)
@@ -206,13 +202,9 @@ pub(crate) fn apply_web_fetch_range(body: &str, start_byte: u64) -> Result<Strin
     }
     // The model supplies a raw BYTE offset that may land in the middle of a
     // multibyte UTF-8 char. Slicing there would panic. Back off to the nearest
-    // char boundary <= start_byte (the same `is_char_boundary` idiom as
-    // `observability::truncate_field`) so the slice is always valid; the header
+    // char boundary <= start_byte so the slice is always valid; the header
     // reports the adjusted offset where the slice actually begins.
-    let mut start = start_byte as usize;
-    while start > 0 && !body.is_char_boundary(start) {
-        start -= 1;
-    }
+    let start = floor_char_boundary(body, start_byte as usize);
     let slice = &body[start..];
     Ok(format!("[starting at byte {start} of {total}]\n{slice}"))
 }

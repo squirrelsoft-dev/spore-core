@@ -37,6 +37,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
+use crate::sync_util::MutexExt;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -368,7 +369,7 @@ impl StandardPromptChunkRegistry {
 impl PromptChunkRegistry for StandardPromptChunkRegistry {
     fn register(&self, chunk: PromptChunk) -> Result<(), ChunkError> {
         validate_slot_and_cache_block(&chunk)?;
-        let mut store = self.inner.lock().unwrap();
+        let mut store = self.inner.lock_recover();
         if store.chunks.contains_key(&chunk.id) {
             return Err(ChunkError::DuplicateId {
                 id: chunk.id.clone(),
@@ -386,16 +387,14 @@ impl PromptChunkRegistry for StandardPromptChunkRegistry {
         capabilities: Vec<ChunkId>,
         skills: Vec<ChunkId>,
     ) -> Result<ComposedPrompt, Vec<ChunkValidationError>> {
-        let store = self.inner.lock().unwrap();
+        let store = self.inner.lock_recover();
 
         let mut errors: Vec<ChunkValidationError> = Vec::new();
         let mut chosen: Vec<PromptChunk> = Vec::new();
-        let mut seen: HashMap<ChunkId, ()> = HashMap::new();
 
         // Role
         match store.chunks.get(&role) {
             Some(c) if c.slot == ChunkSlot::Role => {
-                seen.insert(c.id.clone(), ());
                 chosen.push(c.clone());
             }
             Some(_) => {
@@ -412,14 +411,12 @@ impl PromptChunkRegistry for StandardPromptChunkRegistry {
 
         // Mode — always sourced from the enum.
         let mode_chunk = mode.prompt_chunk();
-        seen.insert(mode_chunk.id.clone(), ());
         chosen.push(mode_chunk);
 
         // Capabilities
         for id in capabilities {
             match store.chunks.get(&id) {
                 Some(c) if c.slot == ChunkSlot::Capability => {
-                    seen.insert(c.id.clone(), ());
                     chosen.push(c.clone());
                 }
                 _ => {
@@ -434,7 +431,6 @@ impl PromptChunkRegistry for StandardPromptChunkRegistry {
         for id in skills {
             match store.chunks.get(&id) {
                 Some(c) if c.slot == ChunkSlot::Skill => {
-                    seen.insert(c.id.clone(), ());
                     chosen.push(c.clone());
                 }
                 _ => {
@@ -504,7 +500,7 @@ impl PromptChunkRegistry for StandardPromptChunkRegistry {
     }
 
     fn get(&self, id: &ChunkId) -> Option<PromptChunk> {
-        self.inner.lock().unwrap().chunks.get(id).cloned()
+        self.inner.lock_recover().chunks.get(id).cloned()
     }
 }
 

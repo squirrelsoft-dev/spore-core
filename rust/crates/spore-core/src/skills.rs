@@ -27,6 +27,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use crate::sync_util::MutexExt;
 
 use serde_json::json;
 
@@ -207,8 +208,7 @@ impl SkillCatalog {
             return false;
         }
         self.active
-            .lock()
-            .expect("active-skills mutex poisoned")
+            .lock_recover()
             .insert(name.to_string());
         true
     }
@@ -217,16 +217,14 @@ impl SkillCatalog {
     /// only the sticky bodies are dropped.
     pub fn clear_active(&self) {
         self.active
-            .lock()
-            .expect("active-skills mutex poisoned")
+            .lock_recover()
             .clear();
     }
 
     /// The currently active skill names (sorted).
     pub fn active(&self) -> Vec<String> {
         self.active
-            .lock()
-            .expect("active-skills mutex poisoned")
+            .lock_recover()
             .iter()
             .cloned()
             .collect()

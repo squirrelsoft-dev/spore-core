@@ -89,7 +89,7 @@ impl EvalHarness {
         config: &HarnessConfig,
         config_id: &str,
     ) -> Result<ConfigSamples, EvalError> {
-        let mut samples = ConfigSamples::new(&self.metrics, config_id);
+        let mut samples = ConfigSamples::new(&self.metrics);
         for (_category, task) in self.task_suite.all_tasks() {
             for run_idx in 0..self.n_runs_per_config {
                 self.run_one(config, config_id, task, run_idx, &mut samples)
@@ -311,7 +311,7 @@ struct ConfigSamples {
 }
 
 impl ConfigSamples {
-    fn new(metrics: &[EvalMetric], _config_id: &str) -> Self {
+    fn new(metrics: &[EvalMetric]) -> Self {
         Self {
             per_metric: metrics.iter().map(|_| Vec::new()).collect(),
             trace_links: Vec::new(),

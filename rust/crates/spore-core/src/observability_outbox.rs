@@ -80,6 +80,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use crate::sync_util::MutexExt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -450,9 +451,10 @@ fn new_trace_id() -> String {
     hasher.update(counter.to_le_bytes());
     hasher.update(stack_addr.to_le_bytes());
     let digest = hasher.finalize();
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(32);
     for b in &digest[..16] {
-        out.push_str(&format!("{b:02x}"));
+        let _ = write!(out, "{b:02x}");
     }
     out
 }
@@ -945,7 +947,7 @@ impl OutboxObservabilityProvider {
 
     /// The per-session `trace_id`, opening the session writer if needed.
     pub fn trace_id_for(&self, session_id: &SessionId) -> std::io::Result<String> {
-        let mut writers = self.writers.lock().unwrap();
+        let mut writers = self.writers.lock_recover();
         let w = self.writer_for(&mut writers, session_id)?;
         Ok(w.trace_id.clone())
     }
@@ -968,8 +970,7 @@ impl OutboxObservabilityProvider {
     /// emitting a one-shot `eprintln`.
     fn mark_failed_append(&self, session_id: &SessionId) {
         self.failed_appends
-            .lock()
-            .unwrap()
+            .lock_recover()
             .insert(session_id.clone());
     }
 
@@ -977,7 +978,7 @@ impl OutboxObservabilityProvider {
     /// A non-empty result means the durable JSONL trace and/or store may be
     /// missing lines for those sessions.
     pub fn sessions_with_failed_appends(&self) -> Vec<SessionId> {
-        self.failed_appends.lock().unwrap().iter().cloned().collect()
+        self.failed_appends.lock_recover().iter().cloned().collect()
     }
 
     /// Append a built line to the session's JSONL file, fan out to every OTLP
@@ -988,7 +989,7 @@ impl OutboxObservabilityProvider {
     fn write_line(&self, session_id: &SessionId, line: TraceLine) {
         let jsonl = line.to_jsonl_line();
         {
-            let mut writers = self.writers.lock().unwrap();
+            let mut writers = self.writers.lock_recover();
             match self.writer_for(&mut writers, session_id) {
                 Ok(w) => {
                     if let Err(e) = w.append(&jsonl) {
@@ -1031,7 +1032,7 @@ impl OutboxObservabilityProvider {
     }
 
     fn trace_id_locked(&self, session_id: &SessionId) -> String {
-        let mut writers = self.writers.lock().unwrap();
+        let mut writers = self.writers.lock_recover();
         match self.writer_for(&mut writers, session_id) {
             Ok(w) => w.trace_id.clone(),
             Err(_) => String::new(),
@@ -1127,7 +1128,7 @@ impl ObservabilityProvider for OutboxObservabilityProvider {
 
             // Flush the JSONL file handle.
             {
-                let mut writers = self.writers.lock().unwrap();
+                let mut writers = self.writers.lock_recover();
                 if let Some(w) = writers.get_mut(session_id) {
                     let _ = w.file.flush();
                 }
@@ -1218,7 +1219,7 @@ impl ObservabilityProvider for OutboxObservabilityProvider {
                 });
             }
             // Drop the open writer first so the handle is released.
-            self.writers.lock().unwrap().remove(session_id);
+            self.writers.lock_recover().remove(session_id);
             fs::remove_dir_all(&dir)?;
             Ok(())
         })

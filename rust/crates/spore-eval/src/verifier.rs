@@ -193,15 +193,11 @@ fn parse_pass_rate(output: &str) -> Option<f64> {
 fn scan_number_before(s: &str, suffix: &str) -> Option<f64> {
     let idx = s.find(suffix)?;
     let head = &s[..idx];
-    let num: String = head
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    num.parse::<f64>().ok()
+    // The trailing run of ASCII digits is what `head` keeps once its non-digit
+    // prefix is stripped; ASCII digits are single-byte so the byte index is a
+    // valid char boundary. No intermediate allocation or double reverse.
+    let digits = &head[head.trim_end_matches(|c: char| c.is_ascii_digit()).len()..];
+    digits.parse::<f64>().ok()
 }
 
 fn scan_number_after(s: &str, prefix: &str) -> Option<f64> {

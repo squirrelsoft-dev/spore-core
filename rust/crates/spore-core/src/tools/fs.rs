@@ -739,7 +739,7 @@ mod tests {
                     // A directory entry (e.g. `sub`) reads as an error but must
                     // NOT be a sandbox violation — that's the regression.
                     assert!(
-                        !message.contains("Sandbox") && !message.contains("PathEscape"),
+                        !message.contains("sandbox") && !message.contains("path escapes"),
                         "entry {entry:?} did not round-trip: {message}"
                     );
                 }
