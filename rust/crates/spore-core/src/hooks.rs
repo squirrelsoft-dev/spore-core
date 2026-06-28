@@ -207,18 +207,49 @@ impl HookEvent {
         HookEvent::PostCompact,
     ];
 
+    /// Single source of truth for per-event classification. Every predicate
+    /// below reads from this one table, so adding an event is a single new arm
+    /// (the compiler forces all fields to be set) rather than ~7 parallel
+    /// `matches!` blocks that can silently drift out of sync.
+    ///
+    /// `is_sync_only`: `Stop` is the divergence gate — it MUST block the loop,
+    /// so it can't be fire-and-forget; the pre-events are sync because their
+    /// mutation must complete before the action proceeds.
+    fn meta(self) -> EventMeta {
+        use HookEvent::*;
+        // (snake, is_pre, is_sync_only, is_async_only, can_block, can_deny)
+        let (snake, is_pre, is_sync_only, is_async_only, can_block, can_deny) = match self {
+            PreTurn => ("pre_turn", true, true, false, true, false),
+            PostTurn => ("post_turn", false, false, false, false, false),
+            PreToolUse => ("pre_tool_use", true, true, false, false, true),
+            PostToolUse => ("post_tool_use", false, false, false, false, false),
+            PostToolUseFailure => ("post_tool_use_failure", false, false, false, false, false),
+            PostToolBatch => ("post_tool_batch", false, true, false, true, false),
+            OnLoopStart => ("on_loop_start", true, true, false, true, false),
+            Stop => ("stop", false, true, false, true, false),
+            OnPause => ("on_pause", false, false, true, false, false),
+            OnResume => ("on_resume", true, true, false, false, false),
+            OnError => ("on_error", false, false, false, true, false),
+            OnPlanCreated => ("on_plan_created", false, true, false, true, false),
+            OnTaskAdvance => ("on_task_advance", true, true, false, true, false),
+            OnSubagentSpawn => ("on_subagent_spawn", true, true, false, false, true),
+            OnSubagentComplete => ("on_subagent_complete", false, false, false, false, false),
+            PreCompact => ("pre_compact", true, true, false, false, false),
+            PostCompact => ("post_compact", false, false, true, false, false),
+        };
+        EventMeta {
+            snake,
+            is_pre,
+            is_sync_only,
+            is_async_only,
+            can_block,
+            can_deny,
+        }
+    }
+
     /// Whether this is a pre-event (fires before its action; may mutate).
     pub fn is_pre(self) -> bool {
-        matches!(
-            self,
-            HookEvent::PreTurn
-                | HookEvent::PreToolUse
-                | HookEvent::OnLoopStart
-                | HookEvent::OnResume
-                | HookEvent::OnTaskAdvance
-                | HookEvent::OnSubagentSpawn
-                | HookEvent::PreCompact
-        )
+        self.meta().is_pre
     }
 
     /// Whether this event carries a mutable field a pre-hook may rewrite.
@@ -229,69 +260,37 @@ impl HookEvent {
 
     /// Whether this event may only run synchronously.
     pub fn is_sync_only(self) -> bool {
-        // `Stop` is the divergence gate — it MUST block the loop, so it cannot
-        // be fire-and-forget. The other pre-events are likewise sync because
-        // their mutation must complete before the action proceeds.
-        matches!(
-            self,
-            HookEvent::Stop
-                | HookEvent::PreTurn
-                | HookEvent::PreToolUse
-                | HookEvent::PostToolBatch
-                | HookEvent::OnLoopStart
-                | HookEvent::OnResume
-                | HookEvent::OnPlanCreated
-                | HookEvent::OnTaskAdvance
-                | HookEvent::OnSubagentSpawn
-                | HookEvent::PreCompact
-        )
+        self.meta().is_sync_only
     }
 
     /// Whether this event may only run asynchronously (fire-and-forget).
     pub fn is_async_only(self) -> bool {
-        matches!(self, HookEvent::OnPause | HookEvent::PostCompact)
+        self.meta().is_async_only
     }
 
     /// Whether a hook on this event may return [`HookDecision::Block`].
     pub fn can_block(self) -> bool {
-        matches!(
-            self,
-            HookEvent::PreTurn
-                | HookEvent::PostToolBatch
-                | HookEvent::OnLoopStart
-                | HookEvent::Stop
-                | HookEvent::OnError
-                | HookEvent::OnPlanCreated
-                | HookEvent::OnTaskAdvance
-        )
+        self.meta().can_block
     }
 
     /// Whether a hook on this event may return [`HookDecision::Deny`].
     pub fn can_deny(self) -> bool {
-        matches!(self, HookEvent::PreToolUse | HookEvent::OnSubagentSpawn)
+        self.meta().can_deny
     }
 
     fn as_snake(self) -> &'static str {
-        match self {
-            HookEvent::PreTurn => "pre_turn",
-            HookEvent::PostTurn => "post_turn",
-            HookEvent::PreToolUse => "pre_tool_use",
-            HookEvent::PostToolUse => "post_tool_use",
-            HookEvent::PostToolUseFailure => "post_tool_use_failure",
-            HookEvent::PostToolBatch => "post_tool_batch",
-            HookEvent::OnLoopStart => "on_loop_start",
-            HookEvent::Stop => "stop",
-            HookEvent::OnPause => "on_pause",
-            HookEvent::OnResume => "on_resume",
-            HookEvent::OnError => "on_error",
-            HookEvent::OnPlanCreated => "on_plan_created",
-            HookEvent::OnTaskAdvance => "on_task_advance",
-            HookEvent::OnSubagentSpawn => "on_subagent_spawn",
-            HookEvent::OnSubagentComplete => "on_subagent_complete",
-            HookEvent::PreCompact => "pre_compact",
-            HookEvent::PostCompact => "post_compact",
-        }
+        self.meta().snake
     }
+}
+
+/// Per-event classification record produced by [`HookEvent::meta`].
+struct EventMeta {
+    snake: &'static str,
+    is_pre: bool,
+    is_sync_only: bool,
+    is_async_only: bool,
+    can_block: bool,
+    can_deny: bool,
 }
 
 // ============================================================================

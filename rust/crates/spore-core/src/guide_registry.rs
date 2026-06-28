@@ -246,6 +246,16 @@ pub enum ImprovementSignal {
 // Trait
 // ============================================================================
 
+/// Guide registry interface.
+///
+/// Declared with `#[trait_variant::make(Send)]` (RPITIT), NOT the hand-rolled
+/// [`BoxFut`](crate::harness::BoxFut) idiom used by the dyn-held provider traits
+/// (`MemoryProvider`, `SensorChain`, the storage traits, …). That is deliberate:
+/// `GuideRegistry` is only ever consumed concretely or behind a generic — there
+/// is no `Arc<dyn GuideRegistry>` anywhere — so it does not need to be
+/// dyn-compatible, and RPITIT avoids the per-call boxing. If a future caller
+/// needs to hold `dyn GuideRegistry`, switch this to the `BoxFut` return shape
+/// (see the note on [`crate::memory::MemoryProvider`]).
 #[trait_variant::make(Send)]
 pub trait GuideRegistry: Send + Sync {
     async fn register(&self, guide: Guide) -> Result<GuideId, GuideRegistryError>;
