@@ -227,6 +227,29 @@ pub(crate) fn extract_embedded_json_object(text: &str) -> Option<&str> {
     None
 }
 
+/// Lenient JSON-value recovery shared by plan capture and the issue-#139
+/// output-schema enforcement gate, so both honor ONE cleanup policy. Tries, in
+/// order: (1) the whitespace-trimmed text as-is; (2) after [`strip_code_fence`];
+/// (3) the first embedded balanced `{ … }` object via
+/// [`extract_embedded_json_object`] (which tolerates a language tag or `{` jammed
+/// onto the fence line, surrounding prose, and a missing closing fence — the
+/// exact shapes a weak local model emits). Returns the recovered value, or `None`
+/// when nothing parses.
+///
+/// MUST be byte-identical across all four language ports — the same ordered
+/// fallback chain over the same deterministic helpers.
+pub(crate) fn recover_json_value(text: &str) -> Option<serde_json::Value> {
+    let trimmed = text.trim_matches(is_ascii_ws);
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return Some(v);
+    }
+    let fenced = strip_code_fence(trimmed);
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(fenced) {
+        return Some(v);
+    }
+    extract_embedded_json_object(text).and_then(|s| serde_json::from_str(s).ok())
+}
+
 /// ASCII-whitespace predicate. Matches `' '`, `'\t'`, `'\n'`, `'\r'`, and the
 /// form-feed / vertical-tab the JSON-adjacent grammar treats as whitespace —
 /// kept to the ASCII set so trimming is byte-identical cross-language.

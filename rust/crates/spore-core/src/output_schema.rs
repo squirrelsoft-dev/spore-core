@@ -146,10 +146,17 @@ fn schema_type(schema: &Value) -> Option<&str> {
 /// the schema is ignored. Iteration order is fixed (see the module docs) so the
 /// returned error is byte-identical across languages.
 pub(crate) fn validate_output(response: &str, schema: &Value) -> Result<(), String> {
-    // Step 1: parse.
-    let value: Value = match serde_json::from_str(response.trim()) {
-        Ok(v) => v,
-        Err(_) => return Err(ERR_NOT_JSON.to_string()),
+    // Step 1: parse. A strict parse rejects the common decorations a weak local
+    // model wraps a structured response in (leading/trailing prose, ```code
+    // fences``` — including a language tag or `{` jammed onto the fence line — and
+    // a missing closing fence). Recover via the SAME lenient extraction the
+    // plan-capture path uses (`crate::plan::recover_json_value`), so #139
+    // output-schema enforcement and plan capture share ONE cleanup policy and a
+    // correct-but-fenced terminal is no longer a hard `OutputSchemaViolation`.
+    // PORT PARITY: TS/Python/Go must mirror this identical fallback chain.
+    let value: Value = match crate::plan::recover_json_value(response) {
+        Some(v) => v,
+        None => return Err(ERR_NOT_JSON.to_string()),
     };
 
     // Step 2: root type.
@@ -269,6 +276,53 @@ Reply with only a JSON value that satisfies the schema."
         let schema = json!({"type": "object"});
         assert_eq!(
             validate_output("not json at all", &schema),
+            Err(ERR_NOT_JSON.to_string())
+        );
+    }
+
+    // The plan schema, reused by the fence-recovery tests below.
+    fn plan_schema() -> Value {
+        json!({
+            "type": "object",
+            "required": ["tasks", "rationale"],
+            "properties": {
+                "tasks": {"type": "array", "items": {"type": "string"}},
+                "rationale": {"type": "string"}
+            }
+        })
+    }
+
+    // Regression (looper vLLM/Qwen3.6): the model emitted a CORRECTLY-shaped plan
+    // wrapped in a malformed fence — opening ```` ``` ```` with `{` on the SAME
+    // line and NO closing fence — which a strict `serde_json::from_str` rejected,
+    // hard-halting the run with `OutputSchemaViolation`. The shared lenient
+    // recovery must now accept it (via the embedded-object scan).
+    #[test]
+    fn step1_recovers_fence_with_brace_on_open_line_and_no_close() {
+        let response = "\n\n```{\n  \"rationale\": \"r\",\n  \"tasks\": [\"a\", \"b\"]\n}";
+        assert!(validate_output(response, &plan_schema()).is_ok());
+    }
+
+    // Same, with a language tag jammed against the brace: ```` ```json{ ````.
+    #[test]
+    fn step1_recovers_fence_with_lang_tag_jammed_to_brace() {
+        let response = "\n\n```json{\n  \"rationale\": \"r\",\n  \"tasks\": [\"a\"]\n}";
+        assert!(validate_output(response, &plan_schema()).is_ok());
+    }
+
+    // A well-formed ```` ```json … ``` ```` fence is also accepted.
+    #[test]
+    fn step1_recovers_standard_json_fence() {
+        let response = "```json\n{\"tasks\": [\"a\"], \"rationale\": \"r\"}\n```";
+        assert!(validate_output(response, &plan_schema()).is_ok());
+    }
+
+    // Recovery is additive: text with no JSON value at all still fails step 1.
+    #[test]
+    fn step1_no_json_anywhere_still_not_json() {
+        let schema = json!({"type": "object"});
+        assert_eq!(
+            validate_output("here is some prose with no object", &schema),
             Err(ERR_NOT_JSON.to_string())
         );
     }
