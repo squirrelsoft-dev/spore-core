@@ -186,6 +186,16 @@ impl StandardTools {
         StandardTool::new(Box::new(TaskListTool::new()), TaskListTool::schema())
     }
 
+    /// `set_plan` — atomic plan authoring: the planner records its whole ordered
+    /// task list in one tool call (never as a free-text JSON message). Writes the
+    /// same RunStore blob `task_list` authors, so capture + execute read it.
+    pub fn set_plan() -> StandardTool {
+        StandardTool::new(
+            Box::new(crate::tools::set_plan::SetPlanTool::new()),
+            crate::tools::set_plan::SetPlanTool::schema(),
+        )
+    }
+
     /// `memory` — NEW #82; scope-aware episodic memory read/write via the
     /// `MemoryStore` seam (#78). Registered alongside `task_list`/`todo_write`.
     pub fn memory() -> StandardTool {
@@ -257,6 +267,7 @@ impl StandardTools {
             Self::web_search(),
             Self::todo_write(),
             Self::task_list(),
+            Self::set_plan(),
             Self::memory(),
         ]
     }

@@ -28,6 +28,7 @@ pub mod memory;
 pub mod message;
 pub mod params;
 pub mod search;
+pub mod set_plan;
 pub mod subagent;
 pub mod tasklist;
 pub mod todo;
