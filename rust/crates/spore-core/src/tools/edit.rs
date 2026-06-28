@@ -12,6 +12,7 @@ use serde_json::json;
 
 use crate::harness::{BoxFut, Operation, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
+use crate::tools::tool_try;
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::error::ToolExecutionError;
 use crate::tools::params::{parse_params, EditFileParams};
@@ -62,14 +63,8 @@ impl Tool for EditFileTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: EditFileParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
-            let resolved = match sandbox.resolve_path(&params.path, Operation::Write).await {
-                Ok(p) => p,
-                Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
-            };
+            let params: EditFileParams = tool_try!(parse_params(call));
+            let resolved = tool_try!(sandbox.resolve_path(&params.path, Operation::Write).await.map_err(ToolExecutionError::SandboxViolation));
             let content = match tokio::fs::read_to_string(&resolved).await {
                 Ok(c) => c,
                 Err(e) => {

@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 
 use crate::harness::{BoxFut, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
+use crate::tools::tool_try;
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::params::{parse_params, HttpGetParams, HttpPostParams};
 use crate::tools::{finish_with_possible_truncation, shared_client};
@@ -74,10 +75,7 @@ impl Tool for HttpGetTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: HttpGetParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
+            let params: HttpGetParams = tool_try!(parse_params(call));
             let req = shared_client().get(&params.url);
             let req = apply_headers(req, params.headers.as_ref());
             match req.send().await {
@@ -149,10 +147,7 @@ impl Tool for HttpPostTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: HttpPostParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
+            let params: HttpPostParams = tool_try!(parse_params(call));
             let has_content_type = params
                 .headers
                 .as_ref()

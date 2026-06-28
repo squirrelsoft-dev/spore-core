@@ -52,6 +52,21 @@ pub use web::{
     SearchMethod, UrlPolicy, WebFetchTool, WebSearchConfig, WebSearchConfigError, WebSearchTool,
 };
 
+/// Unwrap a `Result<T, E>` inside a `Tool::execute` async body, returning the
+/// `Err` converted into a `ToolOutput` early (`E: Into<ToolOutput>`). Replaces
+/// the repeated `match … { Ok(v) => v, Err(e) => return e.into() }` blocks at
+/// the head of nearly every tool. The `return` exits the surrounding
+/// `Box::pin(async move { … })`, whose output is the `ToolOutput`.
+macro_rules! tool_try {
+    ($e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(e) => return ::core::convert::Into::into(e),
+        }
+    };
+}
+pub(crate) use tool_try;
+
 /// Process-wide shared `reqwest` client for the HTTP-shaped tool families
 /// (`http`, `web`). Pooled once so connections are reused across tool calls.
 pub(crate) fn shared_client() -> &'static reqwest::Client {

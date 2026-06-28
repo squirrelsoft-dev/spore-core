@@ -4,6 +4,7 @@ use serde_json::json;
 
 use crate::harness::{BoxFut, Operation, SandboxProvider, SandboxViolation, ToolOutput};
 use crate::model::ToolCall;
+use crate::tools::tool_try;
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::error::ToolExecutionError;
 use crate::tools::params::{
@@ -134,14 +135,8 @@ impl Tool for ReadFileTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: ReadFileParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
-            let resolved = match sandbox.resolve_path(&params.path, Operation::Read).await {
-                Ok(p) => p,
-                Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
-            };
+            let params: ReadFileParams = tool_try!(parse_params(call));
+            let resolved = tool_try!(sandbox.resolve_path(&params.path, Operation::Read).await.map_err(ToolExecutionError::SandboxViolation));
             match tokio::fs::read_to_string(&resolved).await {
                 Ok(content) => match apply_read_range(&content, &params) {
                     Ok(out) => finish_with_possible_truncation(out, &call.id, sandbox).await,
@@ -209,14 +204,8 @@ impl Tool for WriteFileTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: WriteFileParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
-            let resolved = match sandbox.resolve_path(&params.path, Operation::Write).await {
-                Ok(p) => p,
-                Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
-            };
+            let params: WriteFileParams = tool_try!(parse_params(call));
+            let resolved = tool_try!(sandbox.resolve_path(&params.path, Operation::Write).await.map_err(ToolExecutionError::SandboxViolation));
             let bytes = params.content.len();
             // Enforce the sandbox's write cap on the payload (reads are capped in
             // `resolve_path`; writes/appends are capped here, since the resolver
@@ -314,14 +303,8 @@ impl Tool for ListDirTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: ListDirParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
-            let resolved = match sandbox.resolve_path(&params.path, Operation::Read).await {
-                Ok(p) => p,
-                Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
-            };
+            let params: ListDirParams = tool_try!(parse_params(call));
+            let resolved = tool_try!(sandbox.resolve_path(&params.path, Operation::Read).await.map_err(ToolExecutionError::SandboxViolation));
             // Emit paths relative to the workspace root so each entry can be
             // fed straight back into read_file/write_file. The sandbox treats
             // every input path as root-relative, so absolute paths would not
@@ -451,14 +434,8 @@ impl Tool for DeleteFileTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: DeleteFileParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
-            let resolved = match sandbox.resolve_path(&params.path, Operation::Write).await {
-                Ok(p) => p,
-                Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
-            };
+            let params: DeleteFileParams = tool_try!(parse_params(call));
+            let resolved = tool_try!(sandbox.resolve_path(&params.path, Operation::Write).await.map_err(ToolExecutionError::SandboxViolation));
             match tokio::fs::remove_file(&resolved).await {
                 Ok(_) => ToolOutput::Success {
                     content: format!("deleted {}", params.path),
@@ -521,18 +498,9 @@ impl Tool for MoveFileTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: MoveFileParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
-            let src = match sandbox.resolve_path(&params.src, Operation::Write).await {
-                Ok(p) => p,
-                Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
-            };
-            let dst = match sandbox.resolve_path(&params.dst, Operation::Write).await {
-                Ok(p) => p,
-                Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
-            };
+            let params: MoveFileParams = tool_try!(parse_params(call));
+            let src = tool_try!(sandbox.resolve_path(&params.src, Operation::Write).await.map_err(ToolExecutionError::SandboxViolation));
+            let dst = tool_try!(sandbox.resolve_path(&params.dst, Operation::Write).await.map_err(ToolExecutionError::SandboxViolation));
             match tokio::fs::rename(&src, &dst).await {
                 Ok(_) => ToolOutput::Success {
                     content: format!("moved {} -> {}", params.src, params.dst),

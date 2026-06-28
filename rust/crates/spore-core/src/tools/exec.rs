@@ -28,6 +28,7 @@ use serde_json::json;
 
 use crate::harness::{BoxFut, Operation, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
+use crate::tools::tool_try;
 use crate::text_util::{ceil_char_boundary, floor_char_boundary};
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::error::ToolExecutionError;
@@ -92,10 +93,7 @@ impl Tool for ExecTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: ExecParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
+            let params: ExecParams = tool_try!(parse_params(call));
             let timeout = params.timeout.map(Duration::from_secs);
             let out = match sandbox
                 .execute_command(&params.command, &params.args, None, timeout)
@@ -192,10 +190,7 @@ impl Tool for BashCommandTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: ShellCommandParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
+            let params: ShellCommandParams = tool_try!(parse_params(call));
             let timeout = params.timeout.map(Duration::from_secs);
             // Only the optional working_dir is path-validated; the script's own
             // file accesses go through the shell, unvalidated (see doc above).
@@ -289,10 +284,7 @@ impl Tool for RunTestsTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: RunTestsParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
+            let params: RunTestsParams = tool_try!(parse_params(call));
             let timeout = params.timeout.map(Duration::from_secs);
             let working = match sandbox
                 .resolve_path(&params.working_dir, Operation::Read)

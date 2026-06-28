@@ -36,7 +36,7 @@ pub enum ToolExecutionError {
     #[error("execution failed: {reason}")]
     ExecutionFailed { reason: String, recoverable: bool },
 
-    #[error("sandbox violation: {0:?}")]
+    #[error("sandbox violation: {0}")]
     SandboxViolation(SandboxViolation),
 
     #[error("timed out after {after:?}")]

@@ -6,6 +6,7 @@ use serde_json::json;
 
 use crate::harness::{BoxFut, Operation, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
+use crate::tools::tool_try;
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::error::ToolExecutionError;
 use crate::tools::finish_with_possible_truncation;
@@ -173,10 +174,7 @@ impl Tool for GrepFilesTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: GrepFilesParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
+            let params: GrepFilesParams = tool_try!(parse_params(call));
             let re = match regex::Regex::new(&params.pattern) {
                 Ok(r) => r,
                 Err(e) => {
@@ -186,10 +184,7 @@ impl Tool for GrepFilesTool {
                     .into()
                 }
             };
-            let root = match sandbox.resolve_path(&params.path, Operation::Read).await {
-                Ok(p) => p,
-                Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
-            };
+            let root = tool_try!(sandbox.resolve_path(&params.path, Operation::Read).await.map_err(ToolExecutionError::SandboxViolation));
             let mut matches = collect_matches(&root, &re, params.recursive);
             matches.sort_by(|a, b| (a.0.as_str(), a.1).cmp(&(b.0.as_str(), b.1)));
             let body = matches
@@ -253,14 +248,8 @@ impl Tool for FindFilesTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: FindFilesParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
-            let root = match sandbox.resolve_path(&params.path, Operation::Read).await {
-                Ok(p) => p,
-                Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
-            };
+            let params: FindFilesParams = tool_try!(parse_params(call));
+            let root = tool_try!(sandbox.resolve_path(&params.path, Operation::Read).await.map_err(ToolExecutionError::SandboxViolation));
             let pattern = root.join(&params.glob).display().to_string();
             let mut entries: Vec<String> = Vec::new();
             match glob::glob(&pattern) {
@@ -349,10 +338,7 @@ impl Tool for GrepTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: GrepParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
+            let params: GrepParams = tool_try!(parse_params(call));
             let re = match regex::Regex::new(&params.pattern) {
                 Ok(r) => r,
                 Err(e) => {
@@ -362,10 +348,7 @@ impl Tool for GrepTool {
                     .into()
                 }
             };
-            let root = match sandbox.resolve_path(&params.path, Operation::Read).await {
-                Ok(p) => p,
-                Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
-            };
+            let root = tool_try!(sandbox.resolve_path(&params.path, Operation::Read).await.map_err(ToolExecutionError::SandboxViolation));
 
             // When context_lines > 0 and output_mode is Content, we need per-file
             // full-line access to build the context windows. Collect files first.

@@ -62,6 +62,7 @@ use thiserror::Error;
 
 use crate::harness::{BoxFut, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
+use crate::tools::tool_try;
 use crate::text_util::floor_char_boundary;
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::finish_with_possible_truncation;
@@ -266,10 +267,7 @@ impl Tool for WebFetchTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: WebFetchParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
+            let params: WebFetchParams = tool_try!(parse_params(call));
             if let Err(denied) = validate_fetch_url(&params.url, &self.policy) {
                 return denied;
             }
@@ -521,10 +519,7 @@ impl Tool for WebSearchTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: WebSearchParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
+            let params: WebSearchParams = tool_try!(parse_params(call));
             let Some(backend) = self.backend.as_ref() else {
                 return ToolOutput::Error {
                     message: "web_search backend not configured".into(),

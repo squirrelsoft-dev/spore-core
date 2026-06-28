@@ -5,11 +5,12 @@ use serde_json::json;
 
 use crate::harness::{BoxFut, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
+use crate::tools::tool_try;
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::error::ToolExecutionError;
 use crate::tools::finish_with_possible_truncation;
 use crate::tools::params::{
-    parse_params, GitCommitParams, GitDiffParams, GitLogParams, GitResetParams, GitStatusParams,
+    parse_params, GitCommitParams, GitDiffParams, GitLogParams, GitResetParams,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,10 +92,7 @@ impl Tool for GitLogTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: GitLogParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
+            let params: GitLogParams = tool_try!(parse_params(call));
             let mut args = vec!["log".to_string(), "-n".to_string(), params.n.to_string()];
             if params.format == "oneline" {
                 args.push("--oneline".into());
@@ -163,10 +161,7 @@ impl Tool for GitDiffTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: GitDiffParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
+            let params: GitDiffParams = tool_try!(parse_params(call));
             let mut args = vec!["diff".to_string()];
             if let Some(f) = params.from {
                 args.push(f);
@@ -234,10 +229,7 @@ impl Tool for GitCommitTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: GitCommitParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
+            let params: GitCommitParams = tool_try!(parse_params(call));
             let mut combined = String::new();
             if !params.files.is_empty() {
                 let mut args = vec!["add".to_string()];
@@ -312,12 +304,12 @@ impl Tool for GitStatusTool {
     }
     fn execute<'a>(
         &'a self,
-        call: &'a ToolCall,
+        _call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let _: GitStatusParams = parse_params(call).unwrap_or_default();
+            // `git_status` takes no parameters.
             let args = vec!["status".to_string(), "--porcelain".to_string()];
             let out = match run_git(&args, sandbox).await {
                 Ok(o) => o,
@@ -382,10 +374,7 @@ impl Tool for GitResetTool {
         _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let params: GitResetParams = match parse_params(call) {
-                Ok(p) => p,
-                Err(e) => return e.into(),
-            };
+            let params: GitResetParams = tool_try!(parse_params(call));
             let flag = match params.mode {
                 GitResetMode::Hard => "--hard",
                 GitResetMode::Soft => "--soft",
