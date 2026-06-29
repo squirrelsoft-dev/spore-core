@@ -202,10 +202,10 @@ fn plan_execute_strategy() -> LoopStrategy {
 struct PlanExecuteReporter;
 
 impl Hook for PlanExecuteReporter {
-    fn handle<'a>(
-        &'a self,
-        ctx: &'a mut HookContext<'a>,
-    ) -> BoxFut<'a, Result<HookDecision, HookError>> {
+    fn handle<'c>(
+        &'c self,
+        ctx: &'c mut HookContext<'_>,
+    ) -> BoxFut<'c, Result<HookDecision, HookError>> {
         match ctx {
             HookContext::OnPlanCreated { plan, .. } => {
                 println!("\n── orchestrator plan ──");
