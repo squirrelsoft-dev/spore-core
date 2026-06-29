@@ -621,6 +621,86 @@ impl StandardHarness {
         }
     }
 
+    /// Emit a [`ToolCallSpan`] for a tool call dispatched on the RESUME path
+    /// (human-approved gated calls: writes, edits, bash, gated reads). The inline
+    /// turn loop emits tool spans at a single site in `react.rs`; gated calls run
+    /// HERE on resume instead, so without this they are ABSENT from the trace —
+    /// making observability under-count tool use (doctor / judge / eval go blind
+    /// to the very writes that do the work). Mirrors the inline emit: same
+    /// content-capture guard, parented to the turn span via the deterministic
+    /// `{session}-turn-{turn}` id so resume tool spans nest under their turn.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_resumed_tool_call(
+        &self,
+        session_id: &SessionId,
+        task: &Task,
+        turn_number: u32,
+        started_at: Timestamp,
+        elapsed_ms: u64,
+        call: &ToolCall,
+        output: &ToolOutput,
+    ) {
+        let Some(obs) = self.config.observability.as_ref() else {
+            return;
+        };
+        let cc = &self.config.content_capture;
+        let (arguments, result) = if cc.enabled {
+            let args = Self::capture_tool_call_args(call, cc.max_field_len);
+            let result = match output {
+                ToolOutput::Success { content, .. } => {
+                    let (content, t) = truncate_field(content, cc.max_field_len);
+                    Some(ToolResultContent { content, truncated: t })
+                }
+                ToolOutput::Error { message, .. } => {
+                    let (content, t) = truncate_field(message, cc.max_field_len);
+                    Some(ToolResultContent { content, truncated: t })
+                }
+                _ => None,
+            };
+            (Some(args), result)
+        } else {
+            (None, None)
+        };
+        let (output_size_bytes, truncated) = match output {
+            ToolOutput::Success { content, truncated } => (content.len(), *truncated),
+            ToolOutput::Error { message, .. } => (message.len(), false),
+            _ => (0, false),
+        };
+        // Reconstruct the turn's SpanBase only to carry its deterministic id as
+        // the parent; this throwaway base is never emitted.
+        let parent = SpanBase::new_root(
+            SpanId::new(format!("{}-turn-{}", session_id.as_str(), turn_number)),
+            session_id.clone(),
+            task.id.clone(),
+            SpanKind::Turn,
+            started_at.clone(),
+        );
+        let mut base = SpanBase::new_child(
+            SpanId::new(format!("{}-tool-{}", session_id.as_str(), call.id)),
+            &parent,
+            SpanKind::ToolCall,
+            started_at,
+        );
+        let status = if matches!(output, ToolOutput::Error { .. }) {
+            SpanStatus::Error { message: "tool returned a recoverable error".into() }
+        } else {
+            SpanStatus::Ok
+        };
+        base.finish(Timestamp::now(), status, elapsed_ms);
+        obs.emit_tool_call(ToolCallSpan {
+            base,
+            tool_name: call.name.clone(),
+            call_id: call.id.clone(),
+            parameters_size_bytes: call.input.to_string().len(),
+            output_size_bytes,
+            truncated,
+            sandbox_mode: String::new(),
+            sandbox_violations: Vec::new(),
+            arguments,
+            result,
+        });
+    }
+
     pub(crate) async fn resume_inner(
         &self,
         state: PausedState,
@@ -811,8 +891,19 @@ impl StandardHarness {
                 }
                 // Dispatch any remaining pending calls from the same batch.
                 for call in pending {
+                    let tool_started_at = Timestamp::now();
+                    let tool_clock = std::time::Instant::now();
                     let output = self
                         .normalize_sandbox_violation(tool_registry.dispatch(call.clone()).await);
+                    self.emit_resumed_tool_call(
+                        &session_id,
+                        &task,
+                        turn_number,
+                        tool_started_at,
+                        tool_clock.elapsed().as_millis() as u64,
+                        &call,
+                        &output,
+                    );
                     let tr = ToolResult {
                         call_id: call.id,
                         output,
@@ -944,8 +1035,22 @@ impl StandardHarness {
                             node: None,
                         },
                     );
+                    let tool_started_at = Timestamp::now();
+                    let tool_clock = std::time::Instant::now();
                     let output = self
                         .normalize_sandbox_violation(tool_registry.dispatch(call.clone()).await);
+                    // Observability span — gated tools dispatch on the resume path;
+                    // emit here too, else they are missing from the trace (the
+                    // single inline emit in `react.rs` never runs for them).
+                    self.emit_resumed_tool_call(
+                        &session_id,
+                        &task,
+                        turn_number,
+                        tool_started_at,
+                        tool_clock.elapsed().as_millis() as u64,
+                        &call,
+                        &output,
+                    );
                     Self::emit(
                         &on_stream,
                         StreamEvent::ToolResult {
@@ -983,8 +1088,22 @@ impl StandardHarness {
                             node: None,
                         },
                     );
+                    let tool_started_at = Timestamp::now();
+                    let tool_clock = std::time::Instant::now();
                     let output = self
                         .normalize_sandbox_violation(tool_registry.dispatch(call.clone()).await);
+                    // Observability span — gated tools dispatch on the resume path;
+                    // emit here too, else they are missing from the trace (the
+                    // single inline emit in `react.rs` never runs for them).
+                    self.emit_resumed_tool_call(
+                        &session_id,
+                        &task,
+                        turn_number,
+                        tool_started_at,
+                        tool_clock.elapsed().as_millis() as u64,
+                        &call,
+                        &output,
+                    );
                     Self::emit(
                         &on_stream,
                         StreamEvent::ToolResult {
