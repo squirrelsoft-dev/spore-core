@@ -189,8 +189,13 @@ pub use types::*;
 mod config;
 pub use config::*;
 
+// Holds only `impl RunStrategy for LoopStrategy` (the dispatch) + the shared
+// `impl ExecutionContext` driver — both inherent/trait impls that apply globally,
+// so there is nothing to re-export.
 mod strategies;
-pub(crate) use strategies::*;
+
+mod strategy_support;
+pub(crate) use strategy_support::*;
 
 mod providers;
 pub use providers::*;
@@ -897,44 +902,11 @@ pub trait RunStrategy: Send + Sync {
 /// bodies translate the terminal into a [`StrategyOutcome`] (or recurse). The
 /// trait is dyn-compatible via [`BoxFut`] so [`ExecutionContext`] can hold
 /// `&dyn StrategyExecutor`.
-pub trait StrategyExecutor: Send + Sync {
-    /// Run ONE bounded ReAct turn-loop window over `session_state`, carrying the
-    /// shared `budget_used`. This is the leaf primitive (the body of the legacy
-    /// `run_react_inner`). Does NOT finalize observability — the caller does.
-    #[allow(clippy::too_many_arguments)]
-    fn react_window<'a>(
-        &'a self,
-        task: Task,
-        max_iterations: u32,
-        session_state: SessionState,
-        budget_used: BudgetSnapshot,
-        on_stream: Option<StreamSink>,
-        agent: Arc<dyn Agent>,
-        // Issue 2 (per-node toolset scoping): the leaf's RESOLVED `toolset`
-        // handle, threaded alongside `agent`. Empty ⇒ global-catalogue fallback;
-        // a non-empty handle with its own catalogue ⇒ strict per-node scoping.
-        toolset: ToolsetRef,
-        // Issue #139: the leaf's RESOLVED output schema (canonical compact
-        // key-sorted JSON) when `enforce_output_schemas` is ON and the leaf
-        // carries `output = Some(..)`; `None` otherwise (no delivery, no
-        // validation). When `Some`, the window VALIDATES its terminal against it
-        // and retries up to `output_schema_max_retries` extra turns, and sets
-        // [`ModelParams::output_schema`] on every turn so the Ollama `format`
-        // channel constrains decoding.
-        output_schema: Option<serde_json::Value>,
-        // Issue #139: the `N` extra validation-retry turns (total attempts =
-        // `1 + N`). Ignored when `output_schema` is `None`.
-        output_schema_max_retries: u32,
-        // SC-10: the leaf's per-node system-prompt OVERRIDE (`ReactConfig::system_prompt`).
-        // `None` ⇒ the window uses the global `config.system_prompt` (byte-identical
-        // to pre-SC-10). `Some` ⇒ this prompt REPLACES the global one for every turn
-        // of this window, so the leaf sees ONLY its own prompt. Mirrors `toolset`.
-        system_prompt: Option<String>,
-        // Whether this window is a PlanExecute EXECUTE step (scopes the behavioral
-        // tool-call nudge). `false` for plan/other leaves.
-        execute_step: bool,
-    ) -> BoxFut<'a, RunResult>;
-
+/// Cross-cutting executor primitives shared by every strategy family (#124 /
+/// ISP split of the former fat `StrategyExecutor`): agent/message seams, the
+/// config-knob accessors the `*Config::run` bodies read through `&dyn _`, and
+/// terminal observability finalization. Supertrait of the per-family executors.
+pub trait CoreExecutor: Send + Sync {
     /// Resolve an [`AgentRef`] to its registered agent (#124). The leaf and the
     /// combinators resolve their worker agent through this so a missing handle is
     /// a typed terminal `Failure` rather than a panic. Returns `Err(RunResult)`
@@ -945,21 +917,15 @@ pub trait StrategyExecutor: Send + Sync {
         session_id: &SessionId,
     ) -> Result<Arc<dyn Agent>, Box<RunResult>>;
 
-    /// Run the SelfVerifying evaluate phase (#124): a fresh evaluator RUN over a
-    /// read-only sandbox in a never-shared session, on `eval_agent`, scoped to
-    /// `eval_toolset` (empty handle ⇒ global-catalogue fallback). Folds the
-    /// run's usage into `total_usage`/`carried`; returns its terminal.
-    fn evaluate_phase<'a>(
-        &'a self,
-        task: &'a Task,
-        eval_agent: Arc<dyn Agent>,
-        eval_toolset: ToolsetRef,
-        carried: &'a mut BudgetSnapshot,
-        total_usage: &'a mut AggregateUsage,
-    ) -> BoxFut<'a, RunResult>;
-
     /// Append `reason` as a user message on `session_state` (Default-FAIL).
     fn append_user_message<'a>(
+        &'a self,
+        session_state: &'a mut SessionState,
+        text: &'a str,
+    ) -> BoxFut<'a, ()>;
+
+    /// Seed a user message onto `session_state` (the `ContextManager` seam).
+    fn seed_user_message<'a>(
         &'a self,
         session_state: &'a mut SessionState,
         text: &'a str,
@@ -976,7 +942,7 @@ pub trait StrategyExecutor: Send + Sync {
     /// propagate-up behavior; `AutoContinue` auto-grants in-process (via
     /// [`ExecutionContext::try_auto_continue`]) up to its cap, then falls through
     /// to the `Autonomous` terminal. Mirrors
-    /// [`ralph_max_resets`](Self::ralph_max_resets) /
+    /// [`ralph_max_resets`](RalphExecutor::ralph_max_resets) /
     /// [`workspace_root`](Self::workspace_root).
     fn escalation_mode(&self) -> EscalationMode;
 
@@ -992,13 +958,39 @@ pub trait StrategyExecutor: Send + Sync {
     /// [`ReactConfig::run`] to thread into the window. Default `2`.
     fn output_schema_max_retries(&self) -> u32;
 
-    /// Seed a user message onto `session_state` (the `ContextManager` seam).
-    fn seed_user_message<'a>(
-        &'a self,
-        session_state: &'a mut SessionState,
-        text: &'a str,
-    ) -> BoxFut<'a, ()>;
+    /// Finalize observability for a terminal outcome (legacy
+    /// `finalize_observability` routing). No-op for non-terminal results.
+    fn finalize<'a>(&'a self, result: &'a RunResult) -> BoxFut<'a, ()>;
+}
 
+/// The ReAct turn-loop window primitive plus the SelfVerifying evaluate phase
+/// (both drive a bounded window over a resolved agent). Depends only on
+/// [`CoreExecutor`] — a `ReactConfig` no longer pulls in HillClimbing primitives.
+pub trait ReactExecutor: CoreExecutor {
+    /// Run ONE bounded ReAct turn-loop window over the [`ReactParams`] inputs
+    /// (`session_state`, the shared `budget_used`, and the resolved per-leaf
+    /// knobs). This is the leaf primitive (the body of the legacy
+    /// `run_react_inner`). Does NOT finalize observability — the caller does.
+    fn react_window<'a>(&'a self, params: ReactParams) -> BoxFut<'a, RunResult>;
+
+    /// Run the SelfVerifying evaluate phase (#124): a fresh evaluator RUN over a
+    /// read-only sandbox in a never-shared session, on `eval_agent`, scoped to
+    /// `eval_toolset` (empty handle ⇒ global-catalogue fallback). Folds the
+    /// run's usage into `total_usage`/`carried`; returns its terminal.
+    fn evaluate_phase<'a>(
+        &'a self,
+        task: &'a Task,
+        eval_agent: Arc<dyn Agent>,
+        eval_toolset: ToolsetRef,
+        carried: &'a mut BudgetSnapshot,
+        total_usage: &'a mut AggregateUsage,
+    ) -> BoxFut<'a, RunResult>;
+}
+
+/// PlanExecute primitives: plan directive/artifact, the plan sub-tree drive, the
+/// durable task-list seam, and the harness-observed-write accumulator the DAG
+/// executor reads to attach `files_touched`.
+pub trait PlanExecutor: CoreExecutor {
     /// Capture + persist a [`PlanArtifact`] from the plan sub-strategy's final
     /// output text (#124). The leaf model work (the planner turn) now runs through
     /// `self.plan.run(cx)`; this primitive owns only the harness-side artifact
@@ -1097,6 +1089,21 @@ pub trait StrategyExecutor: Send + Sync {
     /// the writes that step issued (no leakage from a prior step).
     fn clear_observed_writes(&self);
 
+    /// PlanExecute plan-empty re-ask cap: how many ADDITIONAL times the plan
+    /// phase re-asks the model for a usable plan — nudging it to emit the plan as
+    /// message CONTENT — before halting with [`HaltReason::EmptyPlan`]. `0` (the
+    /// default) preserves the historical behaviour: the first empty plan halts
+    /// immediately. Reasoning models that route their plan into the reasoning
+    /// channel (e.g. Qwen behind vLLM) leave the message content empty, so the
+    /// strict + prose capture yields no tasks; a small cap lets them recover.
+    fn plan_empty_max_retries(&self) -> u32 {
+        0
+    }
+}
+
+/// Ralph primitives: the per-window seed/reload session build, the external
+/// completion check, and the outer-loop reset cap.
+pub trait RalphExecutor: CoreExecutor {
     /// Build the per-window Ralph seed session (#124): a fresh
     /// `SessionState::default()` seeded with `instruction`, the `.spore/` reload
     /// context (R3), and the optional VCS history block — exactly the legacy
@@ -1111,18 +1118,11 @@ pub trait StrategyExecutor: Send + Sync {
 
     /// The Ralph outer-loop reset cap (`config.max_resets`, #124).
     fn ralph_max_resets(&self) -> u32;
+}
 
-    /// PlanExecute plan-empty re-ask cap: how many ADDITIONAL times the plan
-    /// phase re-asks the model for a usable plan — nudging it to emit the plan as
-    /// message CONTENT — before halting with [`HaltReason::EmptyPlan`]. `0` (the
-    /// default) preserves the historical behaviour: the first empty plan halts
-    /// immediately. Reasoning models that route their plan into the reasoning
-    /// channel (e.g. Qwen behind vLLM) leave the message content empty, so the
-    /// strict + prose capture yields no tasks; a small cap lets them recover.
-    fn plan_empty_max_retries(&self) -> u32 {
-        0
-    }
-
+/// HillClimbing primitives: metric-evaluator resolution, the baseline + per-
+/// iteration keep/revert steps, winner application, and the results-TSV write.
+pub trait HillExecutor: CoreExecutor {
     /// Resolve the HillClimbing metric evaluator for `key` (#124, Q2), or
     /// `Err(RunResult)` with the misconfiguration failure when absent.
     fn resolve_metric_evaluator(
@@ -1194,10 +1194,16 @@ pub trait StrategyExecutor: Send + Sync {
         task_id: &'a TaskId,
         rows: &'a [crate::metric::ResultsEntry],
     ) -> BoxFut<'a, ()>;
+}
 
-    /// Finalize observability for a terminal outcome (legacy
-    /// `finalize_observability` routing). No-op for non-terminal results.
-    fn finalize<'a>(&'a self, result: &'a RunResult) -> BoxFut<'a, ()>;
+/// The union of every strategy-family executor (#124). [`StandardHarness`]
+/// implements all of them, so [`ExecutionContext`] holds one
+/// `&dyn StrategyExecutor` and each `*Config::run` body still reaches whatever
+/// primitives it needs (supertrait methods are callable on the trait object),
+/// while the trait *definitions* are now segregated by concern (ISP).
+pub trait StrategyExecutor:
+    ReactExecutor + PlanExecutor + RalphExecutor + HillExecutor
+{
 }
 
 
@@ -1591,12 +1597,26 @@ impl StandardHarness {
         }
     }
 
+    /// Single budget-gate site for the turn loops. `turn_cap` is the window's
+    /// hard turn ceiling (`min(budget.max_turns, max_iterations)`) when called
+    /// from a ReAct window; it folds in the gate that used to live separately at
+    /// the top of `run_react_inner`. The effective turn limit is the lower of
+    /// `turn_cap` and `budget.max_turns`, so the `Turns` precedence and the exact
+    /// threshold are identical to the previous two-gate form. Callers with no
+    /// per-window cap (e.g. the strategy carry-budget check) pass `None`, which
+    /// preserves the original `budget.max_turns`-only behavior.
     fn budget_exceeded(
         budget: &BudgetLimits,
         used: &BudgetSnapshot,
         started_at: Instant,
+        turn_cap: Option<u32>,
     ) -> Option<BudgetLimitType> {
-        if let Some(max) = budget.max_turns {
+        let max_turns = match (turn_cap, budget.max_turns) {
+            (Some(cap), Some(max)) => Some(cap.min(max)),
+            (Some(cap), None) => Some(cap),
+            (None, max) => max,
+        };
+        if let Some(max) = max_turns {
             if used.turns >= max {
                 return Some(BudgetLimitType::Turns);
             }

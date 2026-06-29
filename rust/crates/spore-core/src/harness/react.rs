@@ -1,46 +1,15 @@
-//! StandardHarness — ReAct turn loop (Phase 6.1 impl split). Pure move.
+//! ReAct strategy: the `StandardHarness` turn-loop primitives (`run_react` /
+//! `run_react_inner`) plus `impl RunStrategy for ReactConfig` (the leaf body).
 
 use super::*;
 
 impl StandardHarness {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn run_react(
-        &self,
-        task: Task,
-        max_iterations: u32,
-        session_state: SessionState,
-        budget_used: BudgetSnapshot,
-        on_stream: Option<StreamSink>,
-        agent: Arc<dyn Agent>,
-        // Issue 2: the RESOLVED per-node toolset handle. Most `run_react`
-        // wrappers (PlanExecute/DAG execute steps, single-shot run) pass the
-        // empty handle (`ToolsetRef("")`) ⇒ global-catalogue fallback, byte-for-
-        // byte with pre-Issue-2 behaviour. The SelfVerifying evaluate phase
-        // passes its `eval_toolset` so the reviewer is scoped to read-only tools.
-        toolset: ToolsetRef,
-    ) -> RunResult {
-        let result = self
-            .run_react_inner(
-                task,
-                max_iterations,
-                session_state,
-                budget_used,
-                on_stream,
-                agent,
-                toolset,
-                // Issue #139: the legacy `run_react` wrapper does NOT enforce
-                // output schemas (the recursive `ReactConfig::run` is the single
-                // enforcement seam). `None`/`0` ⇒ byte-for-byte pre-#139.
-                None,
-                0,
-                // SC-10: the legacy `run_react` wrapper carries no per-leaf prompt
-                // override (only the recursive `ReactConfig::run` does) ⇒ the
-                // window uses the global `config.system_prompt`, byte-identical.
-                None,
-                // Legacy wrapper is not a PlanExecute execute step.
-                false,
-            )
-            .await;
+    /// Legacy single-shot / DAG execute-step / SelfVerifying-evaluate entry to a
+    /// ReAct window. Wraps [`run_react_inner`](Self::run_react_inner) with the
+    /// pre-#139 / pre-SC-10 defaults (built via [`ReactParams::legacy`]) and adds
+    /// the terminal observability finalization the inner loop deliberately omits.
+    pub(crate) async fn run_react(&self, params: ReactParams) -> RunResult {
+        let result = self.run_react_inner(params).await;
         match &result {
             RunResult::Success { session_id, .. } => {
                 self.finalize_observability(session_id, SessionOutcome::Success)
@@ -145,43 +114,43 @@ impl StandardHarness {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn run_react_inner(
-        &self,
-        task: Task,
-        max_iterations: u32,
-        mut session_state: SessionState,
-        mut budget_used: BudgetSnapshot,
-        on_stream: Option<StreamSink>,
-        // #124: the worker agent is RESOLVED by the caller (the recursing
-        // `ReactConfig::run` resolves `self.agent` from the registry; Ralph may
-        // override it per window). The leaf no longer reads `config.agent`.
-        agent: Arc<dyn Agent>,
-        // Issue 2: the leaf's RESOLVED `toolset` handle (mirrors `agent`). Empty
-        // (`""`) ⇒ global-catalogue fallback; a non-empty handle with its own
-        // per-key catalogue ⇒ strict per-node scoping.
-        toolset: ToolsetRef,
-        // Issue #139: the leaf's RESOLVED output schema (`None` ⇒ no enforcement,
-        // identical to pre-#139 behavior). When `Some`, the terminal is validated
-        // against it (frozen validator subset) and a validation failure feeds the
-        // error back + retries up to `output_schema_max_retries` extra turns
-        // WITHIN budget; on exhaustion WITH budget remaining the window returns
-        // `HaltReason::OutputSchemaViolation`. The schema is also set on every
-        // turn's `ModelParams.output_schema` so the Ollama `format` channel
-        // constrains decoding (Anthropic/OpenAI ignore it).
-        output_schema: Option<serde_json::Value>,
-        output_schema_max_retries: u32,
-        // SC-10: the leaf's per-node system-prompt OVERRIDE. `None` ⇒ the global
-        // `config.system_prompt` is used (byte-identical to pre-SC-10). `Some` ⇒
-        // it REPLACES the global prompt for every turn of this window, so the leaf
-        // sees ONLY its own prompt (the per-leaf prompt half of SC-10; the toolset
-        // half is the `toolset` arg above).
-        system_prompt: Option<String>,
-        // Whether this window is a PlanExecute EXECUTE step — scopes the behavioral
-        // tool-call nudge so the plan-JSON / synthesis turns are not nudged.
-        execute_step: bool,
-    ) -> RunResult {
+    pub(crate) async fn run_react_inner(&self, params: ReactParams) -> RunResult {
+        // The fully-resolved per-window inputs, bundled into `ReactParams` so the
+        // turn-loop entry points stay under the argument-count lint. Destructured
+        // straight back into the loop-body locals so the body below is unchanged.
+        let ReactParams {
+            task,
+            max_iterations,
+            mut session_state,
+            mut budget_used,
+            on_stream,
+            // #124: the worker agent is RESOLVED by the caller (the recursing
+            // `ReactConfig::run` resolves `self.agent` from the registry; Ralph
+            // may override it per window). The leaf no longer reads `config.agent`.
+            agent,
+            // Issue 2: the leaf's RESOLVED `toolset` handle (mirrors `agent`).
+            // Empty (`""`) ⇒ global-catalogue fallback; a non-empty handle with
+            // its own per-key catalogue ⇒ strict per-node scoping.
+            toolset,
+            // Issue #139: the leaf's RESOLVED output schema (`None` ⇒ no
+            // enforcement, identical to pre-#139). When `Some`, the terminal is
+            // validated against it (frozen validator subset) and a validation
+            // failure feeds the error back + retries up to
+            // `output_schema_max_retries` extra turns WITHIN budget; on exhaustion
+            // WITH budget remaining the window returns
+            // `HaltReason::OutputSchemaViolation`. Also set on every turn's
+            // `ModelParams.output_schema` so the Ollama `format` channel
+            // constrains decoding (Anthropic/OpenAI ignore it).
+            output_schema,
+            output_schema_max_retries,
+            // SC-10: the leaf's per-node system-prompt OVERRIDE. `None` ⇒ the
+            // global `config.system_prompt` is used (byte-identical to pre-SC-10).
+            // `Some` ⇒ it REPLACES the global prompt for every turn of this window.
+            system_prompt,
+            // Whether this window is a PlanExecute EXECUTE step — scopes the
+            // behavioral nudge so plan-JSON / synthesis turns are not nudged.
+            execute_step,
+        } = params;
         let session_id = task.session_id.clone();
         // Resolve the effective tool registry once per turn-loop window (all
         // strategies funnel through here). Bridges the per-node toolset catalogue
@@ -248,20 +217,17 @@ impl StandardHarness {
         let mut tools_called_this_window: u32 = 0;
 
         loop {
-            // Layer-1 budget gates before the turn.
-            if budget_used.turns >= effective_turn_cap {
-                return RunResult::Failure {
-                    reason: HaltReason::BudgetExceeded {
-                        limit_type: BudgetLimitType::Turns,
-                    },
-                    session_id,
-                    usage,
-                    turns: budget_used.turns,
-                    session_state: session_state.clone(),
-                };
-            }
-            if let Some(limit_type) = Self::budget_exceeded(&task.budget, &budget_used, started_at)
-            {
+            // Layer-1 budget gate before the turn. The single `budget_exceeded`
+            // site folds in the turn-cap check: `effective_turn_cap` (the lower of
+            // `budget.max_turns` and `max_iterations`) is passed as the hard cap, so
+            // `Turns` is still surfaced first and at the same threshold as the old
+            // two-gate form.
+            if let Some(limit_type) = Self::budget_exceeded(
+                &task.budget,
+                &budget_used,
+                started_at,
+                Some(effective_turn_cap),
+            ) {
                 return RunResult::Failure {
                     reason: HaltReason::BudgetExceeded { limit_type },
                     session_id,
@@ -1922,4 +1888,223 @@ response (finalize the plan / answer the task).",
     //   - R11 `verifier == None` ⇒ `Failure { SelfVerifyMisconfigured }`.
     //
     // No `// SPEC QUESTION:` markers — all four forks (D1–D4) are resolved.
+}
+
+
+// ── RunStrategy: the ReAct leaf body (#124, moved from strategies.rs) ──
+impl RunStrategy for ReactConfig {
+    /// The leaf: a bounded ReAct turn-loop window. Reads the per-run scratch
+    /// (`task`, `run_session`, `run_budget`) and drives one ReAct window through
+    /// the executor primitive, threading the result back into the shared usage.
+    ///
+    /// ## Budget enforcement (#125)
+    ///
+    /// The leaf pushes its OWN [`BudgetContext`] scope for `self.budget` and
+    /// charges the turns the window consumed against it. Per Open Q A-2 (rule 6)
+    /// the leaf does NOT carry its own behavior and NEVER self-resolves a
+    /// Continue/Fail/Escalate at the leaf — on charge exhaustion it PROPAGATES a
+    /// `StrategyOutcome::BudgetExhausted` to its parent (which owns the single
+    /// recovery site). The propagated `partial_output` is the window's last
+    /// FinalResponse text as JSON (fork #2). A clean (non-budget) terminal is
+    /// recorded verbatim through [`record_terminal`](ExecutionContext::record_terminal).
+    fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async move {
+            let executor = match cx.executor() {
+                Ok(e) => e,
+                Err(o) => return o,
+            };
+            let task = cx.current_task();
+            let max_iterations = self.max_iterations();
+            let mut session_state = std::mem::take(&mut cx.scratch.run_session);
+            let budget_used = cx.scratch.run_budget.clone();
+            // #124: resolve the worker agent from the registry by THIS leaf's
+            // handle (genuine recursion — no `config.agent`). A missing handle is
+            // a typed terminal failure.
+            let agent = match executor.resolve_agent_ref(&self.agent, &task.session_id) {
+                Ok(a) => a,
+                Err(result) => {
+                    let result = *result;
+                    executor.finalize(&result).await;
+                    return cx.record_terminal(result);
+                }
+            };
+            // Output-schema delivery + enforcement (issue #139). MIGRATION GATE:
+            // only when `enforce_output_schemas` is ON AND this leaf carries
+            // `output = Some(..)` do we resolve the schema, DELIVER it (directive
+            // seed + the constrained-decoding channel), and pass it (plus the
+            // retry budget `N`) into the window for terminal validation. When the
+            // gate is OFF or there is no `output`, `output_schema` is `None` and
+            // the window behaves byte-identically to pre-#139 (no resolve, no
+            // delivery, no validation). The schema is canonicalized to compact
+            // key-sorted JSON so its delivered/reported bytes are identical
+            // across the four language ports.
+            // A FORCED schema (the plan-empty repair re-ask, #139) wins over the
+            // global enforce gate and is consumed one-shot; otherwise fall back to
+            // the normal `enforce_output_schemas` + `self.output` resolution.
+            let output_schema: Option<serde_json::Value> =
+                cx.scratch.forced_output_schema.take().or_else(|| {
+                    if executor.enforce_output_schemas() {
+                        self.output
+                            .as_ref()
+                            .and_then(|r| cx.registry.resolve_schema(r))
+                            .cloned()
+                    } else {
+                        None
+                    }
+                });
+            let output_schema_max_retries = executor.output_schema_max_retries();
+            if let Some(schema) = output_schema.as_ref() {
+                // AC1: append the resolved schema to the leaf's directive/system
+                // context as a USER message, key-sorted via `canonicalize_json`
+                // so the seeded bytes are identical across languages.
+                let directive = format!(
+                    "Your final response must be a JSON value that conforms to this \
+JSON schema: {}",
+                    crate::model::canonicalize_json(schema)
+                );
+                executor
+                    .seed_user_message(&mut session_state, &directive)
+                    .await;
+            }
+            // #125/#129: push this leaf's OWN budget scope carrying its CONFIGURED
+            // `behavior`. The leaf still never RESOLVES it in the nested case (rule
+            // 6: it PROPAGATES a `BudgetExhausted` to its parent, which owns the
+            // single recovery site). Carrying the real `behavior` only means the
+            // propagated error reports it, so the TOP-LEVEL/bare-leaf resolution
+            // site (`drive_strategy`) can honor it (Q1 — a bare leaf self-resolves,
+            // a nested leaf does not).
+            cx.push_budget(self.budget.clone(), self.behavior.clone(), "react");
+            // The leaf CLONES (not takes) the run's stream sink so sibling phases
+            // of a combinator parent still inherit it for their own turns, and
+            // WRAPS it so every event this leaf emits is attributed to THIS node
+            // (kind `react` + the resolved agent handle). The wrapper is what the
+            // live agent adapter forwards to, so token deltas carry attribution too.
+            let agent_id = (!self.agent.0.is_empty()).then(|| self.agent.0.clone());
+            let on_stream = wrap_node_sink(cx.stream.clone(), "react", agent_id);
+            // Consume the one-shot execute-step marker (set by the execute walk) so
+            // the behavioral tool-call nudge scopes to execute steps only and never
+            // leaks into a nested leaf.
+            let execute_step = std::mem::take(&mut cx.scratch.in_execute_step);
+            let result = executor
+                .react_window(ReactParams {
+                    task,
+                    max_iterations,
+                    session_state,
+                    budget_used,
+                    on_stream,
+                    agent,
+                    // Issue 2: thread THIS leaf's toolset handle down so the
+                    // window dispatches the per-node scoped catalogue (empty
+                    // handle ⇒ global-catalogue fallback). Mirrors `agent`.
+                    toolset: self.toolset.clone(),
+                    // Issue #139: thread the resolved output schema (or `None`)
+                    // and the retry budget so the window validates the terminal.
+                    output_schema,
+                    output_schema_max_retries,
+                    // SC-10: thread THIS leaf's per-node system-prompt override
+                    // (None ⇒ the window keeps using the global prompt).
+                    system_prompt: self.system_prompt.clone(),
+                    execute_step,
+                })
+                .await;
+            executor.finalize(&result).await;
+
+            // #125: charge the window's turns against this leaf's OWN scope. The
+            // leaf POLICY (`self.budget`) — not the global `BudgetLimits` backstop —
+            // is the per-node enforcement point. A window stops at
+            // `min(max_iterations, task.budget.max_turns)`: when the LEAF cap is the
+            // binding constraint (the window consumed >= the leaf policy value), the
+            // leaf is exhausted and PROPAGATES a typed `BudgetExhausted` to its
+            // parent (rule 6 — the leaf never self-resolves). When the smaller
+            // GLOBAL backstop trips first, the legacy `BudgetExceeded` terminal is
+            // recorded VERBATIM (the global cap is unchanged, #117 backstop).
+            let window_turns = match &result {
+                RunResult::Success { turns, .. } | RunResult::Failure { turns, .. } => *turns,
+                _ => 0,
+            };
+            // #137: the window hit the consecutive-tool-error breaker's 2N hard
+            // stop. PROPAGATE it through the SAME single budget-exhaustion
+            // resolution site (so the node's `behavior` governs Fail/Escalate/
+            // Continue), but carry the `ToolErrorLoop` cause so the terminal
+            // reports `HaltReason::ToolErrorLoop`, never `BudgetExceeded`. The
+            // window's turns are still CHARGED against the leaf scope (accurate
+            // accounting), but the breaker stopped EARLY — the remaining budget
+            // is NOT burned. Detection is independent of `leaf_cap_binding`.
+            if let RunResult::Failure {
+                reason:
+                    HaltReason::ToolErrorLoop {
+                        tool,
+                        consecutive_errors,
+                    },
+                ..
+            } = &result
+            {
+                let tool = tool.clone();
+                let consecutive_errors = *consecutive_errors;
+                let last_final = last_final_response_text(&result).unwrap_or_default();
+                if let RunResult::Failure { session_state, .. } = &result {
+                    cx.scratch.run_session = session_state.clone();
+                }
+                let _ = cx.charge_current(window_turns);
+                cx.pop_budget();
+                return promote_tool_error_loop(
+                    &self.budget,
+                    &self.behavior,
+                    window_turns,
+                    tool,
+                    consecutive_errors,
+                    Some(react_partial_json(&last_final)),
+                );
+            }
+            let window_hit_budget = matches!(
+                &result,
+                RunResult::Failure {
+                    reason: HaltReason::BudgetExceeded { .. },
+                    ..
+                }
+            );
+            // The leaf cap is binding when the window hit a budget terminal AND it
+            // consumed at least the leaf's own allowance (so the leaf policy — not a
+            // smaller global backstop — is what stopped it).
+            let leaf_cap_binding = window_hit_budget
+                && matches!(self.budget.allowance_value(), Some(cap) if window_turns >= cap);
+            let charge = cx.charge_current(window_turns);
+            if leaf_cap_binding || charge.is_err() {
+                // The leaf partial is the window's last FinalResponse text.
+                let last_final = last_final_response_text(&result).unwrap_or_default();
+                // Carry the post-run session so a parent resumes losslessly.
+                if let RunResult::Success { session_state, .. }
+                | RunResult::Failure { session_state, .. } = &result
+                {
+                    cx.scratch.run_session = session_state.clone();
+                }
+                let err = charge.err().unwrap_or_else(|| {
+                    // The window itself hit the cap; synthesize the charge error
+                    // from the current scope state.
+                    cx.budgets
+                        .current_mut()
+                        .map(|s| BudgetExhausted {
+                            policy: s.policy.clone(),
+                            behavior: s.behavior.clone(),
+                            steps_taken: s.steps_taken,
+                            continues_used: s.continues_used,
+                            phase: s.phase.clone(),
+                        })
+                        .unwrap_or_else(|| BudgetExhausted {
+                            policy: self.budget.clone(),
+                            behavior: self.behavior.clone(),
+                            steps_taken: window_turns,
+                            continues_used: 0,
+                            phase: "react".to_string(),
+                        })
+                });
+                cx.pop_budget();
+                // Rule 6: the leaf PROPAGATES — partial carries the last
+                // FinalResponse (Escalate semantics, fork #1/#2).
+                return promote_budget_exhausted(&err, Some(react_partial_json(&last_final)));
+            }
+            cx.pop_budget();
+            cx.record_terminal(result)
+        })
+    }
 }

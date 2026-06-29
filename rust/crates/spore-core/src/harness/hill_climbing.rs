@@ -1,4 +1,5 @@
-//! StandardHarness — HillClimbing reset/commit/metric/TSV helpers (Phase 6.1 impl split). Pure move.
+//! HillClimbing strategy: the `StandardHarness` reset/commit/metric/TSV helpers
+//! plus `impl RunStrategy for HillClimbingConfig` (the keep/revert climb loop).
 
 use super::*;
 
@@ -227,4 +228,295 @@ impl StandardHarness {
         out
     }
 
+}
+
+
+// ── RunStrategy: the HillClimbing body (#124, moved from strategies.rs) ──
+impl RunStrategy for HillClimbingConfig {
+    /// HillClimbing (#124): GENUINELY recursive optimization loop. Iteration 0 is
+    /// a pure baseline (no agent turn). Iterations 1.. recurse `self.inner.run(cx)`
+    /// to propose a change (a non-ReAct inner — e.g. PlanExecute — really runs its
+    /// whole loop per iteration), then evaluate the metric (resolved via
+    /// `resolve_metric_evaluator`, Q2) and keep/revert. Bounded by
+    /// `max_stagnation` and the turn budget.
+    fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async move {
+            let executor = match cx.executor() {
+                Ok(e) => e,
+                Err(o) => return o,
+            };
+            let task = cx.current_task();
+            let session_id = task.session_id.clone();
+            let task_id = task.id.clone();
+            // #stream: save the parent sink, install a `hill_climbing`-attributing
+            // wrapper so each iteration's turns stream through it; restored on exit.
+            let on_stream = cx.stream.take();
+            cx.stream = wrap_node_sink(on_stream.clone(), "hill_climbing", None);
+            let mut carried = cx.scratch.run_budget.clone();
+            let _ = std::mem::take(&mut cx.scratch.run_session);
+            let direction = self.direction;
+            let revert = self.revert_on_no_improvement;
+            let min_delta = Some(self.min_improvement_delta);
+            // `u32::MAX` sentinel ⇒ no stagnation cap.
+            let max_stagnation = (self.max_stagnation != u32::MAX).then_some(self.max_stagnation);
+
+            // Q2: resolve the metric evaluator from `evaluator`'s key.
+            let evaluator = match executor.resolve_metric_evaluator(&self.evaluator.0, &session_id)
+            {
+                Ok(e) => e,
+                Err(result) => {
+                    cx.stream = on_stream;
+                    return cx.finish(executor, task, *result).await;
+                }
+            };
+
+            let mut total_usage = AggregateUsage::default();
+            let mut rows: Vec<crate::metric::ResultsEntry> = Vec::new();
+            let mut span_seq: u64 = 0;
+
+            // #125: HillClimbing owns a budget scope for its optimization loop.
+            // POLICY is the task's global turn ceiling (TotalSteps); this REPLACES
+            // the ad-hoc `turn_cap` / `carried.turns >= turn_cap` gate that #124
+            // used. Behavior is `Escalate` (in-process placeholder; #129).
+            let hc_policy = match task.budget.max_turns {
+                Some(max) => BudgetPolicy::TotalSteps { value: max },
+                None => BudgetPolicy::Unlimited,
+            };
+            cx.push_budget(hc_policy, self.behavior.clone(), "hill_climbing");
+
+            // ── Iteration 0: pure baseline (no agent turn). D4: also commits the
+            // starting tree and returns its SHA, seeding the durable candidate
+            // pointers (hill-climbing-loop-correctness §4.1).
+            let (baseline_score, start_sha) = match executor
+                .hill_baseline(
+                    &evaluator,
+                    &session_id,
+                    &task_id,
+                    direction,
+                    &mut rows,
+                    &mut span_seq,
+                    total_usage.clone(),
+                    carried.turns,
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(result) => {
+                    cx.pop_budget();
+                    cx.stream = on_stream;
+                    return cx.finish(executor, task, result).await;
+                }
+            };
+            // `current_*` is where the next neighbor branches from; `best_*` is
+            // the best artifact ever accepted. Equal under strict greedy, tracked
+            // separately from day one (D2).
+            let mut cand = HillCandidate {
+                current_sha: start_sha.clone(),
+                best_sha: start_sha,
+                current_best: baseline_score,
+                best_score: baseline_score,
+            };
+
+            let mut stagnation: u32 = 0;
+            let mut iteration: u32 = 1;
+
+            loop {
+                // #125: charge-based budget gate before the iteration's agent
+                // turn. A spent `TotalSteps` cap surfaces this node's OWN typed
+                // BudgetExhausted (partial = best candidate + score), resolving its
+                // behavior — replacing the legacy `BudgetExceeded` Failure.
+                if let Err(err) = cx.charge_current(1) {
+                    let resolution = cx.resolve_current();
+                    // #129: a granted `Continue` resets the scope and KEEPS ITERATING
+                    // the climb IN-PROCESS (do NOT pop; the refreshed allowance lets
+                    // the next charge pass). NO serialization (AC3). `max_continues`
+                    // bounds the loop.
+                    if matches!(resolution, ExhaustedResolution::Continue) {
+                        continue;
+                    }
+                    // SC-5: AutoContinue auto-grants in-process at this Escalate
+                    // point (scope still pushed) before surfacing/aborting.
+                    if matches!(resolution, ExhaustedResolution::Escalate)
+                        && cx.try_auto_continue(&executor.escalation_mode())
+                    {
+                        continue;
+                    }
+                    executor.hill_write_tsv(&task_id, &rows).await;
+                    let partial =
+                        hill_climbing_partial_json(cand.best_score, cand.best_sha.as_deref());
+                    cx.pop_budget();
+                    cx.scratch.task = Some(task.clone());
+                    cx.stream = on_stream;
+                    return match resolution {
+                        ExhaustedResolution::Fail => promote_budget_exhausted(&err, None),
+                        // #129: the in-process `Continue` is handled above; this arm
+                        // is `Escalate`-only now (kept combined for the surface/
+                        // propagate shape).
+                        //
+                        // #130: under `SurfaceToHuman`, PAUSE with a
+                        // `BudgetExhausted` request instead of propagating up.
+                        ExhaustedResolution::Continue | ExhaustedResolution::Escalate => {
+                            if matches!(executor.escalation_mode(), EscalationMode::SurfaceToHuman)
+                            {
+                                // #138 AC2-a: HillClimbing iterates on a METRIC, not
+                                // a worker conversation, so there is no richer
+                                // session to carry — pass the empty default to fall
+                                // back to the partial-only stub (pre-#138 behavior).
+                                // The worker leaf's toolset handle is still carried
+                                // (#140 parity, AC4-a).
+                                let waiting = promote_budget_exhausted_to_human(
+                                    &err,
+                                    Some(partial),
+                                    combinator_escalation_actions(&err),
+                                    session_id.clone(),
+                                    task,
+                                    carried.clone(),
+                                    carried.turns,
+                                    SessionState::default(),
+                                    worker_toolset_of(&self.inner),
+                                );
+                                cx.record_terminal(waiting)
+                            } else {
+                                promote_budget_exhausted(&err, Some(partial))
+                            }
+                        }
+                    };
+                }
+                if let Some(limit_type) =
+                    StandardHarness::budget_exceeded(&task.budget, &carried, Instant::now(), None)
+                {
+                    executor.hill_write_tsv(&task_id, &rows).await;
+                    // Winner application (§4.6): a wall/cost/token budget halt is a
+                    // terminal exit — leave the best accepted candidate on disk.
+                    executor.hill_apply_winner(cand.best_sha.as_deref()).await;
+                    let result = RunResult::Failure {
+                        reason: HaltReason::BudgetExceeded { limit_type },
+                        session_id,
+                        usage: total_usage,
+                        turns: carried.turns,
+                        session_state: SessionState::default(),
+                    };
+                    cx.pop_budget();
+                    cx.stream = on_stream;
+                    return cx.finish(executor, task, result).await;
+                }
+
+                // ── One agent turn proposes a change: recurse `self.inner`.
+                let iter_task = Task {
+                    id: task.id.clone(),
+                    instruction: task.instruction.clone(),
+                    session_id: session_id.clone(),
+                    budget: task.budget.clone(),
+                    loop_strategy: (*self.inner).clone(),
+                };
+                cx.scratch.task = Some(iter_task);
+                let mut iter_state = SessionState::default();
+                executor
+                    .append_user_message(&mut iter_state, &task.instruction)
+                    .await;
+                cx.scratch.run_session = iter_state;
+                cx.scratch.run_budget = carried.clone();
+                // Model (A): each HillClimbing iteration generates a FRESH neighbor
+                // candidate — never a continuation of the prior iteration's plan.
+                // Clear the continue signal so a PlanExecute inner re-plans each
+                // iteration (the load-bearing requirement of hill climbing), and so
+                // an enclosing Ralph window's continue signal does not leak in.
+                cx.scratch.continue_task_list = false;
+                let iter_outcome = self.inner.run(cx).await;
+                // #125 rule 4/7: a child's BudgetExhausted reaches HillClimbing as
+                // a `StrategyOutcome`, never auto-cascaded. Surface this node's own
+                // typed BudgetExhausted (partial = best candidate + score).
+                if let StrategyOutcome::BudgetExhausted { .. } = &iter_outcome {
+                    executor.hill_write_tsv(&task_id, &rows).await;
+                    let partial =
+                        hill_climbing_partial_json(cand.best_score, cand.best_sha.as_deref());
+                    let err = cx
+                        .budgets
+                        .current_mut()
+                        .map(|s| BudgetExhausted {
+                            policy: s.policy.clone(),
+                            behavior: s.behavior.clone(),
+                            steps_taken: s.steps_taken,
+                            continues_used: s.continues_used,
+                            phase: s.phase.clone(),
+                        })
+                        .expect("hill_climbing scope pushed above");
+                    cx.pop_budget();
+                    cx.scratch.task = Some(task);
+                    cx.stream = on_stream;
+                    return promote_budget_exhausted(&err, Some(partial));
+                }
+                let turn_result = match cx.take_child_override() {
+                    Some(r) => r,
+                    None => RunResult::Failure {
+                        reason: HaltReason::BudgetExceeded {
+                            limit_type: BudgetLimitType::Turns,
+                        },
+                        session_id: session_id.clone(),
+                        usage: AggregateUsage::default(),
+                        turns: carried.turns,
+                        session_state: SessionState::default(),
+                    },
+                };
+                fold_usage(&mut total_usage, &mut carried, &turn_result);
+
+                // A paused / escalated turn propagates verbatim.
+                if turn_result.is_pause() {
+                    executor.hill_write_tsv(&task_id, &rows).await;
+                    cx.pop_budget();
+                    cx.stream = on_stream;
+                    return cx.finish(executor, task, turn_result).await;
+                }
+
+                // ── Evaluate the metric + keep/revert decision. `hill_iteration`
+                // mutates the durable candidate pointers in `cand` (commit-on-keep,
+                // reset-to-current_sha-on-discard) and returns the non-improvement
+                // flag.
+                let non_improvement = executor
+                    .hill_iteration(
+                        &evaluator,
+                        &session_id,
+                        &task_id,
+                        iteration,
+                        direction,
+                        revert,
+                        min_delta,
+                        &mut cand,
+                        &mut rows,
+                        &mut span_seq,
+                    )
+                    .await;
+                if non_improvement {
+                    stagnation += 1;
+                } else {
+                    stagnation = 0;
+                }
+
+                if let Some(limit) = max_stagnation {
+                    if stagnation >= limit {
+                        executor.hill_write_tsv(&task_id, &rows).await;
+                        // Winner application (§4.6): stagnation is the canonical
+                        // HillClimbing termination — leave the best accepted
+                        // candidate on disk before returning.
+                        executor.hill_apply_winner(cand.best_sha.as_deref()).await;
+                        let result = RunResult::Failure {
+                            reason: HaltReason::StagnationLimitReached {
+                                iterations: stagnation,
+                                best_metric: cand.best_score,
+                            },
+                            session_id,
+                            usage: total_usage,
+                            turns: carried.turns,
+                            session_state: SessionState::default(),
+                        };
+                        cx.pop_budget();
+                        cx.stream = on_stream;
+                        return cx.finish(executor, task, result).await;
+                    }
+                }
+
+                iteration = iteration.saturating_add(1);
+            }
+        })
+    }
 }

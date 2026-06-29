@@ -2,44 +2,10 @@
 
 use super::*;
 
-/// [`StrategyExecutor`] impl (#124): the harness-side primitives the recursive
-/// per-variant [`RunStrategy::run`] bodies delegate to. Each primitive wraps an
-/// existing, tested orchestration method so behavior stays at parity — the only
-/// structural change is that the per-variant bodies now own their loops and the
-/// central dispatch `match` is gone.
-impl StrategyExecutor for StandardHarness {
-    fn react_window<'a>(
-        &'a self,
-        task: Task,
-        max_iterations: u32,
-        session_state: SessionState,
-        budget_used: BudgetSnapshot,
-        on_stream: Option<StreamSink>,
-        agent: Arc<dyn Agent>,
-        toolset: ToolsetRef,
-        output_schema: Option<serde_json::Value>,
-        output_schema_max_retries: u32,
-        system_prompt: Option<String>,
-        execute_step: bool,
-    ) -> BoxFut<'a, RunResult> {
-        Box::pin(async move {
-            self.run_react_inner(
-                task,
-                max_iterations,
-                session_state,
-                budget_used,
-                on_stream,
-                agent,
-                toolset,
-                output_schema,
-                output_schema_max_retries,
-                system_prompt,
-                execute_step,
-            )
-            .await
-        })
-    }
-
+/// [`CoreExecutor`] impl (#124 / ISP split): the cross-cutting primitives
+/// every `*Config::run` body needs — agent/message seams, config-knob
+/// accessors, and terminal observability finalization.
+impl CoreExecutor for StandardHarness {
     fn resolve_agent_ref(
         &self,
         r: &AgentRef,
@@ -65,21 +31,20 @@ impl StrategyExecutor for StandardHarness {
             })
     }
 
-    fn evaluate_phase<'a>(
+    fn append_user_message<'a>(
         &'a self,
-        task: &'a Task,
-        eval_agent: Arc<dyn Agent>,
-        eval_toolset: ToolsetRef,
-        carried: &'a mut BudgetSnapshot,
-        total_usage: &'a mut AggregateUsage,
-    ) -> BoxFut<'a, RunResult> {
+        session_state: &'a mut SessionState,
+        text: &'a str,
+    ) -> BoxFut<'a, ()> {
         Box::pin(async move {
-            self.run_evaluate_phase(task, eval_agent, eval_toolset, carried, total_usage)
-                .await
+            self.config
+                .context_manager
+                .append_user_message(session_state, text)
+                .await;
         })
     }
 
-    fn append_user_message<'a>(
+    fn seed_user_message<'a>(
         &'a self,
         session_state: &'a mut SessionState,
         text: &'a str,
@@ -96,19 +61,74 @@ impl StrategyExecutor for StandardHarness {
         self.config.sandbox.workspace_root().to_path_buf()
     }
 
-    fn seed_user_message<'a>(
-        &'a self,
-        session_state: &'a mut SessionState,
-        text: &'a str,
-    ) -> BoxFut<'a, ()> {
-        Box::pin(async move {
-            self.config
-                .context_manager
-                .append_user_message(session_state, text)
-                .await;
-        })
+    fn escalation_mode(&self) -> EscalationMode {
+        // No longer `Copy` (SC-5's `AutoContinue` holds an `Arc` callback); clone
+        // out — the callback is refcounted, so this is cheap.
+        self.config.escalation_mode.clone()
     }
 
+    fn enforce_output_schemas(&self) -> bool {
+        self.config.enforce_output_schemas
+    }
+
+    fn output_schema_max_retries(&self) -> u32 {
+        self.config.output_schema_max_retries
+    }
+
+    fn finalize<'a>(&'a self, result: &'a RunResult) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            match result {
+                RunResult::Success { session_id, .. } => {
+                    self.finalize_observability(session_id, SessionOutcome::Success)
+                        .await;
+                }
+                RunResult::Failure {
+                    session_id, reason, ..
+                } => {
+                    self.finalize_observability(
+                        session_id,
+                        SessionOutcome::Failure {
+                            reason: format!("{reason:?}"),
+                        },
+                    )
+                    .await;
+                }
+                RunResult::Escalate { session_id, .. } => {
+                    self.finalize_observability(session_id, SessionOutcome::Escalated)
+                        .await;
+                }
+                // Non-terminal pauses are never finalized.
+                RunResult::WaitingForHuman { .. } | RunResult::Consult { .. } => {}
+            }
+        })
+    }
+}
+
+/// [`ReactExecutor`] impl: the bounded ReAct turn-loop window and the
+/// SelfVerifying evaluate phase (both run a window over a resolved agent).
+impl ReactExecutor for StandardHarness {
+    fn react_window<'a>(&'a self, params: ReactParams) -> BoxFut<'a, RunResult> {
+        Box::pin(async move { self.run_react_inner(params).await })
+    }
+
+    fn evaluate_phase<'a>(
+        &'a self,
+        task: &'a Task,
+        eval_agent: Arc<dyn Agent>,
+        eval_toolset: ToolsetRef,
+        carried: &'a mut BudgetSnapshot,
+        total_usage: &'a mut AggregateUsage,
+    ) -> BoxFut<'a, RunResult> {
+        Box::pin(async move {
+            self.run_evaluate_phase(task, eval_agent, eval_toolset, carried, total_usage)
+                .await
+        })
+    }
+}
+
+/// [`PlanExecutor`] impl: the PlanExecute plan/artifact/task-list + observed-
+/// write primitives the DAG executor and plan phase delegate to.
+impl PlanExecutor for StandardHarness {
     fn capture_plan_artifact<'a>(
         &'a self,
         session_id: &'a SessionId,
@@ -124,10 +144,6 @@ impl StrategyExecutor for StandardHarness {
 
     fn plan_directive(&self, instruction: &str) -> String {
         StandardHarness::plan_directive(instruction)
-    }
-
-    fn plan_empty_max_retries(&self) -> u32 {
-        self.config.plan_empty_max_retries
     }
 
     fn run_plan_subtree<'a>(
@@ -279,6 +295,14 @@ impl StrategyExecutor for StandardHarness {
         }
     }
 
+    fn plan_empty_max_retries(&self) -> u32 {
+        self.config.plan_empty_max_retries
+    }
+}
+
+/// [`RalphExecutor`] impl: the Ralph per-window seed/reload + completion-check
+/// + reset-cap primitives.
+impl RalphExecutor for StandardHarness {
     fn ralph_seed_session<'a>(&'a self, instruction: &'a str) -> BoxFut<'a, SessionState> {
         Box::pin(async move {
             let mut session_state = SessionState::default();
@@ -328,21 +352,11 @@ impl StrategyExecutor for StandardHarness {
     fn ralph_max_resets(&self) -> u32 {
         self.config.max_resets
     }
+}
 
-    fn escalation_mode(&self) -> EscalationMode {
-        // No longer `Copy` (SC-5's `AutoContinue` holds an `Arc` callback); clone
-        // out — the callback is refcounted, so this is cheap.
-        self.config.escalation_mode.clone()
-    }
-
-    fn enforce_output_schemas(&self) -> bool {
-        self.config.enforce_output_schemas
-    }
-
-    fn output_schema_max_retries(&self) -> u32 {
-        self.config.output_schema_max_retries
-    }
-
+/// [`HillExecutor`] impl: the HillClimbing metric-eval / keep-revert / winner
+/// + results-TSV primitives.
+impl HillExecutor for StandardHarness {
     fn resolve_metric_evaluator(
         &self,
         key: &str,
@@ -620,32 +634,8 @@ impl StrategyExecutor for StandardHarness {
                 .await;
         })
     }
-
-    fn finalize<'a>(&'a self, result: &'a RunResult) -> BoxFut<'a, ()> {
-        Box::pin(async move {
-            match result {
-                RunResult::Success { session_id, .. } => {
-                    self.finalize_observability(session_id, SessionOutcome::Success)
-                        .await;
-                }
-                RunResult::Failure {
-                    session_id, reason, ..
-                } => {
-                    self.finalize_observability(
-                        session_id,
-                        SessionOutcome::Failure {
-                            reason: format!("{reason:?}"),
-                        },
-                    )
-                    .await;
-                }
-                RunResult::Escalate { session_id, .. } => {
-                    self.finalize_observability(session_id, SessionOutcome::Escalated)
-                        .await;
-                }
-                // Non-terminal pauses are never finalized.
-                RunResult::WaitingForHuman { .. } | RunResult::Consult { .. } => {}
-            }
-        })
-    }
 }
+
+/// Union marker (#124): `StandardHarness` satisfies every strategy family, so
+/// [`ExecutionContext`] can hold one `&dyn StrategyExecutor`.
+impl StrategyExecutor for StandardHarness {}

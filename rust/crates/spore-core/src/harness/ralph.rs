@@ -1,4 +1,5 @@
-//! StandardHarness — Ralph progress/feature-list/completion helpers (Phase 6.1 impl split). Pure move.
+//! Ralph strategy: the `StandardHarness` progress/feature-list/completion
+//! helpers plus `impl RunStrategy for RalphConfig` (the context-window reset loop).
 
 use super::*;
 
@@ -228,4 +229,166 @@ impl StandardHarness {
     //
     // No `// SPEC QUESTION:` markers — all six decisions are resolved.
 
+}
+
+
+// ── RunStrategy: the Ralph body (#124, moved from strategies.rs) ──
+impl RunStrategy for RalphConfig {
+    /// Ralph (#124): GENUINELY recursive continuation wrapper. Each context
+    /// window seeds a FRESH session from the `.spore/` checkpoint, then recurses
+    /// `self.inner.run(cx)` (a non-ReAct inner — e.g. SelfVerifying — really runs
+    /// its whole loop per window). Ralph is an OUTER LOOP that re-runs `inner` as
+    /// the architect declared it — it does NOT replace nodes the inner tree
+    /// already assigned. When `self.agent` is set it only FILLS a worker leaf that
+    /// left its own agent handle EMPTY (the bare-leaf Ralph convenience); an
+    /// explicit leaf agent is authoritative and never overwritten.
+    /// `ralph_completion_status` drives the OUTER reset loop; exhaustion ⇒
+    /// `RalphCompletionUnmet`.
+    fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async move {
+            let executor = match cx.executor() {
+                Ok(e) => e,
+                Err(o) => return o,
+            };
+            let task = cx.current_task();
+            // #stream: save the parent sink, install a `ralph`-attributing wrapper
+            // so each reset window's turns stream through it; restored on exit.
+            let on_stream = cx.stream.take();
+            cx.stream = wrap_node_sink(on_stream.clone(), "ralph", None);
+            // Ralph discards the incoming session state by design (each window is
+            // a fresh start re-seeded from the filesystem checkpoint).
+            let _ = std::mem::take(&mut cx.scratch.run_session);
+            let max_resets = self.max_resets(executor);
+
+            // Ralph fills — never replaces. When `self.agent` is set it supplies a
+            // worker agent ONLY where the inner leaf left its handle empty; an
+            // explicitly-declared leaf agent (the architect's node) is authoritative.
+            let inner_for_window: LoopStrategy = if self.agent.0.is_empty() {
+                (*self.inner).clone()
+            } else {
+                let mut cloned = (*self.inner).clone();
+                fill_empty_worker_agent(&mut cloned, &self.agent);
+                cloned
+            };
+
+            let mut total_usage = AggregateUsage::default();
+            let mut cumulative_turns: u32 = 0;
+            let mut last_reason = String::from(".spore/progress.json missing");
+            let mut last_session_id = task.session_id.clone();
+
+            for iteration in 0..max_resets.max(1) {
+                let window_session_id = if iteration == 0 {
+                    task.session_id.clone()
+                } else {
+                    SessionId::generate()
+                };
+                last_session_id = window_session_id.clone();
+
+                // R2/R3: a FRESH session seeded from the `.spore/` checkpoint.
+                let session_state = executor.ralph_seed_session(&task.instruction).await;
+
+                let window_task = Task {
+                    id: task.id.clone(),
+                    instruction: task.instruction.clone(),
+                    session_id: window_session_id.clone(),
+                    budget: task.budget.clone(),
+                    loop_strategy: inner_for_window.clone(),
+                };
+                cx.scratch.task = Some(window_task);
+                cx.scratch.run_session = session_state;
+                // FRESH per-window budget (the reset discards the turn budget).
+                cx.scratch.run_budget = BudgetSnapshot::default();
+                // Model (A): Ralph is the continuation loop — each window continues
+                // the ONE logical task across the per-window session reset. Signal
+                // it so a PlanExecute inner resumes its durable task list (window 0
+                // / fresh-start has an empty list ⇒ the inner's "unfinished work"
+                // check still plans fresh; a window that finished its whole plan but
+                // is not yet "done" likewise has no unfinished work ⇒ re-plans for
+                // the remaining work instead of no-op draining).
+                cx.scratch.continue_task_list = true;
+                let window_outcome = inner_for_window.run(cx).await;
+                // #125 rule 4/7: a window child's BudgetExhausted reaches Ralph as
+                // a `StrategyOutcome`, never auto-cascaded. Ralph's recovery
+                // semantics: a budget-exhausted window is treated as "window
+                // incomplete" — RESET the context window and retry (next outer
+                // iteration). After `max_resets` this falls through to
+                // `RalphCompletionUnmet`. Ralph's own scope is unaffected.
+                if let StrategyOutcome::BudgetExhausted { partial_output, .. } = &window_outcome {
+                    last_reason = format!(
+                        "window {} budget-exhausted: {}",
+                        iteration + 1,
+                        partial_output.as_deref().unwrap_or("<no partial>")
+                    );
+                    continue;
+                }
+                let window_result = match cx.take_child_override() {
+                    Some(r) => r,
+                    None => RunResult::Failure {
+                        reason: HaltReason::RalphCompletionUnmet {
+                            iterations: iteration + 1,
+                            last_reason: "window sub-strategy produced no terminal".into(),
+                        },
+                        session_id: window_session_id.clone(),
+                        usage: AggregateUsage::default(),
+                        turns: 0,
+                        session_state: SessionState::default(),
+                    },
+                };
+                let mut window_budget = BudgetSnapshot::default();
+                fold_usage(&mut total_usage, &mut window_budget, &window_result);
+                cumulative_turns += window_budget.turns;
+
+                // A paused / escalated window propagates verbatim.
+                if window_result.is_pause() {
+                    cx.stream = on_stream;
+                    return cx.finish(executor, task, window_result).await;
+                }
+
+                match executor.ralph_completion_status().await {
+                    None => {
+                        let (output, final_state) = match window_result {
+                            RunResult::Success {
+                                output,
+                                session_state,
+                                ..
+                            } => (output, session_state),
+                            _ => (String::new(), SessionState::default()),
+                        };
+                        let result = RunResult::Success {
+                            output,
+                            session_id: window_session_id,
+                            usage: total_usage,
+                            turns: cumulative_turns,
+                            session_state: final_state,
+                        };
+                        cx.stream = on_stream;
+                        return cx.finish(executor, task, result).await;
+                    }
+                    Some(reason) => {
+                        last_reason = reason;
+                    }
+                }
+            }
+
+            let result = RunResult::Failure {
+                reason: HaltReason::RalphCompletionUnmet {
+                    iterations: max_resets.max(1),
+                    last_reason,
+                },
+                session_id: last_session_id,
+                usage: total_usage,
+                turns: cumulative_turns,
+                session_state: SessionState::default(),
+            };
+            cx.stream = on_stream;
+            cx.finish(executor, task, result).await
+        })
+    }
+}
+
+impl RalphConfig {
+    /// The configured `max_resets` (the harness `config.max_resets`).
+    fn max_resets(&self, executor: &dyn StrategyExecutor) -> u32 {
+        executor.ralph_max_resets()
+    }
 }

@@ -142,7 +142,7 @@ impl StandardHarness {
                 };
             }
         };
-        self.run_react(
+        self.run_react(ReactParams::legacy(
             task,
             max_iterations,
             session_state,
@@ -151,7 +151,7 @@ impl StandardHarness {
             agent,
             // legacy wrapper: empty handle ⇒ global-catalogue fallback.
             ToolsetRef(String::new()),
-        )
+        ))
         .await
     }
 
@@ -864,7 +864,7 @@ impl StandardHarness {
                     }
                 };
                 return self
-                    .run_react(
+                    .run_react(ReactParams::legacy(
                         task,
                         max_iterations,
                         session_state,
@@ -873,7 +873,7 @@ impl StandardHarness {
                         agent,
                         // legacy wrapper: empty handle ⇒ global-catalogue fallback.
                         ToolsetRef(String::new()),
-                    )
+                    ))
                     .await;
             }
         }
@@ -1068,7 +1068,7 @@ impl StandardHarness {
                 };
             }
         };
-        self.run_react(
+        self.run_react(ReactParams::legacy(
             task,
             max_iterations,
             session_state,
@@ -1077,7 +1077,7 @@ impl StandardHarness {
             agent,
             // legacy wrapper: empty handle ⇒ global-catalogue fallback.
             ToolsetRef(String::new()),
-        )
+        ))
         .await
     }
 }

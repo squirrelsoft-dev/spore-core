@@ -1,4 +1,5 @@
-//! StandardHarness — SelfVerifying evaluate phase (Phase 6.1 impl split). Pure move.
+//! SelfVerifying strategy: the `StandardHarness` evaluate-phase helper plus
+//! `impl RunStrategy for SelfVerifyingConfig` (the build↔evaluate↔verify loop).
 
 use super::*;
 
@@ -115,7 +116,7 @@ impl StandardHarness {
 
         let cap = task.budget.max_turns.unwrap_or(u32::MAX);
         let eval_result = eval_harness
-            .run_react(
+            .run_react(ReactParams::legacy(
                 eval_task,
                 cap,
                 eval_state,
@@ -123,7 +124,7 @@ impl StandardHarness {
                 None,
                 evaluator,
                 eval_toolset,
-            )
+            ))
             .await;
 
         fold_usage(total_usage, carried, &eval_result);
@@ -202,4 +203,366 @@ impl StandardHarness {
     //         window, finalized via observability).
     //
     // No `// SPEC QUESTION:` markers — B1–B4 are resolved.
+}
+
+
+// ── RunStrategy: the SelfVerifying body (#124, moved from strategies.rs) ──
+impl RunStrategy for SelfVerifyingConfig {
+    /// SelfVerifying (#124): GENUINELY recursive build↔evaluate loop. Each
+    /// iteration dispatches `self.inner.run(cx)` for the build phase (a non-ReAct
+    /// inner — e.g. PlanExecute — really runs its whole loop per iteration), then
+    /// runs a fresh evaluate phase on the inner worker's resolved agent (Q1c) and
+    /// consults the verifier resolved from `self.evaluator`'s key (Q1a). Passed ⇒
+    /// Success; Failed ⇒ append the reason (Default-FAIL) and loop; exhausted ⇒
+    /// `SelfVerifyExhausted`.
+    fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async move {
+            let executor = match cx.executor() {
+                Ok(e) => e,
+                Err(o) => return o,
+            };
+            let task = cx.current_task();
+            let build_session_id = task.session_id.clone();
+            // SC-BUG-1: a HITL resume re-drives the whole SelfVerifying strategy
+            // with the stalled build (worker) conversation carried in the
+            // phase-agnostic resume seed. Consume it as the FIRST build iteration's
+            // session so the build phase CONTINUES the approved/answered worker turn
+            // (which already carries the original instruction + the dispatched tool
+            // result) instead of restarting from an empty top-level session — then
+            // the evaluate phase + verifier run, reaching the looper's eval-frame
+            // reviewer. On a fresh run the seed is `None` and this is the incoming
+            // `run_session`, byte-identical to before. When SelfVerifying is NESTED
+            // under a PlanExecute walk, that outer walk `.take()`s the seed BEFORE
+            // recursing, so this sees `None` and the nested behavior is unchanged.
+            let mut session_state = cx
+                .scratch
+                .resume_seed
+                .take()
+                .unwrap_or_else(|| std::mem::take(&mut cx.scratch.run_session));
+            let mut carried = cx.scratch.run_budget.clone();
+            // #stream: save the parent sink, install a `self_verifying`-attributing
+            // wrapper so the build (worker) and evaluate phases stream through it;
+            // restored to the parent on every exit (`cx.stream = on_stream;`).
+            let on_stream = cx.stream.take();
+            cx.stream = wrap_node_sink(on_stream.clone(), "self_verifying", None);
+
+            // Q1a: resolve the verifier from `evaluator`'s key (NO wire change).
+            let verifier = match cx.registry.resolve_verifier(&self.evaluator.0) {
+                Some(v) => v.clone(),
+                None => {
+                    let result = RunResult::Failure {
+                        reason: HaltReason::SelfVerifyMisconfigured {
+                            reason: format!(
+                                "SelfVerifying requires a verifier registered under key {:?}",
+                                self.evaluator.0
+                            ),
+                        },
+                        session_id: build_session_id,
+                        usage: AggregateUsage::default(),
+                        turns: 0,
+                        session_state: SessionState::default(),
+                    };
+                    cx.stream = on_stream;
+                    return cx.finish(executor, task, result).await;
+                }
+            };
+            // Q1c: the evaluate-phase agent defaults to the inner worker's agent;
+            // an explicit `eval_agent` override (a dedicated reviewer, distinct
+            // from the builder) takes precedence.
+            let eval_agent_ref = self
+                .eval_agent
+                .clone()
+                .unwrap_or_else(|| AgentRef(executor_worker_key(self)));
+            let eval_agent = match executor.resolve_agent_ref(&eval_agent_ref, &build_session_id) {
+                Ok(a) => a,
+                Err(result) => {
+                    cx.stream = on_stream;
+                    return cx.finish(executor, task, *result).await;
+                }
+            };
+            // The evaluate phase runs against `eval_toolset` (a read-only/
+            // inspection catalogue) when set; `None` ⇒ the empty handle (global-
+            // catalogue fallback), byte-identical to pre-override behavior.
+            let eval_toolset = self
+                .eval_toolset
+                .clone()
+                .unwrap_or_else(|| ToolsetRef(String::new()));
+
+            let max_iterations = verifier.max_iterations();
+            let mut total_usage = AggregateUsage::default();
+            let mut last_reason = String::new();
+            let mut last_worker_output = String::new();
+
+            // #125: SelfVerifying owns a budget scope for its build↔evaluate loop.
+            // POLICY is the task's global turn ceiling (TotalSteps); behavior is
+            // `Escalate` (in-process placeholder; serialized behavior is #129).
+            let sv_policy = match task.budget.max_turns {
+                Some(max) => BudgetPolicy::TotalSteps { value: max },
+                None => BudgetPolicy::Unlimited,
+            };
+            cx.push_budget(sv_policy, self.behavior.clone(), "self_verifying");
+
+            for iteration in 0..max_iterations {
+                // ── Build phase: recurse `self.inner.run(cx)`.
+                let build_task = Task {
+                    id: task.id.clone(),
+                    instruction: task.instruction.clone(),
+                    session_id: build_session_id.clone(),
+                    budget: task.budget.clone(),
+                    loop_strategy: (*self.inner).clone(),
+                };
+                cx.scratch.task = Some(build_task);
+                cx.scratch.run_session = session_state.clone();
+                cx.scratch.run_budget = carried.clone();
+                let carried_before = carried.turns;
+                let build_outcome = self.inner.run(cx).await;
+                // #125 rule 4/7: a child's BudgetExhausted reaches THIS parent as
+                // a `StrategyOutcome`, never auto-cascaded. SelfVerifying surfaces
+                // its own typed BudgetExhausted (partial = last worker result +
+                // last verdict) without charging the child's exhaustion against
+                // its own scope.
+                if let StrategyOutcome::BudgetExhausted { .. } = &build_outcome {
+                    let partial = self_verifying_partial_json(&last_worker_output, &last_reason);
+                    let err = cx
+                        .budgets
+                        .current_mut()
+                        .map(|s| BudgetExhausted {
+                            policy: s.policy.clone(),
+                            behavior: s.behavior.clone(),
+                            steps_taken: s.steps_taken,
+                            continues_used: s.continues_used,
+                            phase: s.phase.clone(),
+                        })
+                        .expect("self_verifying scope pushed above");
+                    cx.pop_budget();
+                    cx.scratch.task = Some(task);
+                    cx.stream = on_stream;
+                    return promote_budget_exhausted(&err, Some(partial));
+                }
+                let build_result = match cx.take_child_override() {
+                    Some(r) => r,
+                    None => RunResult::Failure {
+                        reason: HaltReason::SelfVerifyMisconfigured {
+                            reason: "build sub-strategy produced no terminal".into(),
+                        },
+                        session_id: build_session_id.clone(),
+                        usage: AggregateUsage::default(),
+                        turns: carried.turns,
+                        session_state: session_state.clone(),
+                    },
+                };
+                fold_usage(&mut total_usage, &mut carried, &build_result);
+
+                // A paused / escalated build propagates verbatim.
+                match &build_result {
+                    RunResult::WaitingForHuman { .. } | RunResult::Consult { .. } => {
+                        cx.pop_budget();
+                        cx.stream = on_stream;
+                        return cx.finish(executor, task, build_result).await;
+                    }
+                    RunResult::Escalate { .. } => {
+                        cx.pop_budget();
+                        cx.stream = on_stream;
+                        return cx.finish(executor, task, build_result).await;
+                    }
+                    _ => {}
+                }
+                // Capture the build's output for the partial (last worker result).
+                if let RunResult::Success { output, .. } = &build_result {
+                    last_worker_output = output.clone();
+                }
+                // Carry the build's post-run session forward for the next round.
+                if let RunResult::Success {
+                    session_state: st, ..
+                }
+                | RunResult::Failure {
+                    session_state: st, ..
+                } = &build_result
+                {
+                    session_state = st.clone();
+                }
+
+                // #125: charge this iteration's build turns against the
+                // SelfVerifying scope. If the global cap is spent, the node
+                // surfaces its OWN typed BudgetExhausted (partial = last worker
+                // result + last verdict).
+                if let Err(err) = cx.charge_current(carried.turns.saturating_sub(carried_before)) {
+                    let partial = self_verifying_partial_json(&last_worker_output, &last_reason);
+                    let resolution = cx.resolve_current();
+                    // #129: a granted `Continue` resets the scope and RE-RUNS the
+                    // build↔evaluate iteration IN-PROCESS (do NOT pop the scope; the
+                    // loop continues under the refreshed allowance). NO serialization
+                    // (AC3). `max_continues` bounds the loop.
+                    if matches!(resolution, ExhaustedResolution::Continue) {
+                        continue;
+                    }
+                    // SC-5: AutoContinue auto-grants in-process at this Escalate
+                    // point (scope still pushed) before surfacing/aborting.
+                    if matches!(resolution, ExhaustedResolution::Escalate)
+                        && cx.try_auto_continue(&executor.escalation_mode())
+                    {
+                        continue;
+                    }
+                    cx.pop_budget();
+                    cx.scratch.task = Some(task.clone());
+                    cx.stream = on_stream;
+                    return match resolution {
+                        ExhaustedResolution::Fail => promote_budget_exhausted(&err, None),
+                        // #129: the in-process `Continue` is handled above; this arm
+                        // is `Escalate`-only now (kept combined for the surface/
+                        // propagate shape).
+                        ExhaustedResolution::Continue | ExhaustedResolution::Escalate => {
+                            if matches!(executor.escalation_mode(), EscalationMode::SurfaceToHuman)
+                            {
+                                // #138 AC2-a: carry the FULL build (worker) session
+                                // — the SelfVerifying loop carries it forward in
+                                // `session_state` after each iteration — so a budget
+                                // resume re-attaches the real worker context.
+                                let waiting = promote_budget_exhausted_to_human(
+                                    &err,
+                                    Some(partial),
+                                    combinator_escalation_actions(&err),
+                                    build_session_id.clone(),
+                                    task,
+                                    carried.clone(),
+                                    carried.turns,
+                                    session_state.clone(),
+                                    worker_toolset_of(&self.inner),
+                                );
+                                cx.record_terminal(waiting)
+                            } else {
+                                promote_budget_exhausted(&err, Some(partial))
+                            }
+                        }
+                    };
+                }
+
+                // ── Evaluate phase: a fresh evaluator run on `eval_agent`.
+                let eval_result = executor
+                    .evaluate_phase(
+                        &task,
+                        eval_agent.clone(),
+                        eval_toolset.clone(),
+                        &mut carried,
+                        &mut total_usage,
+                    )
+                    .await;
+
+                // #C1: charge the evaluator's OWN turns against the SelfVerifying
+                // scope, mirroring the build charge above. `run_evaluate_phase`
+                // runs the evaluator in an isolated harness from a fresh
+                // `BudgetSnapshot`, so `eval_result.turns` is the evaluator's
+                // standalone turn count — and `fold_usage` folds it via `.max()`
+                // (NOT a sum), so it never reaches `carried.turns` once build
+                // turns dominate. Charging the build delta alone therefore missed
+                // the evaluate phase entirely; charge it explicitly here so both
+                // phases count against the budget.
+                let eval_turns = match &eval_result {
+                    RunResult::Success { turns, .. }
+                    | RunResult::Failure { turns, .. }
+                    | RunResult::Escalate { turns, .. } => *turns,
+                    RunResult::WaitingForHuman { .. } | RunResult::Consult { .. } => 0,
+                };
+                if let Err(err) = cx.charge_current(eval_turns) {
+                    let partial = self_verifying_partial_json(&last_worker_output, &last_reason);
+                    let resolution = cx.resolve_current();
+                    // A granted `Continue` resets the scope and re-runs the
+                    // build↔evaluate iteration in-process (mirrors the build path).
+                    if matches!(resolution, ExhaustedResolution::Continue) {
+                        continue;
+                    }
+                    // SC-5: AutoContinue auto-grants in-process at this Escalate
+                    // point (scope still pushed) before surfacing/aborting.
+                    if matches!(resolution, ExhaustedResolution::Escalate)
+                        && cx.try_auto_continue(&executor.escalation_mode())
+                    {
+                        continue;
+                    }
+                    cx.pop_budget();
+                    cx.scratch.task = Some(task.clone());
+                    cx.stream = on_stream;
+                    return match resolution {
+                        ExhaustedResolution::Fail => promote_budget_exhausted(&err, None),
+                        ExhaustedResolution::Continue | ExhaustedResolution::Escalate => {
+                            if matches!(executor.escalation_mode(), EscalationMode::SurfaceToHuman)
+                            {
+                                let waiting = promote_budget_exhausted_to_human(
+                                    &err,
+                                    Some(partial),
+                                    combinator_escalation_actions(&err),
+                                    build_session_id.clone(),
+                                    task,
+                                    carried.clone(),
+                                    carried.turns,
+                                    session_state.clone(),
+                                    worker_toolset_of(&self.inner),
+                                );
+                                cx.record_terminal(waiting)
+                            } else {
+                                promote_budget_exhausted(&err, Some(partial))
+                            }
+                        }
+                    };
+                }
+
+                let input = VerifierInput {
+                    build_result,
+                    eval_result,
+                    workspace: self.sandbox_root(executor),
+                    iteration,
+                };
+                match verifier.verify(&input).await {
+                    VerifierVerdict::Passed => {
+                        let (output, turns, final_state) = match input.build_result {
+                            RunResult::Success {
+                                output,
+                                turns,
+                                session_state: st,
+                                ..
+                            } => (output, turns, st),
+                            _ => (String::new(), carried.turns, session_state.clone()),
+                        };
+                        let result = RunResult::Success {
+                            output,
+                            session_id: build_session_id,
+                            usage: total_usage,
+                            turns,
+                            session_state: final_state,
+                        };
+                        cx.pop_budget();
+                        cx.stream = on_stream;
+                        return cx.finish(executor, task, result).await;
+                    }
+                    VerifierVerdict::Failed { reason } => {
+                        last_reason = reason.clone();
+                        executor
+                            .append_user_message(&mut session_state, &reason)
+                            .await;
+                    }
+                }
+            }
+
+            cx.pop_budget();
+            let result = RunResult::Failure {
+                reason: HaltReason::SelfVerifyExhausted {
+                    iterations: max_iterations,
+                    last_reason,
+                },
+                session_id: build_session_id,
+                usage: total_usage,
+                turns: carried.turns,
+                session_state,
+            };
+            cx.stream = on_stream;
+            cx.finish(executor, task, result).await
+        })
+    }
+}
+
+impl SelfVerifyingConfig {
+    /// The workspace root for a verifier input. Delegated to the executor so the
+    /// config body stays harness-agnostic.
+    fn sandbox_root(&self, executor: &dyn StrategyExecutor) -> std::path::PathBuf {
+        executor.workspace_root()
+    }
 }

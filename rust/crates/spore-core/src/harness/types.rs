@@ -323,6 +323,70 @@ impl StreamEvent {
 /// the harness backs subscribes to exactly this sink and forwards over SSE).
 pub type StreamSink = Arc<dyn Fn(StreamEvent) + Send + Sync>;
 
+/// The fully-resolved inputs to one ReAct turn-loop window. Bundles what used
+/// to be the long positional argument list of `run_react_inner` /
+/// [`StrategyExecutor::react_window`] into a single value so the turn-loop
+/// entry points stay under the argument-count lint without an allow, and so the
+/// per-leaf knobs (#139 output schema, SC-10 prompt override, Issue 2 toolset,
+/// the execute-step marker) travel together rather than as a row of `None`s and
+/// booleans. Constructed by the caller (`ReactConfig::run`, the legacy
+/// `run_react` wrapper); consumed once when the window starts.
+pub struct ReactParams {
+    /// The task this window runs (carries `session_id`, instruction, budget).
+    pub task: Task,
+    /// Hard turn ceiling for the window (the leaf's `max_iterations`).
+    pub max_iterations: u32,
+    /// Conversation state threaded in; mutated in place across turns.
+    pub session_state: SessionState,
+    /// Budget consumed so far, carried across nested windows.
+    pub budget_used: BudgetSnapshot,
+    /// Optional user-facing stream sink (cloned per turn for live deltas).
+    pub on_stream: Option<StreamSink>,
+    /// The RESOLVED worker agent for this leaf (#124).
+    pub agent: Arc<dyn Agent>,
+    /// The RESOLVED per-node toolset handle (Issue 2). Empty ⇒ global fallback.
+    pub toolset: ToolsetRef,
+    /// The RESOLVED output schema to enforce (#139). `None` ⇒ no enforcement.
+    pub output_schema: Option<serde_json::Value>,
+    /// Extra validation-retry turns allowed within budget (#139).
+    pub output_schema_max_retries: u32,
+    /// Per-node system-prompt OVERRIDE (SC-10). `None` ⇒ the global prompt.
+    pub system_prompt: Option<String>,
+    /// Whether this window is a PlanExecute EXECUTE step (scopes the nudge).
+    pub execute_step: bool,
+}
+
+impl ReactParams {
+    /// Build the inputs for a LEGACY `run_react` window — the single-shot / DAG
+    /// execute-step / SelfVerifying-evaluate path that does NOT enforce output
+    /// schemas, carries no per-leaf prompt override, and is not an execute step.
+    /// Fills the #139 / SC-10 / execute-step knobs with their byte-for-byte
+    /// pre-feature defaults so callers pass only the seven values they vary.
+    pub fn legacy(
+        task: Task,
+        max_iterations: u32,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: Option<StreamSink>,
+        agent: Arc<dyn Agent>,
+        toolset: ToolsetRef,
+    ) -> Self {
+        Self {
+            task,
+            max_iterations,
+            session_state,
+            budget_used,
+            on_stream,
+            agent,
+            toolset,
+            output_schema: None,
+            output_schema_max_retries: 0,
+            system_prompt: None,
+            execute_step: false,
+        }
+    }
+}
+
 /// Attribution stamped onto every [`StreamEvent`] as it flows up through the
 /// node-wrapping sinks (see [`wrap_node_sink`]). Lets a multi-agent UI route a
 /// frame to the node that produced it. Optional + `skip_serializing_if` so an
