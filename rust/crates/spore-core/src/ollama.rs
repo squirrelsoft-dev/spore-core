@@ -443,6 +443,16 @@ struct OllamaOptions {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f32>,
+    /// Ollama names the repetition penalty `repeat_penalty` (mapped from
+    /// [`ModelParams::repetition_penalty`](crate::model::ModelParams)).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     stop: Vec<String>,
 }
@@ -453,6 +463,10 @@ impl OllamaOptions {
             && self.num_predict.is_none()
             && self.temperature.is_none()
             && self.top_p.is_none()
+            && self.top_k.is_none()
+            && self.min_p.is_none()
+            && self.presence_penalty.is_none()
+            && self.repeat_penalty.is_none()
             && self.stop.is_empty()
     }
 }
@@ -654,6 +668,10 @@ fn build_request(
         num_predict: req.params.max_tokens,
         temperature: req.params.temperature,
         top_p: req.params.top_p,
+        top_k: req.params.top_k,
+        min_p: req.params.min_p,
+        presence_penalty: req.params.presence_penalty,
+        repeat_penalty: req.params.repetition_penalty,
         stop: req.params.stop_sequences.clone(),
     };
 

@@ -1759,6 +1759,7 @@ mod tests {
             max_repair_attempts: 1,
             plan_empty_max_retries: 0,
             tool_call_nudge: false,
+            steering_source: None,
             max_stop_blocks: 8,
             error_loop_threshold: 3,
             enforce_output_schemas: false,

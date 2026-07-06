@@ -292,6 +292,7 @@ fn standard_config(agent: Arc<MockAgent>) -> HarnessConfig {
         max_repair_attempts: 1,
         plan_empty_max_retries: 0,
         tool_call_nudge: false,
+        steering_source: None,
         max_stop_blocks: 8,
         error_loop_threshold: 3,
         // #139: OFF by default in the shared test config (migration gate),
@@ -413,6 +414,90 @@ async fn final_response_returns_success() {
         }
         other => panic!("expected Success, got {other:?}"),
     }
+}
+
+// Steering (pi-style, `HarnessConfig::steering_source`): a message queued
+// mid-run is injected as a USER message at the NEXT turn boundary — after the
+// current turn's tool calls execute, before the next model call — persisted on
+// the session, and emitted as `StreamEvent::UserMessage`. In-flight work is
+// never cancelled.
+#[tokio::test]
+async fn steering_message_injects_at_turn_boundary() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let a = make_agent();
+    a.push(TurnResult::ToolCallRequested {
+        reasoning: None,
+        calls: vec![ToolCall {
+            id: "c1".into(),
+            name: "x".into(),
+            input: serde_json::json!({}),
+        }],
+        usage: usage(),
+    });
+    a.push(TurnResult::FinalResponse {
+        reasoning: None,
+        content: "after-tool".into(),
+        usage: usage(),
+    });
+    let mut cfg = standard_config(a);
+    let reg = Arc::new(ScriptedToolRegistry::new());
+    reg.push(ToolOutput::Success {
+        content: "tool-ok".into(),
+        truncated: false,
+    });
+    cfg.tool_registry = reg;
+    let polls = Arc::new(AtomicU32::new(0));
+    let polls_in_source = polls.clone();
+    cfg.steering_source = Some(Arc::new(move || {
+        // Poll 0 = before turn 1 (nothing queued yet); poll 1 = the boundary
+        // AFTER turn 1's tool calls — the steer is delivered there, before
+        // turn 2's model call.
+        match polls_in_source.fetch_add(1, Ordering::SeqCst) {
+            1 => vec!["steer: also update the docs".to_string()],
+            _ => vec![],
+        }
+    }));
+    let h = StandardHarness::new(cfg);
+    let events: Arc<std::sync::Mutex<Vec<StreamEvent>>> = Default::default();
+    let events_in_sink = events.clone();
+    let r = h
+        .run(
+            HarnessRunOptions::new(react(5))
+                .with_stream(move |e| events_in_sink.lock().unwrap().push(e)),
+        )
+        .await;
+    match r {
+        RunResult::Success {
+            output,
+            turns,
+            session_state,
+            ..
+        } => {
+            assert_eq!(output, "after-tool");
+            assert_eq!(turns, 2, "the tool turn still ran to completion");
+            let injected = session_state.messages.iter().any(|m| {
+                m.role == crate::model::Role::User
+                    && matches!(
+                        &m.content,
+                        crate::model::Content::Text { text } if text.contains("steer: also update the docs")
+                    )
+            });
+            assert!(injected, "steered message persisted on the session");
+        }
+        other => panic!("expected Success, got {other:?}"),
+    }
+    assert!(
+        events.lock().unwrap().iter().any(|e| matches!(
+            e,
+            StreamEvent::UserMessage { content, .. } if content.contains("steer:")
+        )),
+        "steered message emitted as StreamEvent::UserMessage"
+    );
+    assert!(
+        polls.load(Ordering::SeqCst) >= 2,
+        "the source is polled at every turn boundary"
+    );
 }
 
 // Rule: tool calls are dispatched, then loop continues to a final response.
@@ -2520,6 +2605,56 @@ async fn tool_call_repair_fixes_bad_bool_arg() {
     assert!(!last_tool_error.load(Ordering::SeqCst));
 }
 
+// The shared `dispatch_with_repair` helper — the SAME path the resume flow uses
+// for human-GATED tool calls (bash/write/edit). A recoverable-error call with a
+// coercible arg (`"false"` where a bool is wanted) must be repaired and
+// re-dispatched to success, so gated calls get the same repair as auto-approved
+// ones (the resume-path gap: gated calls previously bypassed repair entirely).
+#[tokio::test]
+async fn dispatch_with_repair_coerces_a_recoverable_calls_args() {
+    use std::sync::atomic::Ordering;
+
+    let mut cfg = standard_config(make_agent());
+    let reg = Arc::new(BoolToolRegistry::new());
+    cfg.tool_registry = reg.clone();
+    cfg.tool_call_repair = Some(Arc::new(crate::tool_call_repair::StandardToolCallRepair));
+    let h = StandardHarness::new(cfg);
+
+    let (effective, output) = h
+        .dispatch_with_repair(
+            reg.as_ref(),
+            ToolCall {
+                id: "c".into(),
+                name: "set_flag".into(),
+                input: serde_json::json!({ "flag": "false" }),
+            },
+        )
+        .await;
+
+    // The arg was coerced "false" → false and re-dispatched to success.
+    assert_eq!(effective.input, serde_json::json!({ "flag": false }));
+    assert!(matches!(output, ToolOutput::Success { .. }), "got {output:?}");
+    assert_eq!(reg.call_count.load(Ordering::SeqCst), 2, "original (fail) + repaired (ok)");
+}
+
+// The enrichment gate: only PARAMETER-shaped errors get the schema+hint; a
+// command/runtime failure (a failing `cargo test`) is left raw so the hint
+// doesn't mislead the model — or an offline judge — into seeing a non-existent
+// "schema violation".
+#[test]
+fn is_param_error_distinguishes_malformed_from_command_failures() {
+    assert!(StandardHarness::is_param_error(
+        "invalid parameters: invalid type: string \"60\", expected u64"
+    ));
+    assert!(StandardHarness::is_param_error(
+        "schema validation failed for bash_command: missing required field `script`"
+    ));
+    assert!(!StandardHarness::is_param_error("exit 101 ; stderr: test assertion failed"));
+    assert!(!StandardHarness::is_param_error(
+        "exit 1 ; stderr: error: no library targets found in package `tier1`"
+    ));
+}
+
 // Without a repair provider, the same bad `flag: "false"` argument yields a
 // recoverable tool error fed back to the model (today's behaviour).
 #[tokio::test]
@@ -3921,7 +4056,7 @@ async fn plan_directive_does_not_leak_into_execute_context() {
 
     // The PLAN turn (index 0) DOES carry the directive — that's correct.
     assert!(
-        contexts[0].contains("Respond with a single JSON object")
+        contexts[0].contains("Record the plan ONLY through")
             && contexts[0].contains("Produce a step-by-step plan"),
         "plan turn should see the directive: {}",
         contexts[0]
@@ -3930,7 +4065,7 @@ async fn plan_directive_does_not_leak_into_execute_context() {
     // No EXECUTE-step context (indices 1..) may carry the directive.
     for (i, c) in contexts.iter().enumerate().skip(1) {
         assert!(
-            !c.contains("Respond with a single JSON object"),
+            !c.contains("Record the plan ONLY through"),
             "execute-step context {i} leaked the directive: {c}"
         );
         assert!(
@@ -6195,6 +6330,7 @@ mod compaction {
             max_repair_attempts: 1,
             plan_empty_max_retries: 0,
             tool_call_nudge: false,
+            steering_source: None,
             max_stop_blocks: 8,
             error_loop_threshold: 3,
             enforce_output_schemas: false,

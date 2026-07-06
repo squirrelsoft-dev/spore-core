@@ -54,14 +54,25 @@ pub fn coerce_tool_args(input: &Value, schema: Option<&ToolSchema>) -> Option<Va
     let mut out = serde_json::Map::with_capacity(obj.len());
 
     for (key, value) in obj {
-        let expected = expected_types.get(key.as_str()).map(String::as_str);
+        // Repair a malformed argument KEY before resolving its type. Weak models
+        // sometimes wrap the argument name in literal quotes (`"content"` instead
+        // of `content`) — via hand-written `<input>` JSON or a `<parameter="K">`
+        // tag — so the key misses the schema and the tool rejects the call for a
+        // "missing required field". Adopt the quote-stripped form when it matches
+        // a known property (or, with no schema, unconditionally — a quoted JSON
+        // key is never intentional).
+        let normalized = normalize_key(key, &expected_types);
+        if normalized != *key {
+            changed = true;
+        }
+        let expected = expected_types.get(normalized.as_str()).map(String::as_str);
         match coerce_scalar(value, expected) {
             Some(repaired) => {
                 changed = true;
-                out.insert(key.clone(), repaired);
+                out.insert(normalized, repaired);
             }
             None => {
-                out.insert(key.clone(), value.clone());
+                out.insert(normalized, value.clone());
             }
         }
     }
@@ -71,6 +82,39 @@ pub fn coerce_tool_args(input: &Value, schema: Option<&ToolSchema>) -> Option<Va
     } else {
         None
     }
+}
+
+/// Normalize a possibly-malformed argument key. Weak models sometimes emit the
+/// key wrapped in literal quotes (`"content"` / `'path'`), which makes it miss
+/// the schema so the tool rejects the call for a missing required field. With a
+/// schema, only rewrite a key that misses the declared properties but whose
+/// quote-stripped form hits them; with no schema, strip one surrounding matched
+/// quote pair unconditionally (a quoted JSON key is never intentional). A
+/// stripped form that still isn't a known property is left untouched — we never
+/// fabricate a schema match.
+fn normalize_key(key: &str, expected: &BTreeMap<String, String>) -> String {
+    if expected.contains_key(key) {
+        return key.to_string();
+    }
+    let stripped = strip_one_quote_pair(key.trim());
+    if stripped != key && (expected.is_empty() || expected.contains_key(stripped)) {
+        return stripped.to_string();
+    }
+    key.to_string()
+}
+
+/// Strip exactly one pair of matching surrounding quotes (`"…"` or `'…'`) from a
+/// string. Returns the input unchanged when it is not so wrapped. The quote
+/// bytes are ASCII, so byte-slicing at the ends is UTF-8-safe.
+fn strip_one_quote_pair(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() >= 2 {
+        let (first, last) = (b[0], b[b.len() - 1]);
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
 }
 
 /// Coerce a single field value given its (optional) expected JSON-schema type.
@@ -324,6 +368,45 @@ mod tests {
             description: "t".into(),
             input_schema: json!({ "type": "object", "properties": props }),
         }
+    }
+
+    #[test]
+    fn repairs_a_quoted_key_against_the_schema() {
+        // The send_message regression: weak models wrap the arg name in quotes
+        // (`"content"`), so the key misses the schema and the tool rejects the
+        // call for a missing required field. The quote-stripped key is adopted.
+        let s = schema(json!({ "content": { "type": "string" } }));
+        let input = json!({ "\"content\"": "Adding slugify to util.rs." });
+        let out = coerce_tool_args(&input, Some(&s)).expect("should repair the key");
+        assert_eq!(out, json!({ "content": "Adding slugify to util.rs." }));
+    }
+
+    #[test]
+    fn repairs_a_quoted_key_with_no_schema() {
+        // No schema → a quoted JSON key is never intentional, so strip it.
+        let input = json!({ "'path'": "src/util.rs" });
+        let out = coerce_tool_args(&input, None).expect("should strip the quoted key");
+        assert_eq!(out, json!({ "path": "src/util.rs" }));
+    }
+
+    #[test]
+    fn repairs_a_quoted_key_and_coerces_its_value_together() {
+        // Both defects at once (the set_plan shape): quoted key AND a
+        // string-encoded array value.
+        let s = schema(json!({ "tasks": { "type": "array" } }));
+        let input = json!({ "\"tasks\"": "[\"a\",\"b\"]" });
+        let out = coerce_tool_args(&input, Some(&s)).expect("should repair key + value");
+        assert_eq!(out, json!({ "tasks": ["a", "b"] }));
+    }
+
+    #[test]
+    fn does_not_invent_a_key_that_misses_the_schema() {
+        // A quoted key whose stripped form still isn't a property is left as-is
+        // (with an already-valid value → no change at all). We never fabricate a
+        // schema match.
+        let s = schema(json!({ "content": { "type": "string" } }));
+        let input = json!({ "\"bogus\"": "x" });
+        assert!(coerce_tool_args(&input, Some(&s)).is_none());
     }
 
     #[test]

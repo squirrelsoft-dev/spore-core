@@ -3,6 +3,13 @@
 //! `HarnessBuilder`. Pure move — no behavior change.
 
 use super::*;
+
+/// Non-blocking mid-run steering drain (see
+/// [`HarnessConfig::steering_source`]): returns the user messages queued since
+/// the last poll (usually empty). Called at every ReAct turn boundary, so it
+/// must never block — drain a queue, don't await one.
+pub type SteeringSource = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
 /// A configured memory source for the live loop (issue #160 / SC-26 follow-up).
 ///
 /// Bundles an `Arc<dyn MemoryProvider>` (now object-safe — see
@@ -136,6 +143,15 @@ pub struct HarnessConfig {
     /// it does NOT switch the model to prompt-based tool calling — it only corrects
     /// narrate-instead-of-act. `false` (default) is byte-identical.
     pub tool_call_nudge: bool,
+    /// Mid-run steering seam (pi-style). When set, the ReAct turn loop polls
+    /// this source at every TURN BOUNDARY — after the current assistant turn
+    /// finishes executing its tool calls, before the next model call — and
+    /// injects each returned string as a USER message (also emitted as
+    /// [`StreamEvent::UserMessage`](crate::harness::StreamEvent) so UIs render
+    /// it). Steering never cancels in-flight work; it redirects the NEXT turn.
+    /// The source must be non-blocking (drain a queue, don't wait on one).
+    /// `None` (default) is byte-identical to the pre-steering loop.
+    pub steering_source: Option<SteeringSource>,
     /// Maximum number of consecutive Stop-hook blocks within a single `run()`
     /// before the loop terminates anyway (issue #69, Decision 4/5). The
     /// counter is PER-RUN — it resets on every `run()` call, so a resumed
@@ -388,6 +404,7 @@ pub struct HarnessBuilder {
     max_repair_attempts: u32,
     plan_empty_max_retries: u32,
     tool_call_nudge: bool,
+    steering_source: Option<SteeringSource>,
     max_stop_blocks: u32,
     /// Consecutive-recoverable-tool-error breaker threshold `N` (issue #137).
     /// Defaults to `3`. See [`HarnessConfig::error_loop_threshold`].
@@ -509,6 +526,7 @@ impl HarnessBuilder {
             max_repair_attempts: 1,
             plan_empty_max_retries: 0,
             tool_call_nudge: false,
+            steering_source: None,
             max_stop_blocks: 8,
             error_loop_threshold: 3,
             enforce_output_schemas: false,
@@ -1263,6 +1281,40 @@ impl HarnessBuilder {
         self
     }
 
+    /// Install a mid-run steering source (see
+    /// [`HarnessConfig::steering_source`]): a non-blocking queue drain the ReAct
+    /// loop polls at every turn boundary, injecting each returned string as a
+    /// user message before the next model call. Steering never cancels
+    /// in-flight work. `None` (default) is byte-identical.
+    pub fn steering_source(mut self, source: SteeringSource) -> Self {
+        self.steering_source = Some(source);
+        self
+    }
+
+    /// Pin the model to NATIVE tool calling: disable the adaptive prompt-based
+    /// escalation by dropping the
+    /// [`prompt_tool_call_flag`](HarnessConfig::prompt_tool_call_flag) the run loop
+    /// would otherwise flip. The
+    /// [`AdaptiveToolCallModelInterface`](crate::prompt_tool_call::AdaptiveToolCallModelInterface)
+    /// wrapper stays installed but its flag is never set, so every request uses the
+    /// inner model's native function-calling — even on a turn that produced no tool
+    /// call. The behavioral [`tool_call_nudge`](Self::tool_call_nudge) still nudges
+    /// a tool-free execute turn to act (it never flips the flag), so a model that
+    /// merely narrated is still corrected without abandoning the native channel.
+    ///
+    /// Use for endpoints that reliably return native `tool_calls` — Anthropic, an
+    /// OpenAI-compatible server with a working `--tool-call-parser`, or a LiteLLM
+    /// proxy — where the prompt-based fallback would only do harm (clearing the
+    /// native tool channel and demanding a divergent text format). `native == false`
+    /// (the default) is byte-identical: the escalation stays armed for tool-blind
+    /// local servers.
+    pub fn native_tool_calls(mut self, native: bool) -> Self {
+        if native {
+            self.prompt_tool_call_flag = None;
+        }
+        self
+    }
+
     /// Enable deferred-tool exposure (see
     /// [`ToolSearchConfig`](crate::tool_registry::ToolSearchConfig)): advertise
     /// only the configured core tools + a `tool_search` meta-tool, and let the
@@ -1423,6 +1475,7 @@ impl HarnessBuilder {
             max_repair_attempts: self.max_repair_attempts,
             plan_empty_max_retries: self.plan_empty_max_retries,
             tool_call_nudge: self.tool_call_nudge,
+            steering_source: self.steering_source,
             max_stop_blocks: self.max_stop_blocks,
             error_loop_threshold: self.error_loop_threshold,
             enforce_output_schemas: self.enforce_output_schemas,
@@ -1454,5 +1507,43 @@ impl HarnessBuilder {
     /// Assemble a ready-to-run [`StandardHarness`].
     pub fn build(self) -> StandardHarness {
         StandardHarness::new(self.build_config())
+    }
+}
+
+#[cfg(test)]
+mod native_tool_call_tests {
+    use super::*;
+    use crate::model::mock::MockModelInterface;
+    use crate::model::ProviderInfo;
+
+    fn mock() -> Arc<dyn crate::model::ModelInterface> {
+        Arc::new(MockModelInterface::new(ProviderInfo {
+            name: "test".into(),
+            model_id: "test-1".into(),
+            context_window: 4096,
+        }))
+    }
+
+    #[test]
+    fn conversational_arms_the_escalation_flag_by_default() {
+        // The adaptive prompt-based fallback is installed (and armed) for the
+        // tool-blind-local-server default.
+        let b = HarnessBuilder::conversational_arc(mock());
+        assert!(b.prompt_tool_call_flag.is_some());
+    }
+
+    #[test]
+    fn native_tool_calls_true_disarms_the_escalation_flag() {
+        // native_tool_calls(true) drops the flag the run loop would flip, so the
+        // model can never be switched out of native tool calling.
+        let b = HarnessBuilder::conversational_arc(mock()).native_tool_calls(true);
+        assert!(b.prompt_tool_call_flag.is_none());
+    }
+
+    #[test]
+    fn native_tool_calls_false_is_a_no_op() {
+        // false leaves the escalation armed — byte-identical to not calling it.
+        let b = HarnessBuilder::conversational_arc(mock()).native_tool_calls(false);
+        assert!(b.prompt_tool_call_flag.is_some());
     }
 }

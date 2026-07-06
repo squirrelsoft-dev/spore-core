@@ -207,6 +207,18 @@ struct OpenAIRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f32>,
+    /// Extended sampling controls. vLLM / local OpenAI-compatible servers accept
+    /// `top_k`/`min_p`/`repetition_penalty` as request fields; `presence_penalty`
+    /// is standard OpenAI. All skipped when unset so existing requests stay
+    /// byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repetition_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     stop: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -405,6 +417,18 @@ fn build_request(
     } else {
         (req.params.top_p, req.params.stop_sequences.clone())
     };
+    // Extended sampling controls — dropped for o-series reasoning models (which
+    // reject sampling-control params), exactly like `temperature`/`top_p`/`stop`.
+    let (top_k, min_p, presence_penalty, repetition_penalty) = if is_reasoning {
+        (None, None, None, None)
+    } else {
+        (
+            req.params.top_k,
+            req.params.min_p,
+            req.params.presence_penalty,
+            req.params.repetition_penalty,
+        )
+    };
     // SC-27: emit `reasoning_effort` only for a reasoning model whose compat
     // opted in AND whose caller set an effort level. Absent otherwise so
     // non-reasoning requests stay byte-identical.
@@ -432,6 +456,10 @@ fn build_request(
         reasoning_effort,
         temperature,
         top_p,
+        top_k,
+        min_p,
+        presence_penalty,
+        repetition_penalty,
         stop,
         tools,
         response_format,
@@ -921,6 +949,57 @@ mod tests {
         let body = build_request("gpt-4o", &r, false, &OpenAICompat::default());
         assert_eq!(body.max_tokens, Some(256));
         assert_eq!(body.max_completion_tokens, None);
+    }
+
+    #[test]
+    fn build_request_serializes_extended_sampling_params() {
+        // vLLM / local OpenAI-compatible servers accept top_k/min_p/repetition_penalty
+        // alongside the standard presence_penalty — all must reach the wire when set.
+        // (Binary-exact values so the JSON number comparison is precision-safe.)
+        let mut r = req(vec![user("hi")]);
+        r.params.temperature = Some(0.5);
+        r.params.top_p = Some(0.5);
+        r.params.top_k = Some(20);
+        r.params.min_p = Some(0.0);
+        r.params.presence_penalty = Some(0.0);
+        r.params.repetition_penalty = Some(1.0);
+        let body =
+            build_request("nvidia/Qwen3.6-35B-A3B-NVFP4", &r, false, &OpenAICompat::default());
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["temperature"], 0.5);
+        assert_eq!(json["top_p"], 0.5);
+        assert_eq!(json["top_k"], 20);
+        assert_eq!(json["min_p"], 0.0);
+        assert_eq!(json["presence_penalty"], 0.0);
+        assert_eq!(json["repetition_penalty"], 1.0);
+    }
+
+    #[test]
+    fn unset_sampling_params_are_omitted() {
+        // No sampling set → the fields are absent (byte-identical to the
+        // pre-sampling request; the server default applies).
+        let body = build_request("gpt-4o", &req(vec![user("hi")]), false, &OpenAICompat::default());
+        let json = serde_json::to_value(&body).unwrap();
+        for k in ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repetition_penalty"]
+        {
+            assert!(json.get(k).is_none(), "{k} must be omitted when unset");
+        }
+    }
+
+    #[test]
+    fn reasoning_models_drop_extended_sampling_params() {
+        // o-series reasoning models reject sampling-control params: the extended set
+        // is dropped exactly like temperature/top_p/stop.
+        let mut r = req(vec![user("hi")]);
+        r.params.top_k = Some(20);
+        r.params.min_p = Some(0.1);
+        r.params.presence_penalty = Some(0.5);
+        r.params.repetition_penalty = Some(1.1);
+        let body = build_request("o3-mini", &r, false, &OpenAICompat::default());
+        let json = serde_json::to_value(&body).unwrap();
+        for k in ["top_k", "min_p", "presence_penalty", "repetition_penalty"] {
+            assert!(json.get(k).is_none(), "{k} must be dropped for reasoning models");
+        }
     }
 
     #[test]

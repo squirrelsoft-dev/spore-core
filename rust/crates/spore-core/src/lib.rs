@@ -23,6 +23,7 @@ pub mod anthropic;
 pub mod cache_provider;
 pub mod compaction_adapter;
 pub mod context;
+pub mod embedding;
 pub mod execution_registry;
 pub mod guide_registry;
 pub mod harness;
@@ -54,6 +55,7 @@ pub(crate) mod text_util;
 pub mod tool_call_repair;
 pub mod tool_registry;
 pub mod tools;
+pub mod vector_store;
 pub mod verifier;
 
 pub use agent::{Agent, AgentError, AgentId, Context as AgentContext, ModelAgent, TurnResult};
@@ -71,6 +73,9 @@ pub use context::{
     ComposedPrompt, Context, ContextError, ContextManager, ContextMeta, ContextSources,
     KeyTermVerifier, PromptSegment, RenderedSystemPrompt, SegmentStability,
     SessionState as ContextSessionState, StandardContextManager, DEFAULT_CONTEXT_LENGTH,
+};
+pub use embedding::{
+    cosine_similarity, EmbeddingInfo, EmbeddingModel, OllamaEmbeddingModel, OpenAIEmbeddingModel,
 };
 pub use execution_registry::{
     AutoGrantInfo, EscalationMode, ExecutionRegistry, ExecutionRegistryBuilder, GrantCallback,
@@ -93,12 +98,18 @@ pub use harness::{
     ModelConfig, NetworkPolicy, NodeAttr, NullSandbox, ObservabilityProvider,
     Operation, PausedState, PlanExecuteConfig, RalphConfig, ReactConfig, ReadOnlySandbox,
     RiskLevel, RunResult, RunStrategy, SandboxProvider, SandboxViolation, SchemaRef,
-    SelfVerifyingConfig, SessionId, SessionState, SpanStack, StandardHarness, StrategyOutcome,
-    StrategyRef, StreamEvent as HarnessStreamEvent, Task, TaskId, TerminationDecision,
+    SelfVerifyingConfig, SessionId, SessionState, SpanStack, StandardHarness, SteeringSource,
+    StrategyOutcome, StrategyRef, StreamEvent as HarnessStreamEvent, Task, TaskId,
+    TerminationDecision,
     TerminationPolicy, ToolOutput, ToolRegistry as HarnessToolRegistry,
     ToolResult as HarnessToolResult, ToolsetRef, TruncatedOutput, VcsError, VcsLogArgs,
     VcsProvider,
 };
+// `BoxFut` is the object-safe async return type every boundary trait uses
+// (`Tool`, `ModelInterface`, `EmbeddingModel`, `VectorStore`, …). Re-exported at
+// the root so out-of-crate implementors (e.g. `spore-mcp`, `spore-sqlvec`) can
+// name it without reaching into the `harness` module path.
+pub use harness::BoxFut;
 pub use hooks::{
     CommandHook, FireOutcome, FunctionHook, Hook, HookChain, HookContext, HookDecision, HookError,
     HookEvent, HookSync, PlanArtifact, StandardHookChain, ToolCallSummary, TurnOutput,
@@ -209,6 +220,9 @@ pub use tool_registry::{
     DispatchError, RealToolRegistry, RegistrationError, StandardToolRegistry, TaskPhase, Tool,
     ToolAnnotations, ToolContext, ToolNamespace, ToolRegistry, ToolSchema as RegisteredToolSchema,
     ToolSearchConfig, ToolSearchRegistry, ToolSet,
+};
+pub use vector_store::{
+    MetadataFilter, VectorHit, VectorRecord, VectorStore, VectorStoreError,
 };
 pub use verifier::{
     CompositeVerifier, EvaluatorResponseVerifier, TestSuiteVerifier, Verifier, VerifierInput,

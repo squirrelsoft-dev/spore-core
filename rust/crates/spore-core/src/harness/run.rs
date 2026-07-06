@@ -88,7 +88,7 @@ impl StandardHarness {
         }
         for call in pending {
             let output =
-                self.normalize_sandbox_violation(tool_registry.dispatch(call.clone()).await);
+                self.normalize_sandbox_violation(self.dispatch_with_repair(tool_registry.as_ref(), call.clone()).await.1);
             let tr = ToolResult {
                 call_id: call.id,
                 output,
@@ -894,7 +894,7 @@ impl StandardHarness {
                     let tool_started_at = Timestamp::now();
                     let tool_clock = std::time::Instant::now();
                     let output = self
-                        .normalize_sandbox_violation(tool_registry.dispatch(call.clone()).await);
+                        .normalize_sandbox_violation(self.dispatch_with_repair(tool_registry.as_ref(), call.clone()).await.1);
                     self.emit_resumed_tool_call(
                         &session_id,
                         &task,
@@ -1038,7 +1038,7 @@ impl StandardHarness {
                     let tool_started_at = Timestamp::now();
                     let tool_clock = std::time::Instant::now();
                     let output = self
-                        .normalize_sandbox_violation(tool_registry.dispatch(call.clone()).await);
+                        .normalize_sandbox_violation(self.dispatch_with_repair(tool_registry.as_ref(), call.clone()).await.1);
                     // Observability span — gated tools dispatch on the resume path;
                     // emit here too, else they are missing from the trace (the
                     // single inline emit in `react.rs` never runs for them).
@@ -1091,7 +1091,7 @@ impl StandardHarness {
                     let tool_started_at = Timestamp::now();
                     let tool_clock = std::time::Instant::now();
                     let output = self
-                        .normalize_sandbox_violation(tool_registry.dispatch(call.clone()).await);
+                        .normalize_sandbox_violation(self.dispatch_with_repair(tool_registry.as_ref(), call.clone()).await.1);
                     // Observability span — gated tools dispatch on the resume path;
                     // emit here too, else they are missing from the trace (the
                     // single inline emit in `react.rs` never runs for them).

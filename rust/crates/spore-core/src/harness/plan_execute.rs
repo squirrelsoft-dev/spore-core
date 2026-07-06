@@ -4,6 +4,94 @@
 
 use super::*;
 
+/// Build the `<files>` handoff from a plan phase's conversation: every file the
+/// planner READ, deduped by path (last read wins — most recent contents), so the
+/// execute steps can use them WITHOUT re-reading (plan→execute context threading).
+/// Returns an empty string when the plan read nothing. The combined body is
+/// bounded so a large file cannot blow the execute context — the overflowing file
+/// is truncated at a char boundary and any further files are noted as omitted.
+pub(crate) fn render_plan_read_files(session: &SessionState) -> String {
+    use crate::model::{Content, Role};
+
+    // Tool CALLS are stored structurally (`Content::ToolCall`), but their RESULTS
+    // are stored as a SEPARATE `Role::Tool` `Content::Text` message with NO id
+    // back-link (the context manager renders results to text — see
+    // `append_tool_result`). Calls and results are appended 1:1 in the SAME order,
+    // so pair the Nth call with the Nth result BY POSITION. Record each call's
+    // `read_file` path (`None` for a non-read call) to keep the indexes aligned.
+    let mut call_read_paths: Vec<Option<&str>> = Vec::new();
+    for m in &session.messages {
+        if let Content::ToolCall(tc) = &m.content {
+            call_read_paths.push(if tc.name == "read_file" {
+                tc.input.get("path").and_then(|v| v.as_str())
+            } else {
+                None
+            });
+        }
+    }
+    if !call_read_paths.iter().any(|p| p.is_some()) {
+        return String::new();
+    }
+    let mut result_texts: Vec<&str> = Vec::new();
+    for m in &session.messages {
+        if matches!(m.role, Role::Tool) {
+            if let Content::Text { text } = &m.content {
+                result_texts.push(text);
+            }
+        }
+    }
+
+    // path -> most-recent read content, preserving first-seen order.
+    let mut order: Vec<&str> = Vec::new();
+    let mut by_path: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for (i, maybe_path) in call_read_paths.iter().enumerate() {
+        if let (Some(path), Some(&content)) = (*maybe_path, result_texts.get(i)) {
+            if !by_path.contains_key(path) {
+                order.push(path);
+            }
+            by_path.insert(path, content);
+        }
+    }
+    if order.is_empty() {
+        return String::new();
+    }
+
+    const MAX_TOTAL: usize = 24_000;
+    let mut out = String::from(
+        "<files>\nThese files were already read while planning (contents as of \
+         planning). Use them instead of re-reading — only re-read a file you have \
+         since modified.\n",
+    );
+    let mut used = 0usize;
+    for path in order {
+        let content = by_path[path];
+        let remaining = MAX_TOTAL.saturating_sub(used);
+        if remaining == 0 {
+            out.push_str(&format!(
+                "<file path=\"{path}\">(omitted — plan-handoff size limit)</file>\n"
+            ));
+            continue;
+        }
+        if content.len() <= remaining {
+            used += content.len();
+            out.push_str(&format!("<file path=\"{path}\">\n{content}\n</file>\n"));
+        } else {
+            // Truncate at a char boundary <= remaining.
+            let mut cut = remaining;
+            while cut > 0 && !content.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            used = MAX_TOTAL;
+            out.push_str(&format!(
+                "<file path=\"{path}\">\n{}\n… (truncated — plan-handoff size limit)\n</file>\n",
+                &content[..cut]
+            ));
+        }
+    }
+    out.push_str("</files>");
+    out
+}
+
 impl StandardHarness {
     /// Persist the parsed [`TaskList`](crate::tasklist::TaskList) for the run
     /// (Q4). The DURABLE write goes through the
@@ -39,14 +127,18 @@ impl StandardHarness {
     }
 
     /// The planning directive seeded before the constrained plan turn (R1): the
-    /// "respond with a single JSON plan object" instruction wrapped around the
-    /// task. Seeded by the recursive [`PlanExecuteConfig::run`] plan dispatch
-    /// before `self.plan.run(cx)` (#124).
+    /// "record your plan via the `set_plan` tool" instruction wrapped around the
+    /// task — the canonical authoring path (#126 decision C). Seeded by the
+    /// recursive [`PlanExecuteConfig::run`] plan dispatch before `self.plan.run(cx)`
+    /// (#124). The retry nudge still asks for JSON message content because the
+    /// re-ask runs with tools SUPPRESSED (set_plan is then unavailable).
     pub(crate) fn plan_directive(instruction: &str) -> String {
         format!(
-            "Produce a step-by-step plan for the following task. Respond with a \
-             single JSON object: {{\"tasks\": [<ordered step strings>], \
-             \"rationale\": <string>}}.\n\nTask:\n{instruction}"
+            "Produce a step-by-step plan for the following task, then RECORD it by \
+             calling the `set_plan` tool with `tasks` = the ordered list of concrete \
+             step strings (plus an optional one-line `rationale`). Record the plan \
+             ONLY through `set_plan` — do NOT write it as a JSON or text message.\n\n\
+             Task:\n{instruction}"
         )
     }
 
@@ -331,6 +423,12 @@ impl RunStrategy for PlanExecuteConfig {
             });
             let skip_plan = is_continuation && has_unfinished_work;
 
+            // Plan→execute context threading: the `<files>` handoff built from the
+            // plan phase's `read_file` results and seeded into each execute step so it
+            // does not re-read what planning already read. Empty on the skip-plan path
+            // (no plan turn ran) or when the planner read nothing.
+            let mut plan_files_block = String::new();
+
             let (mut task_list, mut total_usage, mut carried) = if skip_plan {
                 // ── AC1: skip-plan path. The list is the durable source of truth.
                 let mut task_list =
@@ -470,8 +568,39 @@ object in your MESSAGE CONTENT: {\"tasks\": [<ordered step strings>], \"rational
                             output,
                             usage,
                             turns,
+                            session_state: plan_session,
                             ..
-                        }) => (output, usage, turns),
+                        }) => {
+                            // Capture the files the planner read so the execute steps
+                            // inherit them (plan→execute threading). Guarded so a
+                            // tools-suppressed retry (which reads nothing) cannot
+                            // clobber a prior non-empty capture.
+                            let block = render_plan_read_files(&plan_session);
+                            if !block.is_empty() {
+                                plan_files_block = block;
+                            }
+                            (output, usage, turns)
+                        }
+                        Some(RunResult::Escalate {
+                            signal: HarnessSignal::PlanRecorded,
+                            state,
+                            usage,
+                            turns,
+                            ..
+                        }) => {
+                            // `set_plan` recorded the plan and terminated the plan
+                            // phase (Fix A — its terminal signal, the plan-phase
+                            // analogue of `plan_completed`, scoped to the plan
+                            // toolset). Thread the reads it gathered, then proceed
+                            // with an EMPTY plan_output: `capture_and_persist_plan`'s
+                            // SC-28 fallback loads the runnable plan from the durable
+                            // `task_list` store.
+                            let block = render_plan_read_files(&state.session_state);
+                            if !block.is_empty() {
+                                plan_files_block = block;
+                            }
+                            (String::new(), usage, turns)
+                        }
                         Some(other) => {
                             cx.stream = on_stream.clone();
                             return cx.finish(executor, task.clone(), other).await;
@@ -723,6 +852,15 @@ object in your MESSAGE CONTENT: {\"tasks\": [<ordered step strings>], \"rational
                     // step (with the static elision marker once entries dropped).
                     if let Some(block) = render_step_ledger(&ledger, ledger_elided) {
                         executor.seed_user_message(&mut step_session, &block).await;
+                    }
+
+                    // Plan→execute threading: seed the files the plan phase already
+                    // read so this step uses them instead of re-reading (edits update
+                    // via the post-edit echo). Seeded before the step instruction.
+                    if !plan_files_block.is_empty() {
+                        executor
+                            .seed_user_message(&mut step_session, &plan_files_block)
+                            .await;
                     }
 
                     // Finally seed this step's own instruction.
@@ -1132,5 +1270,80 @@ object in your MESSAGE CONTENT: {\"tasks\": [<ordered step strings>], \"rational
             };
             cx.finish(executor, task, result).await
         })
+    }
+}
+
+#[cfg(test)]
+mod plan_read_files_tests {
+    use super::render_plan_read_files;
+    use crate::harness::types::SessionState;
+    use crate::model::{Content, Message, Role, ToolCall};
+
+    fn read_call(id: &str, path: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: Content::ToolCall(ToolCall {
+                id: id.into(),
+                name: "read_file".into(),
+                input: serde_json::json!({ "path": path }),
+            }),
+        }
+    }
+
+    fn other_call(id: &str, name: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: Content::ToolCall(ToolCall {
+                id: id.into(),
+                name: name.into(),
+                input: serde_json::json!({}),
+            }),
+        }
+    }
+
+    // Results are stored as a `Role::Tool` `Content::Text` message (no id link) —
+    // paired with the preceding call BY POSITION, mirroring the context manager.
+    fn result(text: &str) -> Message {
+        Message { role: Role::Tool, content: Content::Text { text: text.into() } }
+    }
+
+    fn session(messages: Vec<Message>) -> SessionState {
+        SessionState { messages, extras: Default::default() }
+    }
+
+    #[test]
+    fn empty_when_the_plan_read_nothing() {
+        assert_eq!(render_plan_read_files(&session(vec![])), "");
+        // A non-read tool with a result yields nothing.
+        assert_eq!(
+            render_plan_read_files(&session(vec![
+                other_call("b1", "bash_command"),
+                result("ls output"),
+            ])),
+            ""
+        );
+    }
+
+    #[test]
+    fn threads_reads_dedupes_by_path_last_read_wins() {
+        // One call per turn: call, result, call, result … (the real ordering). A
+        // non-read tool (grep) is interleaved to check the index alignment holds.
+        let out = render_plan_read_files(&session(vec![
+            read_call("c1", "src/util.rs"),
+            result("fn a() {}"),
+            other_call("c2", "grep"),
+            result("2 matches"),
+            read_call("c3", "src/main.rs"),
+            result("fn main() {}"),
+            // Re-read util.rs with newer content — last read wins, single entry.
+            read_call("c4", "src/util.rs"),
+            result("fn a() {} // v2"),
+        ]));
+        assert!(out.starts_with("<files>") && out.ends_with("</files>"));
+        assert!(out.contains("path=\"src/main.rs\"") && out.contains("fn main() {}"));
+        // util.rs appears once, with the LATEST content; grep output is NOT paired in.
+        assert_eq!(out.matches("path=\"src/util.rs\"").count(), 1);
+        assert!(out.contains("fn a() {} // v2"));
+        assert!(!out.contains("2 matches"));
     }
 }

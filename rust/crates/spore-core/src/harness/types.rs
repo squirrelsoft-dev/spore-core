@@ -118,6 +118,11 @@ pub enum StreamEvent {
     },
     TurnEnd {
         turn: u32,
+        /// This turn's token usage, so a live consumer (the UI token chip) can
+        /// update PER-TURN instead of only at end-of-run. `#[serde(default)]` keeps
+        /// pre-existing serialized events / other-language consumers compatible.
+        #[serde(default)]
+        usage: crate::model::TokenUsage,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         node: Option<NodeAttr>,
     },
@@ -162,12 +167,20 @@ pub enum StreamEvent {
         node: Option<NodeAttr>,
     },
     /// Emitted when a tool wants to surface a message to the user out-of-band
-    /// (issue #81 — `SendMessageTool`). The harness loop recognizes the
-    /// `send_message` tool, emits this event instead of collapsing the content
-    /// into a normal tool result, and records a minimal success tool result so
-    /// the loop continues.
+    /// (issue #81 — `SendMessageTool`), OR when a queued steering message is
+    /// injected into the run (`HarnessConfig::steering_source`). The harness
+    /// loop recognizes the `send_message` tool, emits this event instead of
+    /// collapsing the content into a normal tool result, and records a minimal
+    /// success tool result so the loop continues.
     UserMessage {
         content: String,
+        /// `true` when this is a USER-authored steering message injected at a
+        /// turn boundary (rendered as user input), `false` for the agent's
+        /// `send_message` narration (rendered as agent output). The roles are
+        /// opposite, so consumers must branch on it. `#[serde(default)]` keeps
+        /// pre-steering serialized events (all narration) deserializing.
+        #[serde(default)]
+        steered: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         node: Option<NodeAttr>,
     },
@@ -515,6 +528,12 @@ pub enum HarnessSignal {
     /// Distinct from `HaltReason::AgentError` — this is an intentional,
     /// agent-initiated stop and surfaces as `RunResult::Escalate`.
     Abort { reason: String },
+    /// The planner recorded its plan via `set_plan` and is done planning — END the
+    /// PlanExecute plan phase (the plan-phase analogue of `plan_completed`) so the
+    /// DAG walk proceeds to EXECUTE. Carries no artifact: the runnable plan is
+    /// already in the durable `task_list` store the plan phase reads. Unlike
+    /// `Abort`, it is CONSUMED inside PlanExecute and never ends the whole run.
+    PlanRecorded,
 }
 
 /// Output of a single tool dispatch. Full type lives in issue #4 (ToolRegistry)

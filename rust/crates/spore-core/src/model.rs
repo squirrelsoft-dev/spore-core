@@ -151,6 +151,23 @@ pub struct ModelParams {
     /// `skip_serializing_if = "Option::is_none"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<serde_json::Value>,
+    /// Top-k sampling cutoff. `None` (the default) omits it from the request so
+    /// the server's own default applies. Standard on local OpenAI-compatible
+    /// servers (vLLM) and Ollama; the cloud OpenAI API ignores/rejects it, so set
+    /// it only for providers that accept it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    /// Min-p nucleus floor (`0.0`–`1.0`). `None` omits it (server default).
+    /// Supported by vLLM / Ollama; ignored by the cloud OpenAI API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f32>,
+    /// Presence penalty (standard OpenAI sampling control). `None` omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    /// Repetition penalty. `None` omits it (server default). Supported by vLLM /
+    /// Ollama (`repeat_penalty`); ignored by the cloud OpenAI API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

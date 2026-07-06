@@ -4,6 +4,85 @@
 use super::*;
 
 impl StandardHarness {
+    /// Dispatch a tool call, applying the configured [`ToolCallRepair`] on a
+    /// recoverable error: coerce the arguments and re-dispatch up to
+    /// `max_repair_attempts`, enriching the error (schema + hint) when repair
+    /// gives up. Returns the call ACTUALLY dispatched (the repaired variant when
+    /// repair fired, so the caller can stamp spans/history from it) and its final
+    /// output.
+    ///
+    /// Shared by the inline ReAct turn-loop AND the resume path (`run.rs`), so
+    /// human-GATED tool calls (bash/write/edit) — which dispatch only after
+    /// approval on the resume path — get the same argument repair as auto-approved
+    /// calls. Without it a malformed gated arg (e.g. `timeout: "60"` where a `u64`
+    /// is expected) is never coerced and surfaces as a hard tool failure the model
+    /// has to retry by hand.
+    pub(crate) async fn dispatch_with_repair(
+        &self,
+        tool_registry: &dyn ToolRegistry,
+        call: ToolCall,
+    ) -> (ToolCall, ToolOutput) {
+        let mut effective_call = call;
+        let mut output = tool_registry.dispatch(effective_call.clone()).await;
+        if let Some(repair) = self.config.tool_call_repair.as_ref() {
+            let mut attempts_left = self.config.max_repair_attempts;
+            while attempts_left > 0 {
+                let ToolOutput::Error { ref message, recoverable: true } = output else {
+                    break;
+                };
+                let schema =
+                    tool_registry.schemas().into_iter().find(|s| s.name == effective_call.name);
+                let Some(repaired_call) = repair.repair(&effective_call, message, schema.as_ref())
+                else {
+                    // Repair gave up. Enrich with the schema+hint ONLY for a
+                    // parameter-shaped error (one the hint can actually help); a
+                    // plain command/runtime failure (e.g. a non-zero `cargo test`
+                    // exit) is left raw, so the hint doesn't mislead the model — or
+                    // an offline judge — into seeing a "schema violation" that
+                    // never happened.
+                    if Self::is_param_error(message) {
+                        output = Self::enrich_tool_error(message, schema.as_ref());
+                    }
+                    break;
+                };
+                attempts_left -= 1;
+                effective_call = repaired_call;
+                output = tool_registry.dispatch(effective_call.clone()).await;
+                if !matches!(output, ToolOutput::Error { recoverable: true, .. }) {
+                    break;
+                }
+                if attempts_left == 0 {
+                    if let ToolOutput::Error { message: ref m, recoverable: true } = output {
+                        if Self::is_param_error(m) {
+                            let schema = tool_registry
+                                .schemas()
+                                .into_iter()
+                                .find(|s| s.name == effective_call.name);
+                            output = Self::enrich_tool_error(m, schema.as_ref());
+                        }
+                    }
+                }
+            }
+        }
+        (effective_call, output)
+    }
+
+    /// Whether a recoverable tool-error message is a PARAMETER problem (a
+    /// malformed call) rather than a command/runtime failure (e.g. a non-zero
+    /// `cargo test` exit). Only parameter-shaped errors benefit from the
+    /// schema+hint enrichment; enriching a command failure misleads the model —
+    /// and offline judges — into seeing a "schema violation" that did not happen.
+    pub(crate) fn is_param_error(message: &str) -> bool {
+        let m = message.to_ascii_lowercase();
+        m.contains("invalid parameters")
+            || m.contains("invalid type")
+            || m.contains("missing required field")
+            || m.contains("missing field")
+            || m.contains("schema validation failed")
+            || m.contains("unknown field")
+            || m.contains("unknown variant")
+    }
+
     /// Legacy single-shot / DAG execute-step / SelfVerifying-evaluate entry to a
     /// ReAct window. Wraps [`run_react_inner`](Self::run_react_inner) with the
     /// pre-#139 / pre-SC-10 defaults (built via [`ReactParams::legacy`]) and adds
@@ -215,8 +294,40 @@ impl StandardHarness {
         const MAX_TOOL_CALL_NUDGES: u32 = 2;
         let mut tool_call_nudges_used: u32 = 0;
         let mut tools_called_this_window: u32 = 0;
+        // Send_message-ONLY turns are pure narration (#81) and must not consume the
+        // productive-turn budget. Each refunds one turn of the cap in the gate below,
+        // keeping `budget_used.turns` monotonic (span ids stay unique) while the
+        // budget gate discounts narration. Capped at `effective_turn_cap` so a
+        // pure-narration loop still terminates — the window runs at most ~2× budget
+        // (productive turns are still bounded at `effective_turn_cap`).
+        let mut narration_refund: u32 = 0;
 
         loop {
+            // Mid-run steering (pi-style, `HarnessConfig::steering_source`):
+            // drain any user messages queued since the last turn boundary and
+            // inject them BEFORE the next model call — after the previous
+            // turn's tool calls fully executed, so steering redirects the next
+            // turn without ever cancelling in-flight work. Each is recorded on
+            // the session via the ContextManager seam (it persists with the
+            // transcript) and emitted as `StreamEvent::UserMessage` so UIs
+            // render what was injected.
+            if let Some(source) = self.config.steering_source.as_ref() {
+                for text in source() {
+                    self.config
+                        .context_manager
+                        .append_user_message(&mut session_state, &text)
+                        .await;
+                    Self::emit(
+                        &on_stream,
+                        StreamEvent::UserMessage {
+                            content: text,
+                            steered: true,
+                            node: None,
+                        },
+                    );
+                }
+            }
+
             // Layer-1 budget gate before the turn. The single `budget_exceeded`
             // site folds in the turn-cap check: `effective_turn_cap` (the lower of
             // `budget.max_turns` and `max_iterations`) is passed as the hard cap, so
@@ -226,7 +337,7 @@ impl StandardHarness {
                 &task.budget,
                 &budget_used,
                 started_at,
-                Some(effective_turn_cap),
+                Some(effective_turn_cap.saturating_add(narration_refund)),
             ) {
                 return RunResult::Failure {
                     reason: HaltReason::BudgetExceeded { limit_type },
@@ -438,6 +549,21 @@ impl StandardHarness {
                 agent.turn(context).await
             };
             budget_used.turns += 1;
+            // Refund a send_message-ONLY turn (pure narration, #81): it advanced no
+            // task work, so it must not count against the productive-turn budget. The
+            // turn span above still uses the incremented `budget_used.turns` (ids stay
+            // unique); only the budget GATE (next iteration) discounts it. Bounded by
+            // `effective_turn_cap` so narration alone cannot loop forever.
+            if let TurnResult::ToolCallRequested { calls, .. } = &result {
+                if !calls.is_empty()
+                    && narration_refund < effective_turn_cap
+                    && calls
+                        .iter()
+                        .all(|c| c.name == crate::tools::SendMessageTool::NAME)
+                {
+                    narration_refund += 1;
+                }
+            }
             // Emit a turn span for every model call (issue #12). Fire-and-forget;
             // it never affects control flow. The span base is retained as the
             // parent for any tool-call spans dispatched this turn.
@@ -537,6 +663,13 @@ impl StandardHarness {
                 &on_stream,
                 StreamEvent::TurnEnd {
                     turn: budget_used.turns,
+                    // This turn's usage, so a live consumer updates the token chip
+                    // PER-TURN (not only at end-of-run). Re-derived from `result`.
+                    usage: match &result {
+                        TurnResult::ToolCallRequested { usage, .. }
+                        | TurnResult::FinalResponse { usage, .. } => usage.clone(),
+                        TurnResult::Error { usage, .. } => usage.clone().unwrap_or_default(),
+                    },
                     node: None,
                 },
             );
@@ -1080,66 +1213,15 @@ report only what the tools returned."
                         // `effective_call` is the call actually dispatched. It
                         // starts as the agent's call and may be replaced by a
                         // repaired variant below. Spans/results are stamped from it.
-                        let mut effective_call = call.clone();
-                        let mut output = tool_registry.dispatch(effective_call.clone()).await;
-
-                        // Tool-call repair (additive): if the dispatch returned a
-                        // recoverable error and a repair provider is configured,
-                        // try to coerce the arguments and re-dispatch, bounded by
-                        // `max_repair_attempts`. If repair gives up or the retry
-                        // still errors, fall through to the existing behaviour but
-                        // with an enriched error message (schema + hint).
-                        if let Some(repair) = self.config.tool_call_repair.as_ref() {
-                            let mut attempts_left = self.config.max_repair_attempts;
-                            while attempts_left > 0 {
-                                let ToolOutput::Error {
-                                    ref message,
-                                    recoverable: true,
-                                } = output
-                                else {
-                                    break;
-                                };
-                                let schema = tool_registry
-                                    .schemas()
-                                    .into_iter()
-                                    .find(|s| s.name == effective_call.name);
-                                let Some(repaired_call) =
-                                    repair.repair(&effective_call, message, schema.as_ref())
-                                else {
-                                    // Repair gave up: enrich the error fed back to
-                                    // the model with the parameter schema + a hint.
-                                    output = Self::enrich_tool_error(message, schema.as_ref());
-                                    break;
-                                };
-                                attempts_left -= 1;
-                                effective_call = repaired_call;
-                                output = tool_registry.dispatch(effective_call.clone()).await;
-                                if !matches!(
-                                    output,
-                                    ToolOutput::Error {
-                                        recoverable: true,
-                                        ..
-                                    }
-                                ) {
-                                    break;
-                                }
-                                // Still a recoverable error and no budget left:
-                                // enrich before giving up.
-                                if attempts_left == 0 {
-                                    if let ToolOutput::Error {
-                                        message: ref m,
-                                        recoverable: true,
-                                    } = output
-                                    {
-                                        let schema = tool_registry
-                                            .schemas()
-                                            .into_iter()
-                                            .find(|s| s.name == effective_call.name);
-                                        output = Self::enrich_tool_error(m, schema.as_ref());
-                                    }
-                                }
-                            }
-                        }
+                        // Dispatch + tool-call repair (additive): coerce a
+                        // recoverable-error call's args and re-dispatch, enriching
+                        // the error if repair gives up. Extracted to
+                        // `dispatch_with_repair` so the resume path (gated calls)
+                        // shares it. `effective_call` is the call actually
+                        // dispatched (repaired variant when repair fired); spans /
+                        // results are stamped from it.
+                        let (effective_call, mut output) =
+                            self.dispatch_with_repair(tool_registry.as_ref(), call.clone()).await;
 
                         // Tool-surfaced sandbox violation: the HARNESS decides
                         // halt-vs-recoverable per `sandbox_violation_policy`, not
@@ -1355,6 +1437,7 @@ report only what the tools returned."
                                     &on_stream,
                                     StreamEvent::UserMessage {
                                         content: content.clone(),
+                                        steered: false,
                                         node: None,
                                     },
                                 );
