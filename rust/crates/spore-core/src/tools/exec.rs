@@ -113,11 +113,7 @@ impl Tool for ExecTool {
                 finish_with_possible_truncation(out.stdout, &call.id, sandbox).await
             } else {
                 ToolOutput::Error {
-                    message: format!(
-                        "exit {} ; stderr: {}",
-                        out.exit_code,
-                        truncate_for_message(out.stderr.trim_end())
-                    ),
+                    message: failure_message(out.exit_code, &out.stdout, &out.stderr),
                     recoverable: true,
                 }
             }
@@ -220,11 +216,7 @@ impl Tool for BashCommandTool {
                 finish_with_possible_truncation(out.stdout, &call.id, sandbox).await
             } else {
                 ToolOutput::Error {
-                    message: format!(
-                        "exit {} ; stderr: {}",
-                        out.exit_code,
-                        truncate_for_message(out.stderr.trim_end())
-                    ),
+                    message: failure_message(out.exit_code, &out.stdout, &out.stderr),
                     recoverable: true,
                 }
             }
@@ -336,6 +328,24 @@ impl Tool for RunTestsTool {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Build the error message for a non-zero exit. Includes BOTH streams:
+/// test runners and build tools put the actionable failure detail on stdout,
+/// so surfacing only stderr starves the model of what actually failed.
+fn failure_message(exit_code: i32, stdout: &str, stderr: &str) -> String {
+    let stdout = stdout.trim_end();
+    let stderr = stderr.trim_end();
+    let mut msg = format!("exit {exit_code}");
+    if !stdout.is_empty() {
+        msg.push_str(" ; stdout: ");
+        msg.push_str(&truncate_for_message(stdout));
+    }
+    if !stderr.is_empty() {
+        msg.push_str(" ; stderr: ");
+        msg.push_str(&truncate_for_message(stderr));
+    }
+    msg
+}
 
 /// Truncate a string before embedding it in an error message. The threshold
 /// is intentionally smaller than the general 64 KB output threshold because
@@ -586,6 +596,76 @@ mod tests {
             ToolOutput::Error { recoverable, .. } => assert!(recoverable),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A failing command's stdout must reach the model — test runners put the
+    /// actionable detail there, not on stderr.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_command_failure_includes_stdout_and_stderr() {
+        let sb = AllowAllSandbox;
+        let r = BashCommandTool::new()
+            .execute(
+                &call(
+                    "bash_command",
+                    json!({"script": "echo 'FAILED: expected 3 got 4'; echo 'oops' >&2; exit 1"}),
+                ),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        match r {
+            ToolOutput::Error { message, .. } => {
+                assert!(message.starts_with("exit 1"), "got {message:?}");
+                assert!(
+                    message.contains("stdout: FAILED: expected 3 got 4"),
+                    "stdout missing from {message:?}"
+                );
+                // Not `stderr: oops` — the sibling `exec_has_no_shell_semantics`
+                // test mutates the process cwd concurrently, which can prefix
+                // stderr with a harmless `shell-init: getcwd` warning.
+                assert!(
+                    message.contains("stderr:") && message.contains("oops"),
+                    "stderr missing from {message:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_failure_includes_stdout() {
+        let sb = AllowAllSandbox;
+        let r = ExecTool::new()
+            .execute(
+                &call(
+                    "exec",
+                    json!({"command": "/bin/sh", "args": ["-c", "echo detail; exit 2"]}),
+                ),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        match r {
+            ToolOutput::Error { message, .. } => {
+                assert!(message.contains("stdout: detail"), "got {message:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // ---------------- failure_message ----------------
+
+    #[test]
+    fn failure_message_omits_empty_streams() {
+        assert_eq!(failure_message(3, "", ""), "exit 3");
+        assert_eq!(failure_message(1, "", "err\n"), "exit 1 ; stderr: err");
+        assert_eq!(failure_message(1, "out\n", ""), "exit 1 ; stdout: out");
+        assert_eq!(
+            failure_message(1, "out", "err"),
+            "exit 1 ; stdout: out ; stderr: err"
+        );
     }
 
     // ---------------- truncate_for_message ----------------

@@ -383,6 +383,151 @@ impl WorkspaceScopedSandbox {
 }
 
 // ============================================================================
+// Subprocess plumbing: incremental capture, group kill, output sanitizing
+// ============================================================================
+
+type SharedBuf = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+fn new_shared_buf() -> SharedBuf {
+    std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
+fn take_buf(buf: &SharedBuf) -> String {
+    String::from_utf8_lossy(&buf.lock().expect("output buffer lock")).into_owned()
+}
+
+/// Read a child pipe to EOF, appending into a shared buffer so the bytes stay
+/// reachable even if the awaiting future is cancelled by a timeout.
+async fn drain_pipe(
+    mut pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    buf: SharedBuf,
+) {
+    use tokio::io::AsyncReadExt;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.lock().expect("output buffer lock").extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+/// Await the drain tasks with a short bound. A child can only exit once its
+/// remaining output fits the OS pipe buffer, so post-exit drains finish in
+/// milliseconds — the bound exists to cut off a BACKGROUND grandchild that
+/// inherited the pipe and would otherwise hold EOF open indefinitely
+/// (`/bin/sh -c 'server &'`).
+async fn join_drains(
+    stdout_task: Option<tokio::task::JoinHandle<()>>,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
+) {
+    const DRAIN_GRACE: Duration = Duration::from_millis(500);
+    for task in [stdout_task, stderr_task].into_iter().flatten() {
+        let _ = tokio::time::timeout(DRAIN_GRACE, task).await;
+    }
+}
+
+/// SIGKILL an entire Unix process group (the child is spawned as group
+/// leader). No-op on non-Unix and for a child that never reported a pid.
+#[cfg(unix)]
+fn kill_process_group(pgid: Option<i32>) {
+    if let Some(pgid) = pgid {
+        // SAFETY: plain syscall; a stale/invalid pgid returns ESRCH harmlessly.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pgid: Option<i32>) {}
+
+/// Kills the child's whole process group if the owning future is dropped
+/// mid-run (user abort). `kill_on_drop` only covers the direct child.
+struct GroupKillGuard {
+    pgid: Option<i32>,
+    armed: bool,
+}
+
+impl Drop for GroupKillGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            kill_process_group(self.pgid);
+        }
+    }
+}
+
+/// Sanitize subprocess output for model consumption: strip ANSI escape
+/// sequences and non-printing control characters, then apply carriage-return
+/// overwrite semantics per line so progress bars collapse to their final
+/// state instead of flooding context with every intermediate frame.
+pub fn sanitize_command_output(s: &str) -> String {
+    let stripped = strip_ansi(s);
+    stripped
+        .split('\n')
+        .map(resolve_cr_overwrites)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Remove ANSI CSI (`ESC[…m`), OSC (`ESC]…BEL`), and two-byte escape
+/// sequences, plus non-printing control characters other than `\n`/`\t`/`\r`.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.peek() {
+                // CSI: `ESC [` params/intermediates, terminated by 0x40–0x7E.
+                Some('[') => {
+                    chars.next();
+                    for n in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: `ESC ]` … BEL or `ESC \`.
+                Some(']') => {
+                    chars.next();
+                    while let Some(n) = chars.next() {
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Two-byte escape (`ESC c`, `ESC =`, …).
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+        } else if c == '\n' || c == '\t' || c == '\r' || !c.is_control() {
+            out.push(c);
+        }
+        // Other control chars (BEL, BS, VT, …) are dropped.
+    }
+    out
+}
+
+/// Terminal CR semantics for one line: a carriage return moves the cursor to
+/// column 0, so only the text after the LAST `\r` survives. A trailing `\r`
+/// (CRLF line ending) is stripped first so it doesn't erase the line.
+fn resolve_cr_overwrites(line: &str) -> &str {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    match line.rfind('\r') {
+        Some(i) => &line[i + 1..],
+        None => line,
+    }
+}
+
+// ============================================================================
 // SandboxProvider impl
 // ============================================================================
 
@@ -429,6 +574,17 @@ impl SandboxProvider for WorkspaceScopedSandbox {
             let mut cmd = tokio::process::Command::new(command);
             cmd.args(args);
             cmd.current_dir(working_dir.unwrap_or(&self.config.root));
+            // Pipe both streams and read them INCREMENTALLY (instead of the old
+            // buffered `.output()`) so partial output survives a timeout or an
+            // aborted (dropped) future — a timed-out test run still shows the
+            // model what it printed before hanging.
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            // Unix: make the child a process-GROUP leader so timeout/abort can
+            // kill the whole tree. `kill_on_drop` only reaps the direct child
+            // (`/bin/sh`), orphaning grandchildren like `npm → node`.
+            #[cfg(unix)]
+            cmd.process_group(0);
 
             // SC-12: apply exec-hardening knobs when configured. The per-call
             // `timeout` always wins; `default_timeout` is the floor for callers
@@ -448,37 +604,77 @@ impl SandboxProvider for WorkspaceScopedSandbox {
                 timeout
             };
 
-            let fut = cmd.output();
-            let result = match effective_timeout {
-                Some(t) => match tokio::time::timeout(t, fut).await {
-                    Ok(r) => r,
-                    Err(_) => {
-                        return Ok(CommandOutput {
-                            stdout: String::new(),
-                            stderr: format!("command timed out after {}s", t.as_secs()),
-                            exit_code: -1,
-                            timed_out: true,
-                            truncated: false,
-                        });
-                    }
-                },
-                None => fut.await,
-            };
-
-            match result {
-                Ok(out) => Ok(CommandOutput {
-                    stdout: String::from_utf8_lossy(&out.stdout).to_string(),
-                    stderr: String::from_utf8_lossy(&out.stderr).to_string(),
-                    exit_code: out.status.code().unwrap_or(-1),
-                    timed_out: false,
-                    truncated: false,
-                }),
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
                 // SC-15: a failed spawn is a typed violation, not a fake
                 // exit_code: -1 success. Callers already handle `Err`.
-                Err(e) => Err(SandboxViolation::ExecSpawnFailed {
-                    command: command.to_string(),
-                    message: e.to_string(),
-                }),
+                Err(e) => {
+                    return Err(SandboxViolation::ExecSpawnFailed {
+                        command: command.to_string(),
+                        message: e.to_string(),
+                    })
+                }
+            };
+            // On Unix the group id == the child pid (it is the group leader).
+            let pgid = child.id().map(|pid| pid as i32);
+            // If this future is DROPPED mid-run (user abort), kill the whole
+            // group — kill_on_drop alone would orphan grandchildren. Disarmed
+            // on every normal exit path.
+            let mut guard = GroupKillGuard { pgid, armed: true };
+
+            // Drain both pipes into shared buffers from spawned tasks, so the
+            // bytes captured so far remain reachable after a timeout.
+            let stdout_buf = new_shared_buf();
+            let stderr_buf = new_shared_buf();
+            let stdout_task = child.stdout.take().map(|p| tokio::spawn(drain_pipe(p, stdout_buf.clone())));
+            let stderr_task = child.stderr.take().map(|p| tokio::spawn(drain_pipe(p, stderr_buf.clone())));
+
+            let waited = match effective_timeout {
+                Some(t) => tokio::time::timeout(t, child.wait()).await,
+                None => Ok(child.wait().await),
+            };
+
+            match waited {
+                // Timed out: kill the whole process group, then return whatever
+                // output was captured before the hang.
+                Err(_elapsed) => {
+                    kill_process_group(pgid);
+                    let _ = child.kill().await; // non-unix fallback + reaps the zombie
+                    guard.armed = false;
+                    join_drains(stdout_task, stderr_task).await;
+                    let secs = effective_timeout.map(|t| t.as_secs()).unwrap_or(0);
+                    let mut stderr = sanitize_command_output(&take_buf(&stderr_buf));
+                    if !stderr.is_empty() {
+                        stderr.push('\n');
+                    }
+                    stderr.push_str(&format!("command timed out after {secs}s"));
+                    Ok(CommandOutput {
+                        stdout: sanitize_command_output(&take_buf(&stdout_buf)),
+                        stderr,
+                        exit_code: -1,
+                        timed_out: true,
+                        truncated: false,
+                    })
+                }
+                Ok(Ok(status)) => {
+                    guard.armed = false;
+                    join_drains(stdout_task, stderr_task).await;
+                    Ok(CommandOutput {
+                        stdout: sanitize_command_output(&take_buf(&stdout_buf)),
+                        stderr: sanitize_command_output(&take_buf(&stderr_buf)),
+                        exit_code: status.code().unwrap_or(-1),
+                        timed_out: false,
+                        truncated: false,
+                    })
+                }
+                Ok(Err(e)) => {
+                    kill_process_group(pgid);
+                    guard.armed = false;
+                    Err(SandboxViolation::ExecSpawnFailed {
+                        command: command.to_string(),
+                        message: format!("wait failed: {e}"),
+                    })
+                }
             }
         })
     }
@@ -900,6 +1096,117 @@ mod tests {
             .await
             .unwrap();
         assert!(out.timed_out);
+    }
+
+    /// Output printed BEFORE a hang must survive the timeout (the old
+    /// buffered `.output()` returned an empty stdout on timeout).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_preserves_partial_output() {
+        let dir = TempDir::new().unwrap();
+        let sb = WorkspaceScopedSandbox::new(cfg(dir.path())).unwrap();
+        let out = sb
+            .execute_command(
+                "/bin/sh",
+                &["-c".into(), "echo started; echo warn >&2; sleep 5".into()],
+                None,
+                Some(Duration::from_millis(300)),
+            )
+            .await
+            .unwrap();
+        assert!(out.timed_out);
+        assert!(out.stdout.contains("started"), "partial stdout lost: {:?}", out.stdout);
+        assert!(out.stderr.contains("warn"), "partial stderr lost: {:?}", out.stderr);
+        assert!(out.stderr.contains("timed out"), "timeout note missing: {:?}", out.stderr);
+    }
+
+    /// A timed-out shell's GRANDCHILD must die with it: the child is spawned
+    /// as a process-group leader and the whole group is SIGKILLed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_the_whole_process_group() {
+        let dir = TempDir::new().unwrap();
+        let sb = WorkspaceScopedSandbox::new(cfg(dir.path())).unwrap();
+        // Print the grandchild's pid, then hang the direct child.
+        let out = sb
+            .execute_command(
+                "/bin/sh",
+                &["-c".into(), "sleep 30 & echo pid:$!; sleep 30".into()],
+                None,
+                Some(Duration::from_millis(300)),
+            )
+            .await
+            .unwrap();
+        assert!(out.timed_out);
+        let pid: i32 = out
+            .stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("pid:"))
+            .expect("grandchild pid printed")
+            .trim()
+            .parse()
+            .unwrap();
+        // Give the SIGKILL a moment to land, then probe with signal 0.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "grandchild {pid} survived the group kill");
+    }
+
+    // ------------------------------------------------------------------
+    // Output sanitizing (ANSI / carriage-return overwrite)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn sanitize_strips_ansi_color_codes() {
+        assert_eq!(
+            sanitize_command_output("\u{1b}[31mred\u{1b}[0m plain \u{1b}[1;32mbold\u{1b}[m"),
+            "red plain bold"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_osc_title_sequence() {
+        assert_eq!(
+            sanitize_command_output("\u{1b}]0;window title\u{7}visible"),
+            "visible"
+        );
+    }
+
+    #[test]
+    fn sanitize_collapses_cr_progress_bars() {
+        assert_eq!(
+            sanitize_command_output("downloading 10%\rdownloading 55%\rdone.\nnext"),
+            "done.\nnext"
+        );
+    }
+
+    #[test]
+    fn sanitize_keeps_crlf_lines_intact() {
+        // The trailing \r of a CRLF line must not erase the line.
+        assert_eq!(sanitize_command_output("alpha\r\nbeta\r\n"), "alpha\nbeta\n");
+    }
+
+    #[test]
+    fn sanitize_drops_stray_control_chars_keeps_tabs() {
+        assert_eq!(sanitize_command_output("a\u{7}b\tc\u{8}"), "ab\tc");
+    }
+
+    /// Live command output really is sanitized at the execute_command boundary.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_command_sanitizes_ansi_output() {
+        let dir = TempDir::new().unwrap();
+        let sb = WorkspaceScopedSandbox::new(cfg(dir.path())).unwrap();
+        let out = sb
+            .execute_command(
+                "/bin/sh",
+                &["-c".into(), r"printf '\033[31mred\033[0m\n'".into()],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, "red\n");
     }
 
     // ------------------------------------------------------------------

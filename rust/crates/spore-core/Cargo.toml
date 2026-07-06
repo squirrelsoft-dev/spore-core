@@ -28,6 +28,12 @@ opentelemetry = "0.30"
 opentelemetry_sdk = { version = "0.30", features = ["rt-tokio", "trace"] }
 opentelemetry-otlp = { version = "0.30", default-features = false, features = ["grpc-tonic", "trace"] }
 
+# Process-group kill for `execute_command` timeouts/aborts (kill(-pgid)):
+# tokio's kill_on_drop only reaps the DIRECT child, orphaning grandchildren
+# (npm → node). Unix-only; Windows has no process groups in this sense.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 test-utils = []
