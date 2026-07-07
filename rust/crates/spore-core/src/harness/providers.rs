@@ -100,6 +100,13 @@ impl ToolRegistry for ReadOnlyToolView {
     }
 }
 
+/// Live progress sink for a RUNNING subprocess (pi-style bash streaming). Each
+/// call delivers a sanitized TAIL SNAPSHOT of the output accumulated so far —
+/// consumers REPLACE the previous preview, never append. Invoked from the
+/// executor's wait loop at most every ~100ms, and only when the snapshot
+/// changed; it must not block.
+pub type CommandProgressSink = Arc<dyn Fn(String) + Send + Sync>;
+
 /// Issue #6 — SandboxProvider: validates tool calls against sandbox policy.
 ///
 /// Issue #5 adds default implementations for `execute_command`,
@@ -160,6 +167,27 @@ pub trait SandboxProvider: Send + Sync {
                 }),
             }
         })
+    }
+
+    /// Run a subprocess, streaming live output. While the command runs,
+    /// `progress` (when given) receives sanitized tail snapshots of the output
+    /// accumulated so far (see [`CommandProgressSink`]). The default impl
+    /// ignores `progress` and delegates to [`execute_command`] — sandboxes that
+    /// capture output incrementally override THIS method (and delegate
+    /// `execute_command` to it), and **wrapper sandboxes must forward it** or
+    /// streaming silently dies at the wrapper.
+    ///
+    /// [`execute_command`]: Self::execute_command
+    fn execute_command_streaming<'a>(
+        &'a self,
+        command: &'a str,
+        args: &'a [String],
+        working_dir: Option<&'a std::path::Path>,
+        timeout: Option<std::time::Duration>,
+        progress: Option<CommandProgressSink>,
+    ) -> BoxFut<'a, Result<CommandOutput, SandboxViolation>> {
+        let _ = progress;
+        self.execute_command(command, args, working_dir, timeout)
     }
 
     /// Truncate large output head+tail. Default treats `head_tokens * 4` as

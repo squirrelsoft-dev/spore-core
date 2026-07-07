@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::harness::{
-    BoxFut, CommandOutput, FileRef, IsolationMode, Operation, SandboxProvider, SandboxViolation,
-    TruncatedOutput,
+    BoxFut, CommandOutput, CommandProgressSink, FileRef, IsolationMode, Operation, SandboxProvider,
+    SandboxViolation, TruncatedOutput,
 };
 use crate::model::ToolCall;
 
@@ -396,6 +396,47 @@ fn take_buf(buf: &SharedBuf) -> String {
     String::from_utf8_lossy(&buf.lock().expect("output buffer lock")).into_owned()
 }
 
+/// Non-destructive sibling of [`take_buf`]: snapshot the bytes drained so far
+/// without consuming them (the buffers keep accumulating until exit).
+fn peek_buf(buf: &SharedBuf) -> String {
+    String::from_utf8_lossy(&buf.lock().expect("output buffer lock")).into_owned()
+}
+
+/// How often the executor's wait loop snapshots the drain buffers for a live
+/// progress preview (pi streams its subprocess tail at the same cadence).
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Preview budget: the last N bytes of sanitized output. Enough for a screenful
+/// of tail context in a UI without shipping megabytes every tick.
+const PROGRESS_TAIL_BYTES: usize = 2048;
+
+/// Build one live-progress snapshot: both buffers (stderr appended after
+/// stdout), sanitized like the final output, cut to the tail budget on a char
+/// boundary. Interleaving is approximate — the true merge order of the two
+/// pipes is unknowable post-hoc — but a tail preview only needs "what is it
+/// printing right now", not a faithful transcript (the `ToolResult` carries
+/// the real streams separately).
+fn progress_preview(stdout_buf: &SharedBuf, stderr_buf: &SharedBuf) -> String {
+    let mut combined = peek_buf(stdout_buf);
+    let err = peek_buf(stderr_buf);
+    if !err.is_empty() {
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(&err);
+    }
+    let sanitized = sanitize_command_output(&combined);
+    let trimmed = sanitized.trim_end();
+    if trimmed.len() <= PROGRESS_TAIL_BYTES {
+        return trimmed.to_string();
+    }
+    let mut start = trimmed.len() - PROGRESS_TAIL_BYTES;
+    while !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    trimmed[start..].to_string()
+}
+
 /// Read a child pipe to EOF, appending into a shared buffer so the bytes stay
 /// reachable even if the awaiting future is cancelled by a timeout.
 async fn drain_pipe(
@@ -543,6 +584,17 @@ impl SandboxProvider for WorkspaceScopedSandbox {
         working_dir: Option<&'a Path>,
         timeout: Option<Duration>,
     ) -> BoxFut<'a, Result<CommandOutput, SandboxViolation>> {
+        self.execute_command_streaming(command, args, working_dir, timeout, None)
+    }
+
+    fn execute_command_streaming<'a>(
+        &'a self,
+        command: &'a str,
+        args: &'a [String],
+        working_dir: Option<&'a Path>,
+        timeout: Option<Duration>,
+        progress: Option<CommandProgressSink>,
+    ) -> BoxFut<'a, Result<CommandOutput, SandboxViolation>> {
         Box::pin(async move {
             match self.isolation_mode {
                 #[cfg(feature = "dangerous")]
@@ -629,15 +681,50 @@ impl SandboxProvider for WorkspaceScopedSandbox {
             let stdout_task = child.stdout.take().map(|p| tokio::spawn(drain_pipe(p, stdout_buf.clone())));
             let stderr_task = child.stderr.take().map(|p| tokio::spawn(drain_pipe(p, stderr_buf.clone())));
 
-            let waited = match effective_timeout {
-                Some(t) => tokio::time::timeout(t, child.wait()).await,
-                None => Ok(child.wait().await),
+            // Wait for exit, racing a timeout deadline and (when a progress
+            // sink is wired) a ~100ms preview ticker that snapshots the drain
+            // buffers into a sanitized tail preview. The block scopes the
+            // pinned `child.wait()` borrow so the kill paths below can take
+            // `&mut child` again.
+            enum Waited {
+                Exited(std::io::Result<std::process::ExitStatus>),
+                TimedOut,
+            }
+            let waited = {
+                let mut last_preview = String::new();
+                let mut ticker = tokio::time::interval(PROGRESS_INTERVAL);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let wait = child.wait();
+                tokio::pin!(wait);
+                let deadline = async {
+                    match effective_timeout {
+                        Some(t) => tokio::time::sleep(t).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::pin!(deadline);
+                loop {
+                    tokio::select! {
+                        biased;
+                        res = &mut wait => break Waited::Exited(res),
+                        _ = &mut deadline => break Waited::TimedOut,
+                        _ = ticker.tick(), if progress.is_some() => {
+                            let preview = progress_preview(&stdout_buf, &stderr_buf);
+                            if !preview.is_empty() && preview != last_preview {
+                                if let Some(p) = &progress {
+                                    p(preview.clone());
+                                }
+                                last_preview = preview;
+                            }
+                        }
+                    }
+                }
             };
 
             match waited {
                 // Timed out: kill the whole process group, then return whatever
                 // output was captured before the hang.
-                Err(_elapsed) => {
+                Waited::TimedOut => {
                     kill_process_group(pgid);
                     let _ = child.kill().await; // non-unix fallback + reaps the zombie
                     guard.armed = false;
@@ -656,7 +743,7 @@ impl SandboxProvider for WorkspaceScopedSandbox {
                         truncated: false,
                     })
                 }
-                Ok(Ok(status)) => {
+                Waited::Exited(Ok(status)) => {
                     guard.armed = false;
                     join_drains(stdout_task, stderr_task).await;
                     Ok(CommandOutput {
@@ -667,7 +754,7 @@ impl SandboxProvider for WorkspaceScopedSandbox {
                         truncated: false,
                     })
                 }
-                Ok(Err(e)) => {
+                Waited::Exited(Err(e)) => {
                     kill_process_group(pgid);
                     guard.armed = false;
                     Err(SandboxViolation::ExecSpawnFailed {
@@ -1080,6 +1167,36 @@ mod tests {
         assert_eq!(out.exit_code, 0);
         assert!(out.stdout.contains("hello"));
         assert!(!out.timed_out);
+    }
+
+    #[tokio::test]
+    async fn execute_command_streaming_emits_tail_previews() {
+        let dir = TempDir::new().unwrap();
+        let sb = WorkspaceScopedSandbox::new(cfg(dir.path())).unwrap();
+        let previews: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let sink_previews = previews.clone();
+        let sink: CommandProgressSink =
+            std::sync::Arc::new(move |p| sink_previews.lock().unwrap().push(p));
+        let out = sb
+            .execute_command_streaming(
+                "/bin/sh",
+                &["-c".into(), "echo one; sleep 0.35; echo two".into()],
+                None,
+                None,
+                Some(sink),
+            )
+            .await
+            .unwrap();
+        // Final output is complete and unaffected by streaming.
+        assert_eq!(out.exit_code, 0);
+        assert!(out.stdout.contains("one") && out.stdout.contains("two"));
+        // At least one preview fired WHILE the command was still running: the
+        // first snapshot carries the early line but cannot carry the late one
+        // (printed 350ms in, past several 100ms ticks).
+        let previews = previews.lock().unwrap();
+        assert!(!previews.is_empty(), "no live previews were emitted");
+        assert!(previews[0].contains("one"), "first preview missing early output: {:?}", previews[0]);
+        assert!(!previews[0].contains("two"), "first preview already has late output — not live: {:?}", previews[0]);
     }
 
     #[tokio::test]

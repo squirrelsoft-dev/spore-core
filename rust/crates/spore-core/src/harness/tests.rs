@@ -599,12 +599,63 @@ async fn catalogue_tools_fold_into_registry_with_inmemory_storage() {
 }
 
 #[tokio::test]
+async fn effective_registry_streams_tool_progress() {
+    // pi-style live bash streaming, end to end through the production wiring:
+    // effective_tool_registry bridges the run's stream sink into the
+    // ToolContext progress seam, bash_command hands it to the sandbox executor,
+    // and the executor's ~100ms tick surfaces StreamEvent::ToolProgress tail
+    // previews for the RUNNING command — before its ToolResult exists.
+    let dir = tempfile::TempDir::new().unwrap();
+    let sandbox = crate::sandbox::WorkspaceScopedSandbox::new(
+        crate::sandbox::WorkspaceConfig::scoped(dir.path().canonicalize().unwrap()),
+    )
+    .unwrap();
+    let cfg = catalogue_builder(make_agent())
+        .sandbox(Arc::new(sandbox))
+        .tool(crate::tools::StandardTools::bash_command())
+        .build_config();
+    let h = StandardHarness::new(cfg);
+
+    let events: Arc<std::sync::Mutex<Vec<StreamEvent>>> = Default::default();
+    let sink_events = events.clone();
+    let sink: StreamSink = Arc::new(move |ev| sink_events.lock().unwrap().push(ev));
+    let reg =
+        h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef(String::new()), Some(&sink));
+
+    let out = reg
+        .dispatch(ToolCall {
+            id: "c-stream".into(),
+            name: "bash_command".into(),
+            input: serde_json::json!({ "script": "echo one; sleep 0.35; echo two" }),
+        })
+        .await;
+    assert!(matches!(out, ToolOutput::Success { .. }), "bash failed: {out:?}");
+
+    let events = events.lock().unwrap();
+    let progress: Vec<_> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            StreamEvent::ToolProgress { call_id, name, preview, .. } => {
+                Some((call_id.clone(), name.clone(), preview.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!progress.is_empty(), "no ToolProgress events reached the sink");
+    let (call_id, name, preview) = &progress[0];
+    assert_eq!(call_id, "c-stream");
+    assert_eq!(name, "bash_command");
+    assert!(preview.contains("one") && !preview.contains("two"),
+        "first preview should carry only the early output: {preview:?}");
+}
+
+#[tokio::test]
 async fn effective_registry_bridges_catalogue_tools() {
     let cfg = catalogue_builder(make_agent())
         .tool(crate::tools::StandardTools::read_file())
         .build_config();
     let h = StandardHarness::new(cfg);
-    let reg = h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef(String::new()));
+    let reg = h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef(String::new()), None);
     // The bridge advertises the catalogue schemas to the model.
     assert!(reg.schemas().iter().any(|s| s.name == "read_file"));
     // And maps an inner dispatch failure (unknown tool) to a *recoverable*
@@ -667,7 +718,7 @@ async fn per_node_toolset_scoping_closes_cross_node_leaks() {
 
     // Planner node: plan-tools only. Its OWN tools advertise; exec-only tools
     // are NOT available.
-    let plan = h.effective_tool_registry(&sid, &ToolsetRef("plan-tools".into()));
+    let plan = h.effective_tool_registry(&sid, &ToolsetRef("plan-tools".into()), None);
     assert!(plan.schemas().iter().any(|s| s.name == "list_dir"));
     assert!(plan.schemas().iter().any(|s| s.name == "task_list"));
     assert!(!plan.schemas().iter().any(|s| s.name == "read_file"));
@@ -676,7 +727,7 @@ async fn per_node_toolset_scoping_closes_cross_node_leaks() {
     assert!(!dispatched_ok(&plan, "read_file").await);
 
     // Executor node: exec-tools only. It cannot reach the plan-only tools.
-    let exec = h.effective_tool_registry(&sid, &ToolsetRef("exec-tools".into()));
+    let exec = h.effective_tool_registry(&sid, &ToolsetRef("exec-tools".into()), None);
     assert!(exec.schemas().iter().any(|s| s.name == "read_file"));
     assert!(!exec.schemas().iter().any(|s| s.name == "task_list"));
     assert!(!exec.schemas().iter().any(|s| s.name == "list_dir"));
@@ -693,7 +744,7 @@ async fn per_node_toolset_unknown_tool_is_recoverable_error() {
         .toolset_tools("plan-tools", vec![StandardTools::list_dir()])
         .build_config();
     let h = StandardHarness::new(cfg);
-    let reg = h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef("plan-tools".into()));
+    let reg = h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef("plan-tools".into()), None);
     let out = reg
         .dispatch(ToolCall {
             id: "c".into(),
@@ -721,7 +772,7 @@ async fn empty_toolset_handle_falls_back_to_global_catalogue() {
         .toolset_tools("plan-tools", vec![StandardTools::list_dir()]) // scoped
         .build_config();
     let h = StandardHarness::new(cfg);
-    let global = h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef(String::new()));
+    let global = h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef(String::new()), None);
     // Empty handle ⇒ global catalogue (read_file), NOT the scoped plan-tools.
     assert!(global.schemas().iter().any(|s| s.name == "read_file"));
     assert!(!global.schemas().iter().any(|s| s.name == "list_dir"));
@@ -737,7 +788,7 @@ async fn unknown_toolset_handle_falls_back_to_global_catalogue() {
         .tools(vec![StandardTools::read_file()])
         .build_config();
     let h = StandardHarness::new(cfg);
-    let reg = h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef("not-wired".into()));
+    let reg = h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef("not-wired".into()), None);
     assert!(reg.schemas().iter().any(|s| s.name == "read_file"));
 }
 

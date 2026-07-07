@@ -68,7 +68,8 @@ impl StandardHarness {
         // pending calls) through the pausing leaf's own toolset handle, restoring
         // its scoped per-node catalogue. An empty handle (the default) still falls
         // back to the global catalogue, so pre-#140 blobs behave unchanged.
-        let tool_registry = self.effective_tool_registry(&session_id, &toolset);
+        let tool_registry =
+            self.effective_tool_registry(&session_id, &toolset, on_stream.as_ref());
 
         // Inject the consult answer as the RESULT of the head pending (consult)
         // call, then dispatch the remaining pending calls in the same batch.
@@ -863,7 +864,8 @@ impl StandardHarness {
         // per-leaf toolsets during the re-drive — so this line is only reached by
         // the Clarification / direct-resume paths whose pending calls need the
         // carried handle.
-        let tool_registry = self.effective_tool_registry(&session_id, &toolset);
+        let tool_registry =
+            self.effective_tool_registry(&session_id, &toolset, on_stream.as_ref());
 
         // Clarification resume (issue #81, Q4b): if this pause came from
         // `ToolOutput::AwaitingClarification`, the human's answer is injected as

@@ -90,13 +90,19 @@ impl Tool for ExecTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
-        _ctx: &'a crate::tool_registry::ToolContext,
+        ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: ExecParams = tool_try!(parse_params(call));
             let timeout = params.timeout.map(Duration::from_secs);
             let out = match sandbox
-                .execute_command(&params.command, &params.args, None, timeout)
+                .execute_command_streaming(
+                    &params.command,
+                    &params.args,
+                    None,
+                    timeout,
+                    ctx.command_progress(call),
+                )
                 .await
             {
                 Ok(o) => o,
@@ -183,7 +189,7 @@ impl Tool for BashCommandTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
-        _ctx: &'a crate::tool_registry::ToolContext,
+        ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: ShellCommandParams = tool_try!(parse_params(call));
@@ -199,7 +205,13 @@ impl Tool for BashCommandTool {
             };
             let args = vec!["-c".to_string(), params.script];
             let out = match sandbox
-                .execute_command("/bin/sh", &args, working.as_deref(), timeout)
+                .execute_command_streaming(
+                    "/bin/sh",
+                    &args,
+                    working.as_deref(),
+                    timeout,
+                    ctx.command_progress(call),
+                )
                 .await
             {
                 Ok(o) => o,
@@ -273,7 +285,7 @@ impl Tool for RunTestsTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
-        _ctx: &'a crate::tool_registry::ToolContext,
+        ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: RunTestsParams = tool_try!(parse_params(call));
@@ -295,7 +307,13 @@ impl Tool for RunTestsTool {
             };
             let args: Vec<String> = parts.map(String::from).collect();
             let out = match sandbox
-                .execute_command(program, &args, Some(working.as_path()), timeout)
+                .execute_command_streaming(
+                    program,
+                    &args,
+                    Some(working.as_path()),
+                    timeout,
+                    ctx.command_progress(call),
+                )
                 .await
             {
                 Ok(o) => o,

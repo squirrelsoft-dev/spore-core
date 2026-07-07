@@ -89,7 +89,8 @@ pub use guide_registry::{
 pub use harness::{
     AgentRef, AggregateUsage, BudgetContext, BudgetExhausted, BudgetExhaustedBehavior,
     BudgetLimitType, BudgetLimits, BudgetPolicy, BudgetSnapshot, BudgetStack, BwrapProfile,
-    ChildPausedState, CommandOutput, CompleteOnFinalResponse, ConsultHandlerEntry,
+    ChildPausedState, CommandOutput, CommandProgressSink, CompleteOnFinalResponse,
+    ConsultHandlerEntry,
     ConsultOverflowPolicy, ConsultRequest, ConsultResponse,
     ContextManager as HarnessContextManager, EmptyToolRegistry, EscalationAction, ExecutionContext,
     ExhaustionCause, FileRef, GitVcsProvider, HaltReason, Harness, HarnessBuilder, HarnessConfig,
@@ -218,8 +219,9 @@ pub use tool_call_repair::{
 };
 pub use tool_registry::{
     DispatchError, RealToolRegistry, RegistrationError, StandardToolRegistry, TaskPhase, Tool,
-    ToolAnnotations, ToolContext, ToolNamespace, ToolRegistry, ToolSchema as RegisteredToolSchema,
-    ToolSearchConfig, ToolSearchRegistry, ToolSet,
+    ToolAnnotations, ToolContext, ToolNamespace, ToolProgressSink, ToolProgressUpdate,
+    ToolRegistry, ToolSchema as RegisteredToolSchema, ToolSearchConfig, ToolSearchRegistry,
+    ToolSet,
 };
 pub use vector_store::{
     MetadataFilter, VectorHit, VectorRecord, VectorStore, VectorStoreError,

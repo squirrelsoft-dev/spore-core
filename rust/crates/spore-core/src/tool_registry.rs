@@ -134,7 +134,31 @@ pub struct ToolContext {
     project_id: crate::storage::ProjectId,
     run_store: Arc<dyn RunStore>,
     memory_store: Arc<dyn MemoryStore>,
+    /// Optional run-level live-progress sink (pi-style bash streaming). Set by
+    /// the harness bridge ([`RealToolRegistry::with_progress`]) when the run
+    /// has a stream sink; tools derive a per-call emitter via
+    /// [`command_progress`](Self::command_progress). `None` (default) means no
+    /// consumer is listening — tools skip streaming entirely.
+    progress: Option<ToolProgressSink>,
 }
+
+/// One live-progress update from a RUNNING tool, labeled with the call it
+/// belongs to. The bridge maps it onto
+/// [`StreamEvent::ToolProgress`](crate::harness::StreamEvent) for UIs.
+#[derive(Debug, Clone)]
+pub struct ToolProgressUpdate {
+    /// Tool name (e.g. `bash_command`).
+    pub tool: String,
+    /// The originating `ToolCall::id`, so a UI can update the right block.
+    pub call_id: String,
+    /// Sanitized tail snapshot of the output so far — REPLACES the previous
+    /// preview (see [`CommandProgressSink`](crate::harness::CommandProgressSink)).
+    pub preview: String,
+}
+
+/// Run-level sink for [`ToolProgressUpdate`]s. Must not block (called from the
+/// executor's ~100ms wait-loop tick).
+pub type ToolProgressSink = Arc<dyn Fn(ToolProgressUpdate) + Send + Sync>;
 
 impl ToolContext {
     /// Build a context from the run's session id, the stable project id (#142),
@@ -150,7 +174,33 @@ impl ToolContext {
             project_id,
             run_store,
             memory_store,
+            progress: None,
         }
+    }
+
+    /// Install the run-level live-progress sink (builder-style). Wired by the
+    /// harness bridge when the run has a stream sink; see the field doc.
+    pub fn with_progress(mut self, sink: ToolProgressSink) -> Self {
+        self.progress = Some(sink);
+        self
+    }
+
+    /// Derive the per-call command-progress emitter for `call`: wraps the
+    /// run-level sink (when one is installed) with the call's identity so the
+    /// executor only ever deals in plain preview strings. `None` when no
+    /// consumer is listening — pass it straight to
+    /// [`SandboxProvider::execute_command_streaming`](crate::harness::SandboxProvider::execute_command_streaming).
+    pub fn command_progress(&self, call: &ToolCall) -> Option<crate::harness::CommandProgressSink> {
+        let sink = self.progress.clone()?;
+        let tool = call.name.clone();
+        let call_id = call.id.clone();
+        Some(Arc::new(move |preview: String| {
+            sink(ToolProgressUpdate {
+                tool: tool.clone(),
+                call_id: call_id.clone(),
+                preview,
+            })
+        }))
     }
 
     /// The session id keying this run's EPHEMERAL state (resets per Ralph window).
@@ -830,6 +880,17 @@ impl RealToolRegistry {
             ctx: ToolContext::new(session_id, project_id, run_store, memory_store),
             schemas,
         }
+    }
+
+    /// Install a run-level live-progress sink on the bridged [`ToolContext`]
+    /// (builder-style, `None` is a no-op). The harness wires this from the
+    /// run's stream sink so running tools can emit
+    /// [`StreamEvent::ToolProgress`](crate::harness::StreamEvent) previews.
+    pub fn with_progress(mut self, sink: Option<ToolProgressSink>) -> Self {
+        if let Some(sink) = sink {
+            self.ctx = self.ctx.clone().with_progress(sink);
+        }
+        self
     }
 
     /// The model-facing tool schemas, sorted by name.

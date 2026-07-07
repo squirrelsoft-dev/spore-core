@@ -156,6 +156,22 @@ pub enum StreamEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         node: Option<NodeAttr>,
     },
+    /// Live output from a RUNNING tool (pi-style bash streaming): emitted at
+    /// most every ~100ms while a command runs, between the tool's `ToolCall`
+    /// and its `ToolResult`. `preview` is a sanitized TAIL SNAPSHOT of the
+    /// output so far — each event REPLACES the previous preview (never
+    /// append); the final full output still arrives on the `ToolResult`.
+    /// Purely informational: never persisted to the session and absent from
+    /// the model conversation. `#[serde(default)]` keeps older consumers of
+    /// serialized streams deserializing.
+    ToolProgress {
+        call_id: String,
+        name: String,
+        #[serde(default)]
+        preview: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
+    },
     FinalResponse {
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -289,6 +305,7 @@ impl StreamEvent {
             | StreamEvent::TurnEnd { node, .. }
             | StreamEvent::ToolCall { node, .. }
             | StreamEvent::ToolResult { node, .. }
+            | StreamEvent::ToolProgress { node, .. }
             | StreamEvent::FinalResponse { node, .. }
             | StreamEvent::BudgetWarning { node, .. }
             | StreamEvent::UserMessage { node, .. }
@@ -312,6 +329,7 @@ impl StreamEvent {
             | StreamEvent::TurnEnd { node, .. }
             | StreamEvent::ToolCall { node, .. }
             | StreamEvent::ToolResult { node, .. }
+            | StreamEvent::ToolProgress { node, .. }
             | StreamEvent::FinalResponse { node, .. }
             | StreamEvent::BudgetWarning { node, .. }
             | StreamEvent::UserMessage { node, .. }

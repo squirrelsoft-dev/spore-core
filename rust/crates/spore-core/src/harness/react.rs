@@ -136,11 +136,30 @@ impl StandardHarness {
     /// Otherwise (empty handle, or non-empty handle with no per-key catalogue)
     /// the existing global-catalogue / `tool_registry` seam fallback applies, so
     /// examples 01–11 that use `.tools()` keep working byte-for-byte.
+    /// `on_stream`: the run's stream sink, threaded so running tools can emit
+    /// live [`StreamEvent::ToolProgress`] previews (pi-style bash streaming).
+    /// `None` (no consumer) leaves the progress seam un-wired — tools skip
+    /// streaming entirely.
     pub(crate) fn effective_tool_registry(
         &self,
         session_id: &SessionId,
         toolset: &ToolsetRef,
+        on_stream: Option<&StreamSink>,
     ) -> Arc<dyn ToolRegistry> {
+        // Bridge the run's stream sink into the ToolContext progress seam: a
+        // running tool's tail-preview snapshots surface as ToolProgress events
+        // on the same sink every other event uses.
+        let progress = on_stream.map(|sink| {
+            let sink = sink.clone();
+            Arc::new(move |u: crate::tool_registry::ToolProgressUpdate| {
+                sink(StreamEvent::ToolProgress {
+                    call_id: u.call_id,
+                    name: u.tool,
+                    preview: u.preview,
+                    node: None,
+                })
+            }) as crate::tool_registry::ToolProgressSink
+        });
         // Reserved handle: advertise NO tools (plan-empty re-ask). Intercepted
         // before the catalogue lookup so it never falls through to the full
         // registry. Dispatch is unreachable — the model is offered nothing.
@@ -158,21 +177,25 @@ impl StandardHarness {
                         self.config.project_id.clone(),
                         self.config.storage.run().clone(),
                         self.config.storage.memory().clone(),
-                    ),
+                    )
+                    .with_progress(progress.clone()),
                 ));
             }
         }
         // Fallback: empty handle (back-compat) or unregistered non-empty handle.
         match &self.config.catalogue_registry {
             Some(catalogue) => {
-                self.maybe_tool_search(Arc::new(crate::tool_registry::RealToolRegistry::new(
-                    catalogue.clone(),
-                    self.config.sandbox.clone(),
-                    session_id.clone(),
-                    self.config.project_id.clone(),
-                    self.config.storage.run().clone(),
-                    self.config.storage.memory().clone(),
-                )))
+                self.maybe_tool_search(Arc::new(
+                    crate::tool_registry::RealToolRegistry::new(
+                        catalogue.clone(),
+                        self.config.sandbox.clone(),
+                        session_id.clone(),
+                        self.config.project_id.clone(),
+                        self.config.storage.run().clone(),
+                        self.config.storage.memory().clone(),
+                    )
+                    .with_progress(progress),
+                ))
             }
             None => self.config.tool_registry.clone(),
         }
@@ -234,7 +257,8 @@ impl StandardHarness {
         // Resolve the effective tool registry once per turn-loop window (all
         // strategies funnel through here). Bridges the per-node toolset catalogue
         // (or the global catalogue when the handle is empty) per-run.
-        let tool_registry = self.effective_tool_registry(&session_id, &toolset);
+        let tool_registry =
+            self.effective_tool_registry(&session_id, &toolset, on_stream.as_ref());
         // Reset the adaptive prompt-based-tool-calling escalation flag at the
         // start of this turn-loop window so detection is scoped to the window
         // and does not leak across `run()` calls (the flag is shared with the
