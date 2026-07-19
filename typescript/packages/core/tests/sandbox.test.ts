@@ -9,7 +9,6 @@ import {
   writeFileSync,
   mkdirSync,
   existsSync,
-  chmodSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

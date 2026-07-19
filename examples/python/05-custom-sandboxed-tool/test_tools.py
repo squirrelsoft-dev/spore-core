@@ -16,6 +16,7 @@ from spore_core.storage import (
     InMemoryStorageProvider,
     JsonValue,
     StorageBackendError,
+    project_id_from_canonical_path,
 )
 from spore_core.tool_registry import AllowAllSandbox, ToolContext
 
@@ -27,6 +28,7 @@ def _ctx() -> ToolContext:
     backend = InMemoryStorageProvider()
     return ToolContext(
         session_id=SessionId("fact-session"),
+        project_id=project_id_from_canonical_path("/example-project"),
         run_store=backend,
         memory_store=backend,
     )
@@ -52,6 +54,7 @@ class _FailingRunStore:
 def _failing_ctx() -> ToolContext:
     return ToolContext(
         session_id=SessionId("fact-session"),
+        project_id=project_id_from_canonical_path("/example-project"),
         run_store=_FailingRunStore(),  # type: ignore[arg-type]
         memory_store=InMemoryStorageProvider(),
     )

@@ -61,7 +61,7 @@ describe("cordyceps example composition", () => {
     expect(pe.plan.agent).toBe("planner");
     expect(pe.plan.toolset).toBe("plan-tools");
     expect(pe.plan.output).toBe("plan-schema");
-    expect(pe.plan.budget).toEqual({ kind: "per_loop", value: 4 });
+    expect(pe.plan.budget).toEqual({ kind: "per_loop", value: 12 });
     if (pe.execute.kind !== "self_verifying")
       throw new Error("execute must be SelfVerifying");
     const sv = pe.execute;
@@ -73,11 +73,11 @@ describe("cordyceps example composition", () => {
     expect(sv.inner.budget).toEqual({ kind: "per_loop", value: 12 });
   });
 
-  // AC5: the fully-bounded tree's per-window worst case is 17; one `unlimited`
-  // anywhere collapses it to undefined.
-  it("max_steps is 17", () => {
+  // AC5: the fully-bounded tree's per-window worst case is 25 (plan 12 +
+  // (worker 12 + 1)); one `unlimited` anywhere collapses it to undefined.
+  it("max_steps is 25", () => {
     const tree = LoopStrategySchema.parse(readTreeRaw());
-    expect(loopStrategyMaxSteps(tree)).toBe(17);
+    expect(loopStrategyMaxSteps(tree)).toBe(25);
 
     if (tree.kind !== "ralph") throw new Error("unreachable");
     const pe = tree.inner;

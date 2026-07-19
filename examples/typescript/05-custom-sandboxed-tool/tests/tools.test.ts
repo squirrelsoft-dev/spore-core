@@ -71,6 +71,7 @@ function ctxWith(
 ): toolRegistry.ToolContext {
   return new ToolContext(
     SessionId.of(session),
+    storage.ProjectId.fromCanonicalPath("/example-project"),
     runStore,
     new InMemoryStorageProvider(),
   );

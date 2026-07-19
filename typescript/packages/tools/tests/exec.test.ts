@@ -2,14 +2,7 @@
  * Execution tool tests — mirror `rust/crates/spore-core/src/tools/exec.rs#tests`.
  */
 
-import {
-  chmodSync,
-  existsSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -102,17 +95,24 @@ describe("ExecTool", () => {
     }
   });
 
-  // SC-15 breadth parity (#164): a non-ENOENT/EACCES start failure (ENOEXEC for a
-  // non-binary executable) must still become exec_spawn_failed via the DEFAULT
-  // executeCommand path, matching the Rust/Python/Go any-start-error behavior.
+  // SC-15 breadth parity (#164): a non-ENOENT/EACCES start failure
+  // (ENAMETOOLONG for an over-long path component) must still become
+  // exec_spawn_failed via the DEFAULT executeCommand path, matching the
+  // Rust/Python/Go any-start-error behavior.
+  //
+  // Do NOT reach for an empty 0755 file to provoke ENOEXEC here: that is
+  // macOS-only behaviour. glibc's execvp retries an ENOEXEC failure as
+  // `/bin/sh <file>`, so on Linux the empty file runs as an empty shell script
+  // and exits 0 — the spawn SUCCEEDS and there is no violation to assert on.
+  // ENAMETOOLONG comes out of kernel path resolution, before exec ever inspects
+  // the file, so no libc fallback can intercept it on either platform.
+  // (NAME_MAX is 255 on both Linux and macOS.)
   it.runIf(IS_UNIX)(
-    "non-binary executable is a typed spawn failure (ENOEXEC)",
+    "non-binary executable is a typed spawn failure (ENAMETOOLONG)",
     async () => {
       const sb = new AllowAllSandbox();
-      const dir = mkdtempSync(join(tmpdir(), "spore-exec-enoexec-"));
-      const notABinary = join(dir, "not-a-binary");
-      writeFileSync(notABinary, "");
-      chmodSync(notABinary, 0o755);
+      const dir = mkdtempSync(join(tmpdir(), "spore-exec-enametoolong-"));
+      const notABinary = join(dir, "x".repeat(300));
       try {
         const r = await new ExecTool().execute(
           call("exec", { command: notABinary }),
