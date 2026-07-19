@@ -779,10 +779,11 @@ object in your MESSAGE CONTENT: {\"tasks\": [<ordered step strings>], \"rational
             // Completed. A task whose blocker FAILED is cascade-Blocked (so it is
             // no longer Pending and never becomes ready). When no Pending task is
             // ready, the walk drains.
-            loop {
-                let Some(task_id) = task_list.next_ready() else {
-                    break;
-                };
+            // `while let` (not `loop` + let-else): the condition re-reads
+            // `task_list` every iteration, which is load-bearing — the body
+            // RELOADS the list from the durable blob after each step, so the
+            // ready-set must be recomputed against the reloaded value.
+            while let Some(task_id) = task_list.next_ready() {
                 let index = task_list
                     .tasks
                     .iter()
