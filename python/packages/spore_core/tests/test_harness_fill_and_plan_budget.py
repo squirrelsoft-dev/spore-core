@@ -225,6 +225,5 @@ async def test_plan_phase_honors_declared_perloop_budget() -> None:
     # The planner authored across two turns (tool call + JSON) and the worker ran
     # once: three agent calls total.
     assert agent.call_count == 3, (
-        f"planner not clamped to one turn — expected 3 total agent calls, "
-        f"got {agent.call_count}"
+        f"planner not clamped to one turn — expected 3 total agent calls, got {agent.call_count}"
     )
