@@ -238,12 +238,11 @@ impl EmbeddingModel for OllamaEmbeddingModel {
                     message: body_text.chars().take(500).collect(),
                 });
             }
-            let parsed: OllamaEmbedResponse = resp.json().await.map_err(|e| {
-                ModelError::ProviderError {
+            let parsed: OllamaEmbedResponse =
+                resp.json().await.map_err(|e| ModelError::ProviderError {
                     code: 0,
                     message: format!("decode embed response failed: {e}"),
-                }
-            })?;
+                })?;
             Ok(parsed.embeddings)
         })
     }
@@ -325,7 +324,10 @@ impl OpenAIEmbeddingModel {
     }
 
     pub fn from_env(env_var: &str, model_id: impl Into<String>) -> Result<Self, ModelError> {
-        Ok(Self::new(crate::provider_http::key_from_env(env_var)?, model_id))
+        Ok(Self::new(
+            crate::provider_http::key_from_env(env_var)?,
+            model_id,
+        ))
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -420,12 +422,11 @@ impl EmbeddingModel for OpenAIEmbeddingModel {
                 },
             )
             .await?;
-            let mut parsed: OpenAIEmbedResponse = resp.json().await.map_err(|e| {
-                ModelError::ProviderError {
+            let mut parsed: OpenAIEmbedResponse =
+                resp.json().await.map_err(|e| ModelError::ProviderError {
                     code: 0,
                     message: format!("decode embeddings response failed: {e}"),
-                }
-            })?;
+                })?;
             // The API returns data in request order, but `index` is authoritative
             // — sort by it so a non-conforming compatible server can't scramble
             // the input↔vector correspondence.
@@ -496,8 +497,8 @@ mod tests {
     #[tokio::test]
     async fn ollama_empty_input_skips_call() {
         // No mock mounted: an empty batch must not contact the server.
-        let model = OllamaEmbeddingModel::new("nomic-embed-text")
-            .with_base_url("http://127.0.0.1:1");
+        let model =
+            OllamaEmbeddingModel::new("nomic-embed-text").with_base_url("http://127.0.0.1:1");
         assert_eq!(model.embed(Vec::new()).await.unwrap().len(), 0);
     }
 

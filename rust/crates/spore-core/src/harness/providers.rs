@@ -68,7 +68,10 @@ pub(crate) struct ReadOnlyToolView {
 }
 
 impl ReadOnlyToolView {
-    pub(crate) fn new(inner: Arc<dyn ToolRegistry>, allow: std::collections::HashSet<String>) -> Self {
+    pub(crate) fn new(
+        inner: Arc<dyn ToolRegistry>,
+        allow: std::collections::HashSet<String>,
+    ) -> Self {
         Self { inner, allow }
     }
 }
@@ -318,6 +321,16 @@ pub enum IsolationMode {
     /// Full Docker isolation including network policy. Reserved; not
     /// implemented in the v1 reference sandbox.
     Docker {
+        image: String,
+        network: NetworkPolicy,
+    },
+    /// MicroVM isolation via the petri sandbox runtime: commands execute in a
+    /// Linux guest over a shared virtio-fs workspace while file tools stay
+    /// host-side. Implemented by `sandbox_petri::PetriSandboxProvider` behind
+    /// the `petri` feature; the variant itself is always present so wire
+    /// formats do not depend on features. `image` is the host path of the
+    /// image bundle (empty = the backend's default base image).
+    MicroVm {
         image: String,
         network: NetworkPolicy,
     },

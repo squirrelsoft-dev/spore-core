@@ -33,11 +33,11 @@
 //! default build the variant does not exist, so using it is a compile error
 //! rather than a runtime warning. The wire tag stays `"yolo"`. See issue #34.
 
+use crate::sync_util::MutexExt;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
-use crate::sync_util::MutexExt;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

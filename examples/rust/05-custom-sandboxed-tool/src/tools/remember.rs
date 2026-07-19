@@ -74,7 +74,7 @@ mod tests {
 
     use serde_json::Value as JsonValue;
     use spore_core::harness::BoxFut;
-    use spore_core::storage::{InMemoryStorageProvider, RunStore, StorageError};
+    use spore_core::storage::{InMemoryStorageProvider, ProjectId, RunStore, StorageError};
     use spore_core::{
         SandboxProvider, SandboxViolation, SessionId, ToolCall, ToolContext, ToolOutput,
     };
@@ -138,6 +138,7 @@ mod tests {
         // covers the (unused) memory seam.
         ToolContext::new(
             SessionId::new(SESSION),
+            ProjectId::from_canonical_path("/example-project"),
             run_store,
             Arc::new(InMemoryStorageProvider::new()),
         )

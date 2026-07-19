@@ -233,48 +233,78 @@ impl WorkspaceScopedSandbox {
     /// Path-resolution core. Public-but-internal so the trait impl and the
     /// fixture replay test can share the same logic.
     fn resolve(&self, raw: &str, operation: Operation) -> Result<PathBuf, SandboxViolation> {
-        // 1. Treat raw as relative even if absolute — strip a single leading
-        //    separator so callers can pass `/foo/bar` and mean
-        //    `<root>/foo/bar`.
+        // 1. Treat raw as relative even if absolute. An absolute path that is
+        //    already inside the workspace maps to itself: models routinely
+        //    echo the full workspace path from their prompt
+        //    (`/Users/me/Downloads/x`), and re-rooting that under the root
+        //    would silently nest a junk copy of the whole prefix
+        //    (`<root>/Users/me/Downloads/x`). Any other absolute path keeps
+        //    the historical lenient treatment — strip a single leading
+        //    separator so `/foo/bar` means `<root>/foo/bar`.
         let raw_path = Path::new(raw);
         let joined = if raw_path.is_absolute() {
-            let stripped = raw_path
-                .strip_prefix("/")
-                .ok()
-                .or_else(|| raw_path.strip_prefix(std::path::MAIN_SEPARATOR_STR).ok())
-                .unwrap_or(raw_path);
-            self.config.root.join(stripped)
+            if raw_path.starts_with(&self.config.root) {
+                raw_path.to_path_buf()
+            } else {
+                let stripped = raw_path
+                    .strip_prefix("/")
+                    .ok()
+                    .or_else(|| raw_path.strip_prefix(std::path::MAIN_SEPARATOR_STR).ok())
+                    .unwrap_or(raw_path);
+                self.config.root.join(stripped)
+            }
         } else {
             self.config.root.join(raw_path)
         };
 
-        // 2. Canonicalize. The target file may not yet exist — for *any*
-        //    operation, including Read — so canonicalize the parent and
-        //    re-join the filename. Resolution is operation-agnostic on
+        // 2. Canonicalize. The target — and any run of its trailing
+        //    directories — may not yet exist, for *any* operation including
+        //    Read: canonicalize the nearest existing ancestor and re-join the
+        //    missing components. Resolution is operation-agnostic on
         //    purpose: existence is orthogonal to the boundary check. A
         //    missing in-workspace path still resolves (via its canonicalized
-        //    parent) and passes the boundary check; the actual read then
+        //    ancestor) and passes the boundary check; the actual read then
         //    naturally returns NotFound, surfaced as a recoverable error by
         //    the read tool rather than a PathEscape. A missing path that
         //    resolves *outside* the root is still a PathEscape.
         let canonical = match std::fs::canonicalize(&joined) {
             Ok(p) => p,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let parent = joined
-                    .parent()
-                    .ok_or_else(|| SandboxViolation::PathEscape {
-                        path: raw.to_string(),
-                    })?;
-                let canonical_parent =
-                    std::fs::canonicalize(parent).map_err(|_| SandboxViolation::PathEscape {
-                        path: raw.to_string(),
-                    })?;
-                let file_name = joined
-                    .file_name()
-                    .ok_or_else(|| SandboxViolation::PathEscape {
-                        path: raw.to_string(),
-                    })?;
-                canonical_parent.join(file_name)
+                // Walk up to the nearest EXISTING ancestor, canonicalize it,
+                // and re-join the missing components — so a target several
+                // levels inside a not-yet-created subtree still resolves
+                // (write_file / create_dir then materialize the directories).
+                // Symlinks can only live in the existing prefix (a missing
+                // path contains none), so canonicalizing that prefix is as
+                // strong as canonicalizing a direct parent. `file_name()`
+                // returning `None` (a `..`-terminated ancestor) aborts the
+                // walk: a lexical re-join across `..` cannot be trusted once
+                // the directories exist.
+                let mut ancestor = joined.as_path();
+                let mut missing: Vec<std::ffi::OsString> = Vec::new();
+                loop {
+                    let name =
+                        ancestor
+                            .file_name()
+                            .ok_or_else(|| SandboxViolation::PathEscape {
+                                path: raw.to_string(),
+                            })?;
+                    missing.push(name.to_os_string());
+                    let parent = ancestor
+                        .parent()
+                        .ok_or_else(|| SandboxViolation::PathEscape {
+                            path: raw.to_string(),
+                        })?;
+                    match std::fs::canonicalize(parent) {
+                        Ok(base) => break missing.iter().rev().fold(base, |p, c| p.join(c)),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ancestor = parent,
+                        Err(_) => {
+                            return Err(SandboxViolation::PathEscape {
+                                path: raw.to_string(),
+                            });
+                        }
+                    }
+                }
             }
             Err(_) => {
                 return Err(SandboxViolation::PathEscape {
@@ -439,16 +469,16 @@ fn progress_preview(stdout_buf: &SharedBuf, stderr_buf: &SharedBuf) -> String {
 
 /// Read a child pipe to EOF, appending into a shared buffer so the bytes stay
 /// reachable even if the awaiting future is cancelled by a timeout.
-async fn drain_pipe(
-    mut pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
-    buf: SharedBuf,
-) {
+async fn drain_pipe(mut pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static, buf: SharedBuf) {
     use tokio::io::AsyncReadExt;
     let mut chunk = [0u8; 8192];
     loop {
         match pipe.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
-            Ok(n) => buf.lock().expect("output buffer lock").extend_from_slice(&chunk[..n]),
+            Ok(n) => buf
+                .lock()
+                .expect("output buffer lock")
+                .extend_from_slice(&chunk[..n]),
         }
     }
 }
@@ -621,6 +651,15 @@ impl SandboxProvider for WorkspaceScopedSandbox {
                         command: format!("docker isolation not implemented: {command}"),
                     });
                 }
+                IsolationMode::MicroVm { .. } => {
+                    // MicroVM execution lives in `sandbox_petri::PetriSandboxProvider`
+                    // (feature `petri`); this host-exec sandbox cannot honor it.
+                    return Err(SandboxViolation::DisallowedCommand {
+                        command: format!(
+                            "micro_vm isolation requires the petri sandbox provider: {command}"
+                        ),
+                    });
+                }
             }
 
             let mut cmd = tokio::process::Command::new(command);
@@ -678,8 +717,14 @@ impl SandboxProvider for WorkspaceScopedSandbox {
             // bytes captured so far remain reachable after a timeout.
             let stdout_buf = new_shared_buf();
             let stderr_buf = new_shared_buf();
-            let stdout_task = child.stdout.take().map(|p| tokio::spawn(drain_pipe(p, stdout_buf.clone())));
-            let stderr_task = child.stderr.take().map(|p| tokio::spawn(drain_pipe(p, stderr_buf.clone())));
+            let stdout_task = child
+                .stdout
+                .take()
+                .map(|p| tokio::spawn(drain_pipe(p, stdout_buf.clone())));
+            let stderr_task = child
+                .stderr
+                .take()
+                .map(|p| tokio::spawn(drain_pipe(p, stderr_buf.clone())));
 
             // Wait for exit, racing a timeout deadline and (when a progress
             // sink is wired) a ~100ms preview ticker that snapshots the drain
@@ -1065,6 +1110,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_into_missing_nested_subdirs_resolves() {
+        // The whole `new/sub` run is absent — resolution walks up to the
+        // existing root and re-joins the missing components, so write_file /
+        // create_dir can materialize the directories afterwards.
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sb = WorkspaceScopedSandbox::new(cfg(&root)).unwrap();
+        let resolved = sb
+            .resolve_path("new/sub/file.txt", Operation::Write)
+            .await
+            .unwrap();
+        assert_eq!(resolved, root.join("new/sub/file.txt"));
+    }
+
+    #[tokio::test]
+    async fn absolute_path_inside_workspace_maps_to_itself() {
+        // Models echo the full workspace path from the prompt; that must NOT
+        // be re-rooted into `<root>/<root>/…`.
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sb = WorkspaceScopedSandbox::new(cfg(&root)).unwrap();
+        let raw = root.join("images/cat.jpg");
+        let resolved = sb
+            .resolve_path(raw.to_str().unwrap(), Operation::Write)
+            .await
+            .unwrap();
+        assert_eq!(resolved, root.join("images/cat.jpg"));
+    }
+
+    #[tokio::test]
+    async fn absolute_workspace_prefix_with_dotdot_is_still_path_escape() {
+        // `<root>/../…` passes the lexical prefix check but must die at the
+        // canonical boundary check.
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sb = WorkspaceScopedSandbox::new(cfg(&root)).unwrap();
+        let raw = format!("{}/../escaped.txt", root.display());
+        let err = sb.resolve_path(&raw, Operation::Write).await.unwrap_err();
+        assert!(matches!(err, SandboxViolation::PathEscape { .. }));
+    }
+
+    #[tokio::test]
+    async fn missing_subdir_with_dotdot_is_path_escape() {
+        // `..` inside a missing run would resolve differently once the
+        // directories exist, so a lexical re-join is refused outright.
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sb = WorkspaceScopedSandbox::new(cfg(&root)).unwrap();
+        let err = sb
+            .resolve_path("ghost/../../outside.txt", Operation::Write)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SandboxViolation::PathEscape { .. }));
+    }
+
+    #[tokio::test]
     async fn read_of_missing_file_outside_root_still_path_escape() {
         // Regression for #63: a Read of a *non-existent* path that resolves
         // outside the workspace root must still be a PathEscape, not a
@@ -1134,12 +1235,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let sb = WorkspaceScopedSandbox::new(cfg(dir.path())).unwrap();
         let err = sb
-            .execute_command(
-                "spore-definitely-no-such-binary-xyz",
-                &[],
-                None,
-                None,
-            )
+            .execute_command("spore-definitely-no-such-binary-xyz", &[], None, None)
             .await
             .unwrap_err();
         match err {
@@ -1195,8 +1291,16 @@ mod tests {
         // (printed 350ms in, past several 100ms ticks).
         let previews = previews.lock().unwrap();
         assert!(!previews.is_empty(), "no live previews were emitted");
-        assert!(previews[0].contains("one"), "first preview missing early output: {:?}", previews[0]);
-        assert!(!previews[0].contains("two"), "first preview already has late output — not live: {:?}", previews[0]);
+        assert!(
+            previews[0].contains("one"),
+            "first preview missing early output: {:?}",
+            previews[0]
+        );
+        assert!(
+            !previews[0].contains("two"),
+            "first preview already has late output — not live: {:?}",
+            previews[0]
+        );
     }
 
     #[tokio::test]
@@ -1232,9 +1336,21 @@ mod tests {
             .await
             .unwrap();
         assert!(out.timed_out);
-        assert!(out.stdout.contains("started"), "partial stdout lost: {:?}", out.stdout);
-        assert!(out.stderr.contains("warn"), "partial stderr lost: {:?}", out.stderr);
-        assert!(out.stderr.contains("timed out"), "timeout note missing: {:?}", out.stderr);
+        assert!(
+            out.stdout.contains("started"),
+            "partial stdout lost: {:?}",
+            out.stdout
+        );
+        assert!(
+            out.stderr.contains("warn"),
+            "partial stderr lost: {:?}",
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains("timed out"),
+            "timeout note missing: {:?}",
+            out.stderr
+        );
     }
 
     /// A timed-out shell's GRANDCHILD must die with it: the child is spawned
@@ -1300,7 +1416,10 @@ mod tests {
     #[test]
     fn sanitize_keeps_crlf_lines_intact() {
         // The trailing \r of a CRLF line must not erase the line.
-        assert_eq!(sanitize_command_output("alpha\r\nbeta\r\n"), "alpha\nbeta\n");
+        assert_eq!(
+            sanitize_command_output("alpha\r\nbeta\r\n"),
+            "alpha\nbeta\n"
+        );
     }
 
     #[test]

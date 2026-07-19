@@ -99,7 +99,10 @@ impl AnthropicModelInterface {
     /// Read API key from environment variable. Returns
     /// `ModelError::ProviderError` if the variable is unset or empty.
     pub fn from_env(env_var: &str, model_id: impl Into<String>) -> Result<Self, ModelError> {
-        Ok(Self::new(crate::provider_http::key_from_env(env_var)?, model_id))
+        Ok(Self::new(
+            crate::provider_http::key_from_env(env_var)?,
+            model_id,
+        ))
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -408,32 +411,32 @@ async fn map_status_error(resp: reqwest::Response) -> ModelError {
 impl ModelInterface for AnthropicModelInterface {
     fn call<'a>(&'a self, request: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
         Box::pin(async move {
-        let body = build_request(&self.model_id, &request, false);
-        let url = format!("{}/v1/messages", self.base_url);
-        let api_key = self.api_key.clone();
-        let body = crate::provider_http::encode_body(&body)?;
-        let client = self.http_client.clone();
-        let resp = crate::provider_http::send_with_retry(
-            || {
-                client
-                    .post(&url)
-                    .header("x-api-key", &api_key)
-                    .header("anthropic-version", Self::ANTHROPIC_VERSION)
-                    .header("content-type", "application/json")
-                    .body(body.clone())
-            },
-            self.max_retries,
-            self.timeout,
-            retryable,
-            map_status_error,
-        )
-        .await?;
-        let parsed: AnthropicResponse =
-            resp.json().await.map_err(|e| ModelError::ProviderError {
-                code: 0,
-                message: format!("response decode failed: {e}"),
-            })?;
-        Ok(parse_response(parsed))
+            let body = build_request(&self.model_id, &request, false);
+            let url = format!("{}/v1/messages", self.base_url);
+            let api_key = self.api_key.clone();
+            let body = crate::provider_http::encode_body(&body)?;
+            let client = self.http_client.clone();
+            let resp = crate::provider_http::send_with_retry(
+                || {
+                    client
+                        .post(&url)
+                        .header("x-api-key", &api_key)
+                        .header("anthropic-version", Self::ANTHROPIC_VERSION)
+                        .header("content-type", "application/json")
+                        .body(body.clone())
+                },
+                self.max_retries,
+                self.timeout,
+                retryable,
+                map_status_error,
+            )
+            .await?;
+            let parsed: AnthropicResponse =
+                resp.json().await.map_err(|e| ModelError::ProviderError {
+                    code: 0,
+                    message: format!("response decode failed: {e}"),
+                })?;
+            Ok(parse_response(parsed))
         })
     }
 
@@ -442,32 +445,32 @@ impl ModelInterface for AnthropicModelInterface {
         request: ModelRequest,
     ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
         Box::pin(async move {
-        let body = build_request(&self.model_id, &request, true);
-        let url = format!("{}/v1/messages", self.base_url);
-        let body = crate::provider_http::encode_body(&body)?;
-        let client = self.http_client.clone();
-        let api_key = self.api_key.clone();
-        // Route through `send_with_retry` so opening a stream gets the same
-        // retry/backoff on transient failures (timeouts, 429/5xx/529) as the
-        // non-streaming paths. Retries happen BEFORE the body is consumed; the
-        // closure rebuilds the request each attempt (`body.clone()`).
-        let resp = crate::provider_http::send_with_retry(
-            || {
-                client
-                    .post(&url)
-                    .header("x-api-key", &api_key)
-                    .header("anthropic-version", Self::ANTHROPIC_VERSION)
-                    .header("content-type", "application/json")
-                    .header("accept", "text/event-stream")
-                    .body(body.clone())
-            },
-            self.max_retries,
-            self.timeout,
-            retryable,
-            map_status_error,
-        )
-        .await?;
-        Ok::<ModelStream, ModelError>(Box::pin(sse_to_events(resp)))
+            let body = build_request(&self.model_id, &request, true);
+            let url = format!("{}/v1/messages", self.base_url);
+            let body = crate::provider_http::encode_body(&body)?;
+            let client = self.http_client.clone();
+            let api_key = self.api_key.clone();
+            // Route through `send_with_retry` so opening a stream gets the same
+            // retry/backoff on transient failures (timeouts, 429/5xx/529) as the
+            // non-streaming paths. Retries happen BEFORE the body is consumed; the
+            // closure rebuilds the request each attempt (`body.clone()`).
+            let resp = crate::provider_http::send_with_retry(
+                || {
+                    client
+                        .post(&url)
+                        .header("x-api-key", &api_key)
+                        .header("anthropic-version", Self::ANTHROPIC_VERSION)
+                        .header("content-type", "application/json")
+                        .header("accept", "text/event-stream")
+                        .body(body.clone())
+                },
+                self.max_retries,
+                self.timeout,
+                retryable,
+                map_status_error,
+            )
+            .await?;
+            Ok::<ModelStream, ModelError>(Box::pin(sse_to_events(resp)))
         })
     }
 
@@ -476,35 +479,35 @@ impl ModelInterface for AnthropicModelInterface {
         request: &'a ModelRequest,
     ) -> BoxFut<'a, Result<u32, ModelError>> {
         Box::pin(async move {
-        let body = build_request(&self.model_id, request, false);
-        let url = format!("{}/v1/messages/count_tokens", self.base_url);
-        let body = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
-            code: 0,
-            message: format!("count_tokens encode failed: {e}"),
-        })?;
-        let api_key = self.api_key.clone();
-        let client = self.http_client.clone();
-        let resp = crate::provider_http::send_with_retry(
-            || {
-                client
-                    .post(&url)
-                    .header("x-api-key", &api_key)
-                    .header("anthropic-version", Self::ANTHROPIC_VERSION)
-                    .header("content-type", "application/json")
-                    .body(body.clone())
-            },
-            self.max_retries,
-            self.timeout,
-            retryable,
-            map_status_error,
-        )
-        .await?;
-        let parsed: AnthropicCountTokensResponse =
-            resp.json().await.map_err(|e| ModelError::ProviderError {
+            let body = build_request(&self.model_id, request, false);
+            let url = format!("{}/v1/messages/count_tokens", self.base_url);
+            let body = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
                 code: 0,
-                message: format!("count_tokens decode failed: {e}"),
+                message: format!("count_tokens encode failed: {e}"),
             })?;
-        Ok(parsed.input_tokens)
+            let api_key = self.api_key.clone();
+            let client = self.http_client.clone();
+            let resp = crate::provider_http::send_with_retry(
+                || {
+                    client
+                        .post(&url)
+                        .header("x-api-key", &api_key)
+                        .header("anthropic-version", Self::ANTHROPIC_VERSION)
+                        .header("content-type", "application/json")
+                        .body(body.clone())
+                },
+                self.max_retries,
+                self.timeout,
+                retryable,
+                map_status_error,
+            )
+            .await?;
+            let parsed: AnthropicCountTokensResponse =
+                resp.json().await.map_err(|e| ModelError::ProviderError {
+                    code: 0,
+                    message: format!("count_tokens decode failed: {e}"),
+                })?;
+            Ok(parsed.input_tokens)
         })
     }
 
@@ -885,8 +888,8 @@ mod tests {
         // so the harness's compaction budget sizes correctly.
         let bare = AnthropicModelInterface::new("test-key", "claude-imaginary-9");
         assert_eq!(bare.provider().context_window, 200_000);
-        let pinned =
-            AnthropicModelInterface::new("test-key", "some-proxy-model").with_context_window(500_000);
+        let pinned = AnthropicModelInterface::new("test-key", "some-proxy-model")
+            .with_context_window(500_000);
         assert_eq!(pinned.provider().context_window, 500_000);
         // A bare foreign id still reports 0 (callers can detect "unknown").
         assert_eq!(

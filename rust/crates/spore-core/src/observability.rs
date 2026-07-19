@@ -80,9 +80,9 @@
 //!      `SPORE_TRACE_CONTENT` (default OFF).
 //!   4. Prompt source is output + tool spans only (no assembled input history).
 
+use crate::sync_util::MutexExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use crate::sync_util::MutexExt;
 
 use serde::{Deserialize, Serialize};
 
@@ -297,12 +297,35 @@ impl GenAiRole {
 }
 
 /// One captured conversation message (issue #64).
+///
+/// `content` is the human-readable rendering. The tool-linkage fields below
+/// carry the STRUCTURE that rendering flattens away, so a trace can answer
+/// "did this tool result link back to that tool call, and by which id?" —
+/// impossible from `content` alone. They mirror [`Content::ToolCall`] /
+/// [`Content::ToolResult`] verbatim; they are NOT re-derived from the rendered
+/// string. All are `Option` + `skip_serializing_if` so a message that carries
+/// no tool linkage (plain text) stays byte-identical to the pre-linkage form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenAiMessage {
     pub role: GenAiRole,
     pub content: String,
     /// `true` when `content` was clipped by [`truncate_field`].
     pub truncated: bool,
+    /// For a `Tool` message: the id of the call this result answers
+    /// ([`ToolResult::tool_use_id`]). Pairs with the `id` on the corresponding
+    /// [`ToolCallContent`] in an earlier assistant message's `tool_calls`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// For an `Assistant` message that requested tool calls: the calls
+    /// themselves, each carrying its `id`. Present ALONGSIDE the flattened
+    /// `content` rendering, never instead of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallContent>>,
+    /// For a `Tool` message: [`ToolResult::is_error`] — whether the harness
+    /// handed the model a failure. Distinguishes "tool ran and returned this"
+    /// from "tool dispatch failed", which read identically in `content`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
 }
 
 /// A requested tool call captured on a [`TurnSpan`] (issue #64).
@@ -314,6 +337,11 @@ pub struct ToolCallContent {
     /// in place), and `arguments_truncated` is `true`.
     pub arguments: serde_json::Value,
     pub arguments_truncated: bool,
+    /// The provider's tool-call id ([`ToolCall::id`]) — e.g. vLLM's
+    /// `chatcmpl-tool-…`. The join key to a later `Tool` message's
+    /// `tool_call_id`. `None` only for legacy lines written before capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 /// A tool result body captured on a [`ToolCallSpan`] (issue #64).
@@ -1924,11 +1952,20 @@ mod tests {
             role: GenAiRole::Assistant,
             content: "done".into(),
             truncated: false,
+            tool_call_id: None,
+            tool_calls: None,
+            is_error: None,
         });
         let v = serde_json::to_value(&span).unwrap();
         assert_eq!(v["output_text"]["role"], "assistant");
         assert_eq!(v["output_text"]["content"], "done");
         assert_eq!(v["output_text"]["truncated"], false);
+        // A message with no tool linkage must not grow keys — the linkage fields
+        // are skipped, keeping plain-text lines byte-identical to pre-linkage.
+        let msg = v["output_text"].as_object().unwrap();
+        assert!(!msg.contains_key("tool_call_id"));
+        assert!(!msg.contains_key("tool_calls"));
+        assert!(!msg.contains_key("is_error"));
     }
 
     #[derive(serde::Deserialize)]

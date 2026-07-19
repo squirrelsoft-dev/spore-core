@@ -27,6 +27,12 @@ base64 = "0.22"
 opentelemetry = "0.30"
 opentelemetry_sdk = { version = "0.30", features = ["rt-tokio", "trace"] }
 opentelemetry-otlp = { version = "0.30", default-features = false, features = ["grpc-tonic", "trace"] }
+# MicroVM isolation backend (feature `petri`): the sibling petri sandbox
+# runtime. Pinned to a rev until petri publishes to crates.io; macOS/Apple-silicon
+# only at runtime, but the crate itself builds everywhere. NOTE: cargo resolves
+# path/git deps even when the feature is OFF, so this must stay fetchable — a
+# local path here would break the build for anyone without a sibling checkout.
+petri = { git = "ssh://git@github.com/squirrelsoft-dev/petri.git", rev = "0e56420f2066b4766385250436361ee96e2296da", optional = true }
 
 # Process-group kill for `execute_command` timeouts/aborts (kill(-pgid)):
 # tokio's kill_on_drop only reaps the DIRECT child, orphaning grandchildren
@@ -37,6 +43,10 @@ libc = "0.2"
 [features]
 default = []
 test-utils = []
+# MicroVM isolation via the petri sandbox runtime. Enables
+# `sandbox_petri::PetriSandboxProvider`, which executes commands inside a
+# petri microVM while file tools stay host-side over the shared workspace.
+petri = ["dep:petri"]
 # Gates the two named safety footguns `Mode::Yolo` and `IsolationMode::None`.
 # When this feature is OFF (the default), those variants do not exist, so any
 # attempt to use them is a compile error rather than a runtime warning. Intended

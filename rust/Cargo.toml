@@ -4,6 +4,8 @@ members = [
     "crates/spore-core",
     "crates/spore-cli",
     "crates/spore-eval",
+    "crates/spore-mcp",
+    "crates/spore-sqlvec",
 ]
 
 [workspace.package]

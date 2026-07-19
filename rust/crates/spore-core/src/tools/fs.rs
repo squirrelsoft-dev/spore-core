@@ -1,15 +1,17 @@
-//! Filesystem tools: ReadFile, WriteFile, ListDir, DeleteFile, MoveFile.
+//! Filesystem tools: ReadFile, WriteFile, CreateDir, ListDir, DeleteFile,
+//! MoveFile.
 
 use serde_json::json;
 
 use crate::harness::{BoxFut, Operation, SandboxProvider, SandboxViolation, ToolOutput};
 use crate::model::ToolCall;
-use crate::tools::tool_try;
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::error::ToolExecutionError;
 use crate::tools::params::{
-    parse_params, DeleteFileParams, ListDirParams, MoveFileParams, ReadFileParams, WriteFileParams,
+    parse_params, CreateDirParams, DeleteFileParams, ListDirParams, MoveFileParams, ReadFileParams,
+    WriteFileParams,
 };
+use crate::tools::tool_try;
 use crate::tools::{finish_with_possible_truncation, LARGE_OUTPUT_THRESHOLD};
 
 // ============================================================================
@@ -136,7 +138,10 @@ impl Tool for ReadFileTool {
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: ReadFileParams = tool_try!(parse_params(call));
-            let resolved = tool_try!(sandbox.resolve_path(&params.path, Operation::Read).await.map_err(ToolExecutionError::SandboxViolation));
+            let resolved = tool_try!(sandbox
+                .resolve_path(&params.path, Operation::Read)
+                .await
+                .map_err(ToolExecutionError::SandboxViolation));
             match tokio::fs::read_to_string(&resolved).await {
                 Ok(content) => match apply_read_range(&content, &params) {
                     Ok(out) => finish_with_possible_truncation(out, &call.id, sandbox).await,
@@ -169,7 +174,7 @@ impl WriteFileTool {
         ToolSchema {
             name: Self::NAME.into(),
             description:
-                "Write content to a file (overwrites by default; set append=true to append)".into(),
+                "Write content to a file, creating parent directories as needed (overwrites by default; set append=true to append)".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -205,19 +210,35 @@ impl Tool for WriteFileTool {
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: WriteFileParams = tool_try!(parse_params(call));
-            let resolved = tool_try!(sandbox.resolve_path(&params.path, Operation::Write).await.map_err(ToolExecutionError::SandboxViolation));
+            let resolved = tool_try!(sandbox
+                .resolve_path(&params.path, Operation::Write)
+                .await
+                .map_err(ToolExecutionError::SandboxViolation));
             let bytes = params.content.len();
             // Enforce the sandbox's write cap on the payload (reads are capped in
             // `resolve_path`; writes/appends are capped here, since the resolver
             // never sees the content).
             if let Some(limit) = sandbox.max_write_size() {
                 if bytes as u64 > limit {
-                    return ToolExecutionError::SandboxViolation(SandboxViolation::FileSizeExceeded {
-                        path: params.path.clone(),
-                        size: bytes as u64,
-                        limit,
-                    })
+                    return ToolExecutionError::SandboxViolation(
+                        SandboxViolation::FileSizeExceeded {
+                            path: params.path.clone(),
+                            size: bytes as u64,
+                            limit,
+                        },
+                    )
                     .into();
+                }
+            }
+            // The resolver admits targets inside not-yet-created subtrees;
+            // materialize the directories so the write lands (mkdir -p
+            // semantics — a no-op when they already exist).
+            if let Some(parent) = resolved.parent() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    return ToolOutput::Error {
+                        message: format!("write failed: cannot create parent directories: {e}"),
+                        recoverable: true,
+                    };
                 }
             }
             let result = if params.append {
@@ -241,6 +262,71 @@ impl Tool for WriteFileTool {
                 },
                 Err(e) => ToolOutput::Error {
                     message: format!("write failed: {e}"),
+                    recoverable: true,
+                },
+            }
+        })
+    }
+}
+
+// ============================================================================
+// CreateDir
+// ============================================================================
+
+pub struct CreateDirTool;
+
+impl CreateDirTool {
+    pub const NAME: &'static str = "create_dir";
+    pub fn new() -> Self {
+        Self
+    }
+    pub fn schema() -> ToolSchema {
+        ToolSchema {
+            name: Self::NAME.into(),
+            description:
+                "Create a directory, including any missing parent directories (like mkdir -p)"
+                    .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                },
+                "required": ["path"],
+            }),
+            annotations: ToolAnnotations::default(),
+        }
+    }
+}
+
+impl Default for CreateDirTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Tool for CreateDirTool {
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+    fn execute<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
+    ) -> BoxFut<'a, ToolOutput> {
+        Box::pin(async move {
+            let params: CreateDirParams = tool_try!(parse_params(call));
+            let resolved = tool_try!(sandbox
+                .resolve_path(&params.path, Operation::Write)
+                .await
+                .map_err(ToolExecutionError::SandboxViolation));
+            match tokio::fs::create_dir_all(&resolved).await {
+                Ok(_) => ToolOutput::Success {
+                    content: format!("created directory {}", params.path),
+                    truncated: false,
+                },
+                Err(e) => ToolOutput::Error {
+                    message: format!("create_dir failed: {e}"),
                     recoverable: true,
                 },
             }
@@ -304,7 +390,10 @@ impl Tool for ListDirTool {
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: ListDirParams = tool_try!(parse_params(call));
-            let resolved = tool_try!(sandbox.resolve_path(&params.path, Operation::Read).await.map_err(ToolExecutionError::SandboxViolation));
+            let resolved = tool_try!(sandbox
+                .resolve_path(&params.path, Operation::Read)
+                .await
+                .map_err(ToolExecutionError::SandboxViolation));
             // Emit paths relative to the workspace root so each entry can be
             // fed straight back into read_file/write_file. The sandbox treats
             // every input path as root-relative, so absolute paths would not
@@ -435,7 +524,10 @@ impl Tool for DeleteFileTool {
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: DeleteFileParams = tool_try!(parse_params(call));
-            let resolved = tool_try!(sandbox.resolve_path(&params.path, Operation::Write).await.map_err(ToolExecutionError::SandboxViolation));
+            let resolved = tool_try!(sandbox
+                .resolve_path(&params.path, Operation::Write)
+                .await
+                .map_err(ToolExecutionError::SandboxViolation));
             match tokio::fs::remove_file(&resolved).await {
                 Ok(_) => ToolOutput::Success {
                     content: format!("deleted {}", params.path),
@@ -464,12 +556,25 @@ impl MoveFileTool {
     pub fn schema() -> ToolSchema {
         ToolSchema {
             name: Self::NAME.into(),
-            description: "Move/rename a file".into(),
+            description: "Move or rename a file. Paths are relative to the \
+                          workspace. Works like `mv`: if `dst` is an existing \
+                          directory the file is moved into it keeping its name; \
+                          otherwise `dst` is the file's new full path (which \
+                          renames it). Missing destination directories are \
+                          created."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "src": {"type": "string"},
-                    "dst": {"type": "string"},
+                    "src": {
+                        "type": "string",
+                        "description": "Path of the file to move.",
+                    },
+                    "dst": {
+                        "type": "string",
+                        "description": "Destination directory to move the file \
+                                        into, or the file's new full path.",
+                    },
                 },
                 "required": ["src", "dst"],
             }),
@@ -499,11 +604,45 @@ impl Tool for MoveFileTool {
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: MoveFileParams = tool_try!(parse_params(call));
-            let src = tool_try!(sandbox.resolve_path(&params.src, Operation::Write).await.map_err(ToolExecutionError::SandboxViolation));
-            let dst = tool_try!(sandbox.resolve_path(&params.dst, Operation::Write).await.map_err(ToolExecutionError::SandboxViolation));
+            let src = tool_try!(sandbox
+                .resolve_path(&params.src, Operation::Write)
+                .await
+                .map_err(ToolExecutionError::SandboxViolation));
+            let dst = tool_try!(sandbox
+                .resolve_path(&params.dst, Operation::Write)
+                .await
+                .map_err(ToolExecutionError::SandboxViolation));
+            // `mv file dir/` semantics: when `dst` names an existing directory,
+            // move INTO it rather than trying to become it. `fs::rename` takes a
+            // full target path and fails with EISDIR against a directory, so
+            // without this the most natural way to say "put this file in that
+            // folder" is exactly the call that cannot work.
+            let (dst, dst_display) = match tokio::fs::metadata(&dst).await {
+                Ok(meta) if meta.is_dir() => match src.file_name() {
+                    Some(name) => {
+                        let display =
+                            format!("{}/{}", params.dst.trim_end_matches('/'), name.display());
+                        (dst.join(name), display)
+                    }
+                    None => (dst, params.dst.clone()),
+                },
+                _ => (dst, params.dst.clone()),
+            };
+            // Like write_file: materialize a not-yet-created destination
+            // directory so moving into a fresh subfolder succeeds.
+            if let Some(parent) = dst.parent() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    return ToolOutput::Error {
+                        message: format!("move failed: cannot create destination directory: {e}"),
+                        recoverable: true,
+                    };
+                }
+            }
             match tokio::fs::rename(&src, &dst).await {
                 Ok(_) => ToolOutput::Success {
-                    content: format!("moved {} -> {}", params.src, params.dst),
+                    // Report where it ACTUALLY landed — when `dst` was a
+                    // directory that is not the path the caller passed.
+                    content: format!("moved {} -> {}", params.src, dst_display),
                     truncated: false,
                 },
                 Err(e) => ToolOutput::Error {
@@ -593,6 +732,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_into_missing_subdirs_creates_them() {
+        use crate::sandbox::{WorkspaceConfig, WorkspaceScopedSandbox};
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(root.clone())).unwrap();
+        let w = WriteFileTool::new()
+            .execute(
+                &call(
+                    "write_file",
+                    json!({"path": "new/sub/file.txt", "content": "hi"}),
+                ),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        assert!(matches!(w, ToolOutput::Success { .. }), "{w:?}");
+        let content = tokio::fs::read_to_string(root.join("new/sub/file.txt"))
+            .await
+            .unwrap();
+        assert_eq!(content, "hi");
+    }
+
+    #[tokio::test]
+    async fn create_dir_creates_nested_directories() {
+        use crate::sandbox::{WorkspaceConfig, WorkspaceScopedSandbox};
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(root.clone())).unwrap();
+        let r = CreateDirTool::new()
+            .execute(
+                &call("create_dir", json!({"path": "images/thumbnails"})),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        assert!(matches!(r, ToolOutput::Success { .. }), "{r:?}");
+        assert!(root.join("images/thumbnails").is_dir());
+        // Idempotent, like mkdir -p.
+        let again = CreateDirTool::new()
+            .execute(
+                &call("create_dir", json!({"path": "images/thumbnails"})),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        assert!(matches!(again, ToolOutput::Success { .. }), "{again:?}");
+    }
+
+    #[tokio::test]
+    async fn create_dir_outside_workspace_is_a_violation() {
+        use crate::sandbox::{WorkspaceConfig, WorkspaceScopedSandbox};
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(root.clone())).unwrap();
+        let r = CreateDirTool::new()
+            .execute(
+                &call("create_dir", json!({"path": "../escaped"})),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        assert!(matches!(r, ToolOutput::SandboxViolation { .. }), "{r:?}");
+        assert!(!root.parent().unwrap().join("escaped").exists());
+    }
+
+    #[tokio::test]
+    async fn move_file_into_missing_subdir_creates_it() {
+        use crate::sandbox::{WorkspaceConfig, WorkspaceScopedSandbox};
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("cat.jpg"), "meow").unwrap();
+        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(root.clone())).unwrap();
+        let r = MoveFileTool::new()
+            .execute(
+                &call(
+                    "move_file",
+                    json!({"src": "cat.jpg", "dst": "images/cat.jpg"}),
+                ),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        assert!(matches!(r, ToolOutput::Success { .. }), "{r:?}");
+        assert!(!root.join("cat.jpg").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("images/cat.jpg")).unwrap(),
+            "meow"
+        );
+    }
+
+    // `mv file dir/` — the idiomatic "put this in that folder". Previously this
+    // reached `fs::rename(file, dir)` and failed with EISDIR, so a model doing
+    // the natural thing got an error it could not act on.
+    #[tokio::test]
+    async fn move_file_into_an_existing_directory_keeps_the_file_name() {
+        use crate::sandbox::{WorkspaceConfig, WorkspaceScopedSandbox};
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("memo.md"), "hi").unwrap();
+        std::fs::create_dir(root.join("Documents")).unwrap();
+        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(root.clone())).unwrap();
+        let r = MoveFileTool::new()
+            .execute(
+                &call("move_file", json!({"src": "memo.md", "dst": "Documents/"})),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        assert!(matches!(r, ToolOutput::Success { .. }), "{r:?}");
+        assert!(!root.join("memo.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("Documents/memo.md")).unwrap(),
+            "hi"
+        );
+        // The report names where it actually landed, not the bare directory.
+        match r {
+            ToolOutput::Success { content, .. } => assert!(
+                content.contains("Documents/memo.md"),
+                "should report the real destination: {content}"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // The exact shape observed in a live trace: the model echoes absolute
+    // workspace paths from its prompt and gives `dst` a trailing slash.
+    #[tokio::test]
+    async fn move_file_into_a_directory_by_absolute_path_with_trailing_slash() {
+        use crate::sandbox::{WorkspaceConfig, WorkspaceScopedSandbox};
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("notes.md"), "body").unwrap();
+        std::fs::create_dir(root.join("Documents")).unwrap();
+        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(root.clone())).unwrap();
+        let r = MoveFileTool::new()
+            .execute(
+                &call(
+                    "move_file",
+                    json!({
+                        "src": root.join("notes.md").display().to_string(),
+                        "dst": format!("{}/", root.join("Documents").display()),
+                    }),
+                ),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        assert!(matches!(r, ToolOutput::Success { .. }), "{r:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("Documents/notes.md")).unwrap(),
+            "body"
+        );
+    }
+
+    // Renaming must still mean renaming: a `dst` that does not exist is the
+    // file's new path, NOT a directory to move into.
+    #[tokio::test]
+    async fn move_file_to_a_nonexistent_dst_still_renames() {
+        use crate::sandbox::{WorkspaceConfig, WorkspaceScopedSandbox};
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("old.md"), "x").unwrap();
+        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(root.clone())).unwrap();
+        let r = MoveFileTool::new()
+            .execute(
+                &call("move_file", json!({"src": "old.md", "dst": "new.md"})),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        assert!(matches!(r, ToolOutput::Success { .. }), "{r:?}");
+        assert!(!root.join("old.md").exists());
+        assert_eq!(std::fs::read_to_string(root.join("new.md")).unwrap(), "x");
+    }
+
+    #[tokio::test]
     async fn write_over_size_cap_is_rejected() {
         use crate::sandbox::{WorkspaceConfig, WorkspaceScopedSandbox};
         let dir = TempDir::new().unwrap();
@@ -605,7 +920,10 @@ mod tests {
         // 9 bytes > 8-byte cap → rejected on the write path.
         let over = WriteFileTool::new()
             .execute(
-                &call("write_file", json!({"path": "big.txt", "content": "123456789"})),
+                &call(
+                    "write_file",
+                    json!({"path": "big.txt", "content": "123456789"}),
+                ),
                 &sb,
                 &test_ctx(),
             )
@@ -620,7 +938,10 @@ mod tests {
         // 8 bytes == cap → allowed; the appended byte (1 byte ≤ cap) is allowed too.
         let ok = WriteFileTool::new()
             .execute(
-                &call("write_file", json!({"path": "ok.txt", "content": "12345678"})),
+                &call(
+                    "write_file",
+                    json!({"path": "ok.txt", "content": "12345678"}),
+                ),
                 &sb,
                 &test_ctx(),
             )

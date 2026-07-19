@@ -228,9 +228,7 @@ impl StandardHarness {
     //      No panic.
     //
     // No `// SPEC QUESTION:` markers — all six decisions are resolved.
-
 }
-
 
 // ── RunStrategy: the Ralph body (#124, moved from strategies.rs) ──
 impl RunStrategy for RalphConfig {

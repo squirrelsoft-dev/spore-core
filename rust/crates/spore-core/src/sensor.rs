@@ -37,9 +37,9 @@
 //!   - The standard impl is in-memory. Production deployments wire in a
 //!     durable history store if cross-process stats are needed.
 
+use crate::sync_util::MutexExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use crate::sync_util::MutexExt;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

@@ -4,9 +4,9 @@ use serde_json::{json, Value};
 
 use crate::harness::{BoxFut, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
-use crate::tools::tool_try;
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::params::{parse_params, HttpGetParams, HttpPostParams};
+use crate::tools::tool_try;
 use crate::tools::{finish_with_possible_truncation, shared_client};
 
 fn apply_headers(

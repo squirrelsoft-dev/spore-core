@@ -984,41 +984,42 @@ impl OllamaModelInterface {
 impl ModelInterface for OllamaModelInterface {
     fn call<'a>(&'a self, request: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
         Box::pin(async move {
-        let meta = self.ensure_model_available().await?;
-        self.guard_tool_support(&request, meta)?;
-        let mut body = build_request(
-            &self.model_id,
-            self.keep_alive.as_deref(),
-            self.num_ctx,
-            &request,
-            false,
-        );
-        if gate_thinking(&mut body, meta) {
-            self.warn_thinking_unsupported_once();
-        }
-        let url = format!("{}/api/chat", self.base_url);
-        let encoded = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
-            code: 0,
-            message: format!("request encode failed: {e}"),
-        })?;
-        let resp = self
-            .http_client
-            .post(&url)
-            .header("content-type", "application/json")
-            .timeout(self.timeout)
-            .body(encoded)
-            .send()
-            .await
-            .map_err(|e| transport_error(e, &self.base_url))?;
-        if !resp.status().is_success() {
-            return Err(map_status_error(resp, &self.model_id).await);
-        }
-        let parsed: OllamaResponse = resp.json().await.map_err(|e| ModelError::ProviderError {
-            code: 0,
-            message: format!("response decode failed: {e}"),
-        })?;
-        let structured = request.params.structured_tool_calls && !request.tools.is_empty();
-        Ok(parse_response(parsed, structured))
+            let meta = self.ensure_model_available().await?;
+            self.guard_tool_support(&request, meta)?;
+            let mut body = build_request(
+                &self.model_id,
+                self.keep_alive.as_deref(),
+                self.num_ctx,
+                &request,
+                false,
+            );
+            if gate_thinking(&mut body, meta) {
+                self.warn_thinking_unsupported_once();
+            }
+            let url = format!("{}/api/chat", self.base_url);
+            let encoded = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
+                code: 0,
+                message: format!("request encode failed: {e}"),
+            })?;
+            let resp = self
+                .http_client
+                .post(&url)
+                .header("content-type", "application/json")
+                .timeout(self.timeout)
+                .body(encoded)
+                .send()
+                .await
+                .map_err(|e| transport_error(e, &self.base_url))?;
+            if !resp.status().is_success() {
+                return Err(map_status_error(resp, &self.model_id).await);
+            }
+            let parsed: OllamaResponse =
+                resp.json().await.map_err(|e| ModelError::ProviderError {
+                    code: 0,
+                    message: format!("response decode failed: {e}"),
+                })?;
+            let structured = request.params.structured_tool_calls && !request.tools.is_empty();
+            Ok(parse_response(parsed, structured))
         })
     }
 
@@ -1027,44 +1028,44 @@ impl ModelInterface for OllamaModelInterface {
         request: ModelRequest,
     ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
         Box::pin(async move {
-        let meta = self.ensure_model_available().await?;
-        self.guard_tool_support(&request, meta)?;
-        let mut body = build_request(
-            &self.model_id,
-            self.keep_alive.as_deref(),
-            self.num_ctx,
-            &request,
-            true,
-        );
-        if gate_thinking(&mut body, meta) {
-            self.warn_thinking_unsupported_once();
-        }
-        let url = format!("{}/api/chat", self.base_url);
-        let encoded = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
-            code: 0,
-            message: format!("request encode failed: {e}"),
-        })?;
-        let base_url = self.base_url.clone();
-        let model_id = self.model_id.clone();
-        // NB: no per-request `.timeout()` here. `reqwest`'s request timeout is a
-        // TOTAL deadline that also covers reading the streamed body, so applying
-        // it would abort a long-but-healthy generation mid-stream — surfacing as
-        // `StreamInterrupted { "stream chunk error: error decoding response
-        // body" }`. Streaming relies on the client `read_timeout` (idle /
-        // per-chunk) and `connect_timeout` from `default_http_client` instead.
-        let resp = self
-            .http_client
-            .post(&url)
-            .header("content-type", "application/json")
-            .body(encoded)
-            .send()
-            .await
-            .map_err(|e| transport_error(e, &base_url))?;
-        if !resp.status().is_success() {
-            return Err(map_status_error(resp, &model_id).await);
-        }
-        let structured = request.params.structured_tool_calls && !request.tools.is_empty();
-        Ok::<ModelStream, ModelError>(Box::pin(ndjson_to_events(resp, structured)))
+            let meta = self.ensure_model_available().await?;
+            self.guard_tool_support(&request, meta)?;
+            let mut body = build_request(
+                &self.model_id,
+                self.keep_alive.as_deref(),
+                self.num_ctx,
+                &request,
+                true,
+            );
+            if gate_thinking(&mut body, meta) {
+                self.warn_thinking_unsupported_once();
+            }
+            let url = format!("{}/api/chat", self.base_url);
+            let encoded = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
+                code: 0,
+                message: format!("request encode failed: {e}"),
+            })?;
+            let base_url = self.base_url.clone();
+            let model_id = self.model_id.clone();
+            // NB: no per-request `.timeout()` here. `reqwest`'s request timeout is a
+            // TOTAL deadline that also covers reading the streamed body, so applying
+            // it would abort a long-but-healthy generation mid-stream — surfacing as
+            // `StreamInterrupted { "stream chunk error: error decoding response
+            // body" }`. Streaming relies on the client `read_timeout` (idle /
+            // per-chunk) and `connect_timeout` from `default_http_client` instead.
+            let resp = self
+                .http_client
+                .post(&url)
+                .header("content-type", "application/json")
+                .body(encoded)
+                .send()
+                .await
+                .map_err(|e| transport_error(e, &base_url))?;
+            if !resp.status().is_success() {
+                return Err(map_status_error(resp, &model_id).await);
+            }
+            let structured = request.params.structured_tool_calls && !request.tools.is_empty();
+            Ok::<ModelStream, ModelError>(Box::pin(ndjson_to_events(resp, structured)))
         })
     }
 
@@ -1073,13 +1074,13 @@ impl ModelInterface for OllamaModelInterface {
         request: &'a ModelRequest,
     ) -> BoxFut<'a, Result<u32, ModelError>> {
         Box::pin(async move {
-        // Try the embed endpoint; fall back to bytes/4 on missing field or
-        // any transport failure. Matches the openai.rs fallback strategy.
-        let text = concat_request_text(request);
-        if let Some(n) = self.try_embed_count(&text).await {
-            return Ok(n);
-        }
-        Ok((text.len() / 4) as u32)
+            // Try the embed endpoint; fall back to bytes/4 on missing field or
+            // any transport failure. Matches the openai.rs fallback strategy.
+            let text = concat_request_text(request);
+            if let Some(n) = self.try_embed_count(&text).await {
+                return Ok(n);
+            }
+            Ok((text.len() / 4) as u32)
         })
     }
 
@@ -1546,11 +1547,7 @@ mod tests {
             CompactionConfig::default(), // context_length: None → falls to provider window
         );
         assert_eq!(mgr.resolve_context_length(), 256_000);
-        let state = mgr.seed_session(
-            SessionId::new("s"),
-            TaskId::new("t"),
-            "do the thing",
-        );
+        let state = mgr.seed_session(SessionId::new("s"), TaskId::new("t"), "do the thing");
         assert_eq!(
             state.window_limit, 256_000,
             "200K conversation won't compact prematurely at 80% of 256K"
@@ -1712,15 +1709,13 @@ mod tests {
         // fail closed (drop `think`) rather than letting Ollama 400. Holds for
         // both the boolean and level forms.
         for params in [
-            {
-                let mut p = crate::model::ModelParams::default();
-                p.reasoning_budget = Some(1024);
-                p
+            crate::model::ModelParams {
+                reasoning_budget: Some(1024),
+                ..Default::default()
             },
-            {
-                let mut p = crate::model::ModelParams::default();
-                p.reasoning_effort = Some(ReasoningEffort::High);
-                p
+            crate::model::ModelParams {
+                reasoning_effort: Some(ReasoningEffort::High),
+                ..Default::default()
             },
         ] {
             let mut r = req(vec![user("hi")]);
@@ -3207,8 +3202,8 @@ mod tests {
                 OLLAMA_THINKING_MODEL (default deepseek-r1:1.5b); optionally set \
                 OLLAMA_THINKING_EFFORT=low|medium|high|max to exercise the level path"]
     async fn ollama_live_thinking() {
-        let model = std::env::var("OLLAMA_THINKING_MODEL")
-            .unwrap_or_else(|_| "deepseek-r1:1.5b".into());
+        let model =
+            std::env::var("OLLAMA_THINKING_MODEL").unwrap_or_else(|_| "deepseek-r1:1.5b".into());
         let mut r = req(vec![user("What is 17 * 23? Think step by step.")]);
         match std::env::var("OLLAMA_THINKING_EFFORT").ok().as_deref() {
             Some("low") => r.params.reasoning_effort = Some(ReasoningEffort::Low),

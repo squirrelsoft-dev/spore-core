@@ -193,6 +193,13 @@ pub enum TurnResult {
         /// `TurnResult`s back-compatible.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning: Option<String>,
+        /// Prose the model emitted alongside the tool calls (progress
+        /// narration, pre-tool commentary). Preserved so the harness records
+        /// it in the session — discarding it loses the narration from the
+        /// transcript AND from the model's own context on later turns.
+        /// `#[serde(default)]` keeps older serialized `TurnResult`s valid.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
     },
     /// The model produced a terminal textual response.
     FinalResponse {
@@ -286,6 +293,7 @@ pub fn classify_response(response: ModelResponse) -> TurnResult {
     } else {
         Some(reasoning_parts.join(""))
     };
+    let prose = text_parts.join("");
 
     match response.stop_reason {
         StopReason::ToolUse => {
@@ -302,6 +310,7 @@ pub fn classify_response(response: ModelResponse) -> TurnResult {
                 calls: tool_calls,
                 usage,
                 reasoning,
+                content: (!prose.is_empty()).then(|| prose.clone()),
             }
         }
         StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
@@ -315,7 +324,7 @@ pub fn classify_response(response: ModelResponse) -> TurnResult {
             //   an `EmptyResponse` error from it would be wrong.
             // - `MaxTokens` / `StopSequence` empties are abnormal/truncated
             //   stops and remain genuinely suspect, so they stay `EmptyResponse`.
-            if text_parts.is_empty() && tool_calls.is_empty() {
+            if prose.is_empty() && tool_calls.is_empty() {
                 return match response.stop_reason {
                     StopReason::EndTurn => TurnResult::FinalResponse {
                         content: String::new(),
@@ -336,10 +345,11 @@ pub fn classify_response(response: ModelResponse) -> TurnResult {
                     calls: tool_calls,
                     usage,
                     reasoning,
+                    content: (!prose.is_empty()).then(|| prose.clone()),
                 };
             }
             TurnResult::FinalResponse {
-                content: text_parts.join(""),
+                content: prose,
                 usage,
                 reasoning,
             }
@@ -732,6 +742,53 @@ mod tests {
         }
     }
 
+    // Prose emitted alongside tool calls (progress narration) is preserved on
+    // the classification — dropping it loses the agent's running account from
+    // both the transcript and the model's own later context.
+    #[tokio::test]
+    async fn tool_call_requested_keeps_accompanying_prose() {
+        let m = Arc::new(MockModelInterface::new(provider()));
+        m.push_response(Ok(ModelResponse {
+            content: vec![
+                ContentBlock::Text {
+                    text: "Let me look at the file first.".into(),
+                },
+                ContentBlock::ToolUse(ToolCall {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "/x"}),
+                }),
+            ],
+            usage: usage(5, 6),
+            stop_reason: StopReason::ToolUse,
+        }));
+        let agent = make_agent(m);
+        match agent.turn(ctx_user("read /x")).await {
+            TurnResult::ToolCallRequested { calls, content, .. } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(content.as_deref(), Some("Let me look at the file first."));
+            }
+            other => panic!("expected ToolCallRequested, got {other:?}"),
+        }
+    }
+
+    // A pure tool-call turn (no prose) classifies with `content: None` — no
+    // empty-string assistant messages downstream.
+    #[tokio::test]
+    async fn tool_call_requested_without_prose_has_no_content() {
+        let m = Arc::new(MockModelInterface::new(provider()));
+        m.push_response(Ok(tool_resp(vec![ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            input: serde_json::json!({"path": "/x"}),
+        }])));
+        let agent = make_agent(m);
+        match agent.turn(ctx_user("read /x")).await {
+            TurnResult::ToolCallRequested { content, .. } => assert_eq!(content, None),
+            other => panic!("expected ToolCallRequested, got {other:?}"),
+        }
+    }
+
     // Rule: ToolCallRequested may carry multiple parallel tool calls.
     #[tokio::test]
     async fn tool_call_requested_carries_multiple_calls() {
@@ -952,6 +1009,7 @@ mod tests {
     #[test]
     fn turn_result_roundtrips_json() {
         let r = TurnResult::ToolCallRequested {
+            content: None,
             reasoning: None,
             calls: vec![ToolCall {
                 id: "1".into(),

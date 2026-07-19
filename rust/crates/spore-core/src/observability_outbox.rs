@@ -75,12 +75,12 @@
 //! Tempo stack or network. This isolates the version-churny OTLP SDK surface
 //! from the reliability-critical outbox and lets the tests run hermetically.
 
+use crate::sync_util::MutexExt;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use crate::sync_util::MutexExt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -1692,11 +1692,15 @@ mod tests {
             role: GenAiRole::Assistant,
             content: "all done".into(),
             truncated: false,
+            tool_call_id: None,
+            tool_calls: None,
+            is_error: None,
         });
         t.tool_calls = Some(vec![ToolCallContent {
             name: "shell".into(),
             arguments: serde_json::json!({"command": "ls"}),
             arguments_truncated: false,
+            id: Some("call-1".into()),
         }]);
         obs.emit_turn(t);
         let l = &read_lines(tmp.path(), "s1")[0];
@@ -1706,6 +1710,12 @@ mod tests {
         assert_eq!(
             l["attributes"]["gen_ai.response.tool_calls"][0]["name"],
             "shell"
+        );
+        // The id must survive onto the wire attribute — it is the join key a
+        // later tool message's `tool_call_id` points back to.
+        assert_eq!(
+            l["attributes"]["gen_ai.response.tool_calls"][0]["id"],
+            "call-1"
         );
     }
 
@@ -1730,6 +1740,7 @@ mod tests {
             name: "shell".into(),
             arguments: serde_json::json!({"command": "ls"}),
             arguments_truncated: false,
+            id: Some("c1".into()),
         });
         span.result = Some(ToolResultContent {
             content: "file.txt".into(),
@@ -1759,11 +1770,15 @@ mod tests {
             role: GenAiRole::Assistant,
             content: "hi".into(),
             truncated: false,
+            tool_call_id: None,
+            tool_calls: None,
+            is_error: None,
         });
         t.tool_calls = Some(vec![ToolCallContent {
             name: "shell".into(),
             arguments: serde_json::json!({"command": "ls"}),
             arguments_truncated: false,
+            id: Some("c1".into()),
         }]);
         let line = TraceLine::from_turn(&t, "0af7651916cd43dd8448eb211c80319c");
         let events = emit_genai_events(&line);
@@ -1784,6 +1799,7 @@ mod tests {
                 name: "shell".into(),
                 arguments: serde_json::json!({"command": "ls"}),
                 arguments_truncated: false,
+                id: Some("c1".into()),
             }),
             result: Some(ToolResultContent {
                 content: "file.txt".into(),
@@ -1812,21 +1828,38 @@ mod tests {
                 role: GenAiRole::System,
                 content: "sys".into(),
                 truncated: false,
+                tool_call_id: None,
+                tool_calls: None,
+                is_error: None,
             },
             GenAiMessage {
                 role: GenAiRole::User,
                 content: "hi".into(),
                 truncated: false,
+                tool_call_id: None,
+                tool_calls: None,
+                is_error: None,
             },
             GenAiMessage {
                 role: GenAiRole::Assistant,
                 content: "shell {\"command\":\"ls\"}".into(),
                 truncated: false,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCallContent {
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "ls"}),
+                    arguments_truncated: false,
+                    id: Some("call-1".into()),
+                }]),
+                is_error: None,
             },
             GenAiMessage {
                 role: GenAiRole::Tool,
                 content: "file.txt".into(),
                 truncated: false,
+                tool_call_id: Some("call-1".into()),
+                tool_calls: None,
+                is_error: Some(false),
             },
         ]);
         obs.emit_turn(t);
@@ -1839,6 +1872,14 @@ mod tests {
         assert_eq!(prompt[2]["role"], "assistant");
         assert_eq!(prompt[3]["role"], "tool");
         assert_eq!(prompt[3]["content"], "file.txt");
+        // The linkage a loop investigation actually needs: the tool result names
+        // the call it answers, and that id matches the assistant's request. Both
+        // survive the rendered-string flattening.
+        assert_eq!(prompt[2]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(prompt[3]["tool_call_id"], "call-1");
+        assert_eq!(prompt[3]["is_error"], false);
+        // Plain messages stay clean — no empty linkage keys.
+        assert!(!prompt[1].as_object().unwrap().contains_key("tool_call_id"));
     }
 
     /// Guard OFF: a turn with no captured content carries no `gen_ai.prompt`.
@@ -1862,22 +1903,34 @@ mod tests {
                 role: GenAiRole::System,
                 content: "sys".into(),
                 truncated: false,
+                tool_call_id: None,
+                tool_calls: None,
+                is_error: None,
             },
             GenAiMessage {
                 role: GenAiRole::User,
                 content: "hi".into(),
                 truncated: false,
+                tool_call_id: None,
+                tool_calls: None,
+                is_error: None,
             },
             GenAiMessage {
                 role: GenAiRole::Tool,
                 content: "res".into(),
                 truncated: false,
+                tool_call_id: Some("call-1".into()),
+                tool_calls: None,
+                is_error: Some(false),
             },
         ]);
         t.output_text = Some(GenAiMessage {
             role: GenAiRole::Assistant,
             content: "done".into(),
             truncated: false,
+            tool_call_id: None,
+            tool_calls: None,
+            is_error: None,
         });
         let line = TraceLine::from_turn(&t, "0af7651916cd43dd8448eb211c80319c");
         let events = emit_genai_events(&line);

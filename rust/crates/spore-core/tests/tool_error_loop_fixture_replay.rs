@@ -76,6 +76,7 @@ async fn tool_error_loop_breaker_hard_stops_at_two_n() {
         error_loop_threshold: 3,
         plan_empty_max_retries: 0,
         tool_call_nudge: false,
+        steering_source: None,
         tool_search: None,
         enforce_output_schemas: false,
         output_schema_max_retries: 2,

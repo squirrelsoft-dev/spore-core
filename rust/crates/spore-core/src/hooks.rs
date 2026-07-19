@@ -95,8 +95,8 @@
 //! `OnPlanCreated`, `OnTaskAdvance`, `OnSubagentSpawn`, `OnSubagentComplete`.
 //! Each has a `fire_*` method that is exercised directly by unit tests.
 
-use std::sync::{Arc, Mutex};
 use crate::sync_util::MutexExt;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -860,9 +860,7 @@ impl HookChain for StandardHookChain {
                 });
             }
         }
-        self.entries
-            .lock_recover()
-            .push(Entry { hook });
+        self.entries.lock_recover().push(Entry { hook });
         Ok(())
     }
 
@@ -941,9 +939,8 @@ where
 // FunctionHook — inline closure handler
 // ============================================================================
 
-type HookFn = dyn for<'c, 'd> Fn(&'c mut HookContext<'d>) -> Result<HookDecision, HookError>
-    + Send
-    + Sync;
+type HookFn =
+    dyn for<'c, 'd> Fn(&'c mut HookContext<'d>) -> Result<HookDecision, HookError> + Send + Sync;
 
 /// A [`Hook`] backed by an inline closure. The primary handler type for harness
 /// builders (R23). The closure runs synchronously inside `handle`.

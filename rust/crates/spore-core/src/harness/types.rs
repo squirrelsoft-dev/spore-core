@@ -18,7 +18,6 @@ impl RunResult {
     }
 }
 
-
 /// Lightweight placeholder for an alternate planner model selection. Full
 /// shape lives wherever provider routing lands.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -826,7 +825,6 @@ pub struct SessionState {
     #[serde(default)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
-
 
 /// Head+tail-truncated output. `full_ref` is `Some` when the sandbox offloads
 /// the original content to a backing file.

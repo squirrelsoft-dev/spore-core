@@ -1140,7 +1140,11 @@ impl ToolSearchRegistry {
             if tools.is_empty() {
                 continue;
             }
-            namespaces.push(ToolNamespace { name: ns.name.clone(), description: ns.description.clone(), tools });
+            namespaces.push(ToolNamespace {
+                name: ns.name.clone(),
+                description: ns.description.clone(),
+                tools,
+            });
         }
         let namespace_headers = namespaces.iter().map(Self::header_schema).collect();
         let search_schema = Self::build_search_schema(&config.search_tool_name);
@@ -1268,7 +1272,10 @@ impl ToolSearchRegistry {
         }
         self.load_and_list(
             &hits,
-            format!("Loaded {} tool(s) for \"{query}\". You can now call them directly:", hits.len()),
+            format!(
+                "Loaded {} tool(s) for \"{query}\". You can now call them directly:",
+                hits.len()
+            ),
         )
     }
 
@@ -1305,8 +1312,11 @@ impl ToolSearchRegistry {
         for name in names.iter().rev() {
             self.touch(name);
         }
-        let by_name: std::collections::HashMap<&str, &ModelToolSchema> =
-            self.catalogue.iter().map(|s| (s.name.as_str(), s)).collect();
+        let by_name: std::collections::HashMap<&str, &ModelToolSchema> = self
+            .catalogue
+            .iter()
+            .map(|s| (s.name.as_str(), s))
+            .collect();
         let mut lines = vec![header];
         for name in names {
             if let Some(s) = by_name.get(name.as_str()) {
@@ -1353,8 +1363,11 @@ impl HarnessToolRegistry for ToolSearchRegistry {
     }
 
     fn schemas(&self) -> Vec<ModelToolSchema> {
-        let by_name: std::collections::HashMap<&str, &ModelToolSchema> =
-            self.catalogue.iter().map(|s| (s.name.as_str(), s)).collect();
+        let by_name: std::collections::HashMap<&str, &ModelToolSchema> = self
+            .catalogue
+            .iter()
+            .map(|s| (s.name.as_str(), s))
+            .collect();
         let mut out: Vec<ModelToolSchema> = Vec::new();
         let mut used: usize = 0;
         // Core tools — always advertised.
@@ -1982,10 +1995,7 @@ mod tool_search_tests {
 
     impl HarnessToolRegistry for FixedInner {
         fn dispatch<'a>(&'a self, call: ToolCall) -> BoxFut<'a, ToolOutput> {
-            self.dispatched
-                .lock()
-                .unwrap()
-                .push(call.name.clone());
+            self.dispatched.lock().unwrap().push(call.name.clone());
             Box::pin(async move { ToolOutput::success(format!("ran {}", call.name)) })
         }
         fn schemas(&self) -> Vec<ModelToolSchema> {
@@ -2019,7 +2029,10 @@ mod tool_search_tests {
             tool("read_file", "Read a file's contents from the workspace."),
             tool("write_file", "Create or overwrite a file in the workspace."),
             tool("bash_command", "Run a shell command in the workspace."),
-            tool("web_search", "Search the web for information via a backend."),
+            tool(
+                "web_search",
+                "Search the web for information via a backend.",
+            ),
             tool("task_list", "Author and update the structured task DAG."),
             tool("todo_write", "Persist a lightweight todo checklist."),
         ]);
@@ -2056,7 +2069,10 @@ mod tool_search_tests {
             ToolSearchConfig::new(["read_file", "does_not_exist"]),
         );
         let advertised = names(&reg.schemas());
-        assert_eq!(advertised, vec!["read_file".to_string(), "tool_search".to_string()]);
+        assert_eq!(
+            advertised,
+            vec!["read_file".to_string(), "tool_search".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -2067,7 +2083,10 @@ mod tool_search_tests {
             .await;
         match out {
             ToolOutput::Success { content, .. } => {
-                assert!(content.contains("web_search"), "result lists the match: {content}");
+                assert!(
+                    content.contains("web_search"),
+                    "result lists the match: {content}"
+                );
             }
             other => panic!("expected success, got {other:?}"),
         }
@@ -2092,14 +2111,23 @@ mod tool_search_tests {
         let out = reg
             .dispatch(tcall("tool_search", json!({"query": "   "})))
             .await;
-        assert!(matches!(out, ToolOutput::Error { recoverable: true, .. }));
+        assert!(matches!(
+            out,
+            ToolOutput::Error {
+                recoverable: true,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
     async fn no_matches_reports_cleanly_without_loading() {
         let reg = fixture();
         let out = reg
-            .dispatch(tcall("tool_search", json!({"query": "quantum teleportation"})))
+            .dispatch(tcall(
+                "tool_search",
+                json!({"query": "quantum teleportation"}),
+            ))
             .await;
         assert!(matches!(out, ToolOutput::Success { .. }));
         // Nothing new loaded.
@@ -2119,9 +2147,14 @@ mod tool_search_tests {
         assert!(matches!(out, ToolOutput::Success { .. }));
         // A deferred, never-searched tool STILL dispatches (exposure is a hint,
         // not a hard gate) and gets kept warm afterwards.
-        let out = reg.dispatch(tcall("web_search", json!({"query": "x"}))).await;
+        let out = reg
+            .dispatch(tcall("web_search", json!({"query": "x"})))
+            .await;
         assert!(matches!(out, ToolOutput::Success { .. }));
-        assert_eq!(*inner.dispatched.lock().unwrap(), vec!["read_file", "web_search"]);
+        assert_eq!(
+            *inner.dispatched.lock().unwrap(),
+            vec!["read_file", "web_search"]
+        );
         // web_search is now advertised (it was touched on dispatch).
         assert!(names(&reg.schemas()).contains(&"web_search".to_string()));
     }
@@ -2144,13 +2177,21 @@ mod tool_search_tests {
                 .description_budget(search_desc_len + 10)
                 .search_top_k(5),
         );
-        reg.dispatch(tcall("tool_search", json!({"query": "alpha"}))).await;
-        reg.dispatch(tcall("tool_search", json!({"query": "bravo"}))).await;
+        reg.dispatch(tcall("tool_search", json!({"query": "alpha"})))
+            .await;
+        reg.dispatch(tcall("tool_search", json!({"query": "bravo"})))
+            .await;
         // Only one deferred tool fits; bravo was loaded most recently, so alpha is
         // evicted.
         let advertised = names(&reg.schemas());
-        assert!(advertised.contains(&"bravo".to_string()), "MRU kept: {advertised:?}");
-        assert!(!advertised.contains(&"alpha".to_string()), "LRU evicted: {advertised:?}");
+        assert!(
+            advertised.contains(&"bravo".to_string()),
+            "MRU kept: {advertised:?}"
+        );
+        assert!(
+            !advertised.contains(&"alpha".to_string()),
+            "LRU evicted: {advertised:?}"
+        );
         assert!(reg.advertised_description_bytes() <= search_desc_len + 10);
     }
 
@@ -2167,7 +2208,10 @@ mod tool_search_tests {
             .filter(|t| t.schema.name != "memory")
             .map(|t| t.schema.to_model_schema())
             .collect();
-        let full_bytes: usize = coding_minus_memory.iter().map(|s| s.description.len()).sum();
+        let full_bytes: usize = coding_minus_memory
+            .iter()
+            .map(|s| s.description.len())
+            .sum();
 
         let core = [
             "read_file",
@@ -2224,7 +2268,10 @@ mod tool_search_tests {
         let inner = FixedInner::new(vec![
             tool("read_file", "Read a file's contents from the workspace."),
             tool("web_fetch", "Fetch the contents of a URL over HTTP."),
-            tool("web_search", "Search the web for information via a backend."),
+            tool(
+                "web_search",
+                "Search the web for information via a backend.",
+            ),
             tool("task_list", "Author and update the structured task DAG."),
         ]);
         ToolSearchRegistry::new(
@@ -2245,7 +2292,10 @@ mod tool_search_tests {
         let reg = ns_fixture();
         let advertised = names(&reg.schemas());
         // Header + core + search tool; standalone deferred task_list hidden.
-        assert!(advertised.contains(&"web".to_string()), "header advertised: {advertised:?}");
+        assert!(
+            advertised.contains(&"web".to_string()),
+            "header advertised: {advertised:?}"
+        );
         assert!(advertised.contains(&"read_file".to_string()));
         assert!(advertised.contains(&"tool_search".to_string()));
         // Members and the standalone deferred tool are NOT advertised yet.
@@ -2298,9 +2348,13 @@ mod tool_search_tests {
     #[tokio::test]
     async fn namespace_members_are_still_findable_via_search() {
         let reg = ns_fixture();
-        reg.dispatch(tcall("tool_search", json!({"query": "fetch url web"}))).await;
+        reg.dispatch(tcall("tool_search", json!({"query": "fetch url web"})))
+            .await;
         let advertised = names(&reg.schemas());
-        assert!(advertised.contains(&"web_fetch".to_string()), "search finds namespaced tool");
+        assert!(
+            advertised.contains(&"web_fetch".to_string()),
+            "search finds namespaced tool"
+        );
     }
 
     #[tokio::test]
@@ -2336,7 +2390,13 @@ mod tool_search_tests {
             )),
         );
         let advertised = names(&reg.schemas());
-        assert!(!advertised.contains(&"empty".to_string()), "empty namespace dropped: {advertised:?}");
-        assert_eq!(advertised, vec!["read_file".to_string(), "tool_search".to_string()]);
+        assert!(
+            !advertised.contains(&"empty".to_string()),
+            "empty namespace dropped: {advertised:?}"
+        );
+        assert_eq!(
+            advertised,
+            vec!["read_file".to_string(), "tool_search".to_string()]
+        );
     }
 }

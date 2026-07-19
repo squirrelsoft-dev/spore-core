@@ -883,18 +883,15 @@ mod tests {
     }
 
     impl ModelInterface for FakeModel {
-        fn call<'a>(
-            &'a self,
-            _req: ModelRequest,
-        ) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
+        fn call<'a>(&'a self, _req: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
             Box::pin(async move {
-            Ok(ModelResponse {
-                content: vec![MCB::Text {
-                    text: self.text.clone(),
-                }],
-                stop_reason: StopReason::EndTurn,
-                usage: TokenUsage::default(),
-            })
+                Ok(ModelResponse {
+                    content: vec![MCB::Text {
+                        text: self.text.clone(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                })
             })
         }
 

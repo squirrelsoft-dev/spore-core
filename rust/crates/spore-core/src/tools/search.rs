@@ -6,13 +6,13 @@ use serde_json::json;
 
 use crate::harness::{BoxFut, Operation, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
-use crate::tools::tool_try;
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::error::ToolExecutionError;
 use crate::tools::finish_with_possible_truncation;
 use crate::tools::params::{
     parse_params, FindFilesParams, GrepFilesParams, GrepOutputMode, GrepParams,
 };
+use crate::tools::tool_try;
 
 // ============================================================================
 // GrepFiles
@@ -184,7 +184,10 @@ impl Tool for GrepFilesTool {
                     .into()
                 }
             };
-            let root = tool_try!(sandbox.resolve_path(&params.path, Operation::Read).await.map_err(ToolExecutionError::SandboxViolation));
+            let root = tool_try!(sandbox
+                .resolve_path(&params.path, Operation::Read)
+                .await
+                .map_err(ToolExecutionError::SandboxViolation));
             let mut matches = collect_matches(&root, &re, params.recursive);
             matches.sort_by(|a, b| (a.0.as_str(), a.1).cmp(&(b.0.as_str(), b.1)));
             let body = matches
@@ -249,7 +252,10 @@ impl Tool for FindFilesTool {
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: FindFilesParams = tool_try!(parse_params(call));
-            let root = tool_try!(sandbox.resolve_path(&params.path, Operation::Read).await.map_err(ToolExecutionError::SandboxViolation));
+            let root = tool_try!(sandbox
+                .resolve_path(&params.path, Operation::Read)
+                .await
+                .map_err(ToolExecutionError::SandboxViolation));
             let pattern = root.join(&params.glob).display().to_string();
             let mut entries: Vec<String> = Vec::new();
             match glob::glob(&pattern) {
@@ -348,7 +354,10 @@ impl Tool for GrepTool {
                     .into()
                 }
             };
-            let root = tool_try!(sandbox.resolve_path(&params.path, Operation::Read).await.map_err(ToolExecutionError::SandboxViolation));
+            let root = tool_try!(sandbox
+                .resolve_path(&params.path, Operation::Read)
+                .await
+                .map_err(ToolExecutionError::SandboxViolation));
 
             // When context_lines > 0 and output_mode is Content, we need per-file
             // full-line access to build the context windows. Collect files first.

@@ -205,7 +205,6 @@ impl StandardHarness {
     // No `// SPEC QUESTION:` markers — B1–B4 are resolved.
 }
 
-
 // ── RunStrategy: the SelfVerifying body (#124, moved from strategies.rs) ──
 impl RunStrategy for SelfVerifyingConfig {
     /// SelfVerifying (#124): GENUINELY recursive build↔evaluate loop. Each

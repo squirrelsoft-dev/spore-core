@@ -1323,13 +1323,13 @@ mod tests {
             _req: crate::model::ModelRequest,
         ) -> BoxFut<'a, Result<crate::model::ModelResponse, crate::model::ModelError>> {
             Box::pin(async move {
-            Ok(crate::model::ModelResponse {
-                content: vec![crate::model::ContentBlock::Text {
-                    text: self.verdict.clone(),
-                }],
-                stop_reason: crate::model::StopReason::EndTurn,
-                usage: crate::model::TokenUsage::default(),
-            })
+                Ok(crate::model::ModelResponse {
+                    content: vec![crate::model::ContentBlock::Text {
+                        text: self.verdict.clone(),
+                    }],
+                    stop_reason: crate::model::StopReason::EndTurn,
+                    usage: crate::model::TokenUsage::default(),
+                })
             })
         }
         fn call_streaming<'a>(
@@ -1337,7 +1337,7 @@ mod tests {
             _req: crate::model::ModelRequest,
         ) -> BoxFut<'a, Result<crate::model::ModelStream, crate::model::ModelError>> {
             Box::pin(async move {
-            unreachable!("StubJudge::call_streaming is not used by QuestionAnsweredCheck")
+                unreachable!("StubJudge::call_streaming is not used by QuestionAnsweredCheck")
             })
         }
         fn count_tokens<'a>(

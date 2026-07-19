@@ -28,12 +28,12 @@ use serde_json::json;
 
 use crate::harness::{BoxFut, Operation, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
-use crate::tools::tool_try;
 use crate::text_util::{ceil_char_boundary, floor_char_boundary};
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::error::ToolExecutionError;
 use crate::tools::finish_with_possible_truncation;
 use crate::tools::params::{parse_params, ExecParams, RunTestsParams, ShellCommandParams};
+use crate::tools::tool_try;
 
 // ============================================================================
 // Exec — shell-free: run one program directly

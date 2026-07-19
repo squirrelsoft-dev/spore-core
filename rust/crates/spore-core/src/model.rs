@@ -361,7 +361,8 @@ pub trait ModelInterface: Send + Sync {
 
     /// Pre-call token count for context-size estimation. Used by the harness
     /// to detect `ContextLimitExceeded` before contacting the provider.
-    fn count_tokens<'a>(&'a self, request: &'a ModelRequest) -> BoxFut<'a, Result<u32, ModelError>>;
+    fn count_tokens<'a>(&'a self, request: &'a ModelRequest)
+        -> BoxFut<'a, Result<u32, ModelError>>;
 
     /// Provider identity for tracing and routing decisions.
     fn provider(&self) -> ProviderInfo;
@@ -386,7 +387,10 @@ impl<T: ModelInterface + ?Sized> ModelInterface for Arc<T> {
         (**self).call_streaming(request)
     }
 
-    fn count_tokens<'a>(&'a self, request: &'a ModelRequest) -> BoxFut<'a, Result<u32, ModelError>> {
+    fn count_tokens<'a>(
+        &'a self,
+        request: &'a ModelRequest,
+    ) -> BoxFut<'a, Result<u32, ModelError>> {
         (**self).count_tokens(request)
     }
 
@@ -657,32 +661,32 @@ impl ReplayModelInterface {
 impl ModelInterface for ReplayModelInterface {
     fn call<'a>(&'a self, request: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
         Box::pin(async move {
-        match self.mode {
-            ReplayMode::HashMatched => {
-                let want = request_hash(&request);
-                let exchange = self
-                    .exchanges
-                    .iter()
-                    .find(|e| e.request_hash.as_deref() == Some(want.as_str()))
-                    .ok_or_else(|| ModelError::ProviderError {
-                        code: 0,
-                        message: format!("no matching fixture for request_hash={want}"),
-                    })?;
-                Ok(exchange.response.clone())
+            match self.mode {
+                ReplayMode::HashMatched => {
+                    let want = request_hash(&request);
+                    let exchange = self
+                        .exchanges
+                        .iter()
+                        .find(|e| e.request_hash.as_deref() == Some(want.as_str()))
+                        .ok_or_else(|| ModelError::ProviderError {
+                            code: 0,
+                            message: format!("no matching fixture for request_hash={want}"),
+                        })?;
+                    Ok(exchange.response.clone())
+                }
+                ReplayMode::Positional => {
+                    let mut cursor = self.cursor.lock().await;
+                    let exchange =
+                        self.exchanges
+                            .get(*cursor)
+                            .ok_or(ModelError::ProviderError {
+                                code: 0,
+                                message: "replay exhausted: no more recorded exchanges".into(),
+                            })?;
+                    *cursor += 1;
+                    Ok(exchange.response.clone())
+                }
             }
-            ReplayMode::Positional => {
-                let mut cursor = self.cursor.lock().await;
-                let exchange = self
-                    .exchanges
-                    .get(*cursor)
-                    .ok_or(ModelError::ProviderError {
-                        code: 0,
-                        message: "replay exhausted: no more recorded exchanges".into(),
-                    })?;
-                *cursor += 1;
-                Ok(exchange.response.clone())
-            }
-        }
         })
     }
 
@@ -691,36 +695,36 @@ impl ModelInterface for ReplayModelInterface {
         request: ModelRequest,
     ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
         Box::pin(async move {
-        let response = self.call(request).await?;
-        let stream = async_stream::stream! {
-            yield Ok(StreamEvent::MessageStart);
-            for (i, block) in response.content.iter().enumerate() {
-                let idx = i as u32;
-                match block {
-                    ContentBlock::Text { text } => {
-                        yield Ok(StreamEvent::ContentBlockDelta { index: idx, delta: text.clone() });
+            let response = self.call(request).await?;
+            let stream = async_stream::stream! {
+                yield Ok(StreamEvent::MessageStart);
+                for (i, block) in response.content.iter().enumerate() {
+                    let idx = i as u32;
+                    match block {
+                        ContentBlock::Text { text } => {
+                            yield Ok(StreamEvent::ContentBlockDelta { index: idx, delta: text.clone() });
+                        }
+                        ContentBlock::Thinking { text } => {
+                            yield Ok(StreamEvent::ThinkingDelta { index: idx, delta: text.clone() });
+                        }
+                        ContentBlock::ToolUse(call) => {
+                            let json = serde_json::to_string(&call.input).unwrap_or_else(|_| "{}".into());
+                            yield Ok(StreamEvent::ToolUseStart {
+                                index: idx,
+                                id: call.id.clone(),
+                                name: call.name.clone(),
+                            });
+                            yield Ok(StreamEvent::ToolUseDelta { index: idx, partial_json: json });
+                        }
                     }
-                    ContentBlock::Thinking { text } => {
-                        yield Ok(StreamEvent::ThinkingDelta { index: idx, delta: text.clone() });
-                    }
-                    ContentBlock::ToolUse(call) => {
-                        let json = serde_json::to_string(&call.input).unwrap_or_else(|_| "{}".into());
-                        yield Ok(StreamEvent::ToolUseStart {
-                            index: idx,
-                            id: call.id.clone(),
-                            name: call.name.clone(),
-                        });
-                        yield Ok(StreamEvent::ToolUseDelta { index: idx, partial_json: json });
-                    }
+                    yield Ok(StreamEvent::ContentBlockStop { index: idx });
                 }
-                yield Ok(StreamEvent::ContentBlockStop { index: idx });
-            }
-            yield Ok(StreamEvent::MessageStop {
-                usage: response.usage,
-                stop_reason: response.stop_reason,
-            });
-        };
-        Ok::<ModelStream, ModelError>(Box::pin(stream))
+                yield Ok(StreamEvent::MessageStop {
+                    usage: response.usage,
+                    stop_reason: response.stop_reason,
+                });
+            };
+            Ok::<ModelStream, ModelError>(Box::pin(stream))
         })
     }
 
@@ -729,22 +733,22 @@ impl ModelInterface for ReplayModelInterface {
         request: &'a ModelRequest,
     ) -> BoxFut<'a, Result<u32, ModelError>> {
         Box::pin(async move {
-        // When the fixture was recorded by RecordingModelInterface against a
-        // real provider, the recorded response's `usage.input_tokens` carries
-        // the provider's exact count. Use that whenever we can match by hash;
-        // fall back to the bytes/4 heuristic only when no matching entry
-        // exists (positional fixtures or unrecorded requests).
-        if self.mode == ReplayMode::HashMatched {
-            let want = request_hash(request);
-            if let Some(e) = self
-                .exchanges
-                .iter()
-                .find(|e| e.request_hash.as_deref() == Some(want.as_str()))
-            {
-                return Ok(e.response.usage.input_tokens);
+            // When the fixture was recorded by RecordingModelInterface against a
+            // real provider, the recorded response's `usage.input_tokens` carries
+            // the provider's exact count. Use that whenever we can match by hash;
+            // fall back to the bytes/4 heuristic only when no matching entry
+            // exists (positional fixtures or unrecorded requests).
+            if self.mode == ReplayMode::HashMatched {
+                let want = request_hash(request);
+                if let Some(e) = self
+                    .exchanges
+                    .iter()
+                    .find(|e| e.request_hash.as_deref() == Some(want.as_str()))
+                {
+                    return Ok(e.response.usage.input_tokens);
+                }
             }
-        }
-        Ok(estimate_tokens(request)) // ~4 chars/token rule-of-thumb (fallback)
+            Ok(estimate_tokens(request)) // ~4 chars/token rule-of-thumb (fallback)
         })
     }
 
@@ -857,16 +861,16 @@ impl<M: ModelInterface + 'static> RecordingModelInterface<M> {
 impl<M: ModelInterface + 'static> ModelInterface for RecordingModelInterface<M> {
     fn call<'a>(&'a self, request: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
         Box::pin(async move {
-        let start = std::time::Instant::now();
-        let response = self.inner.call(request.clone()).await?;
-        let duration_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        if let Err(e) = self.record(&request, &response, duration_ms).await {
-            return Err(ModelError::ProviderError {
-                code: 0,
-                message: format!("recorder write failed: {e}"),
-            });
-        }
-        Ok(response)
+            let start = std::time::Instant::now();
+            let response = self.inner.call(request.clone()).await?;
+            let duration_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            if let Err(e) = self.record(&request, &response, duration_ms).await {
+                return Err(ModelError::ProviderError {
+                    code: 0,
+                    message: format!("recorder write failed: {e}"),
+                });
+            }
+            Ok(response)
         })
     }
 
@@ -875,9 +879,9 @@ impl<M: ModelInterface + 'static> ModelInterface for RecordingModelInterface<M> 
         request: ModelRequest,
     ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
         Box::pin(async move {
-        // Streaming recording is not implemented: spec only requires the
-        // blocking `call()` pair to be recorded. Pass through unchanged.
-        self.inner.call_streaming(request).await
+            // Streaming recording is not implemented: spec only requires the
+            // blocking `call()` pair to be recorded. Pass through unchanged.
+            self.inner.call_streaming(request).await
         })
     }
 
@@ -938,16 +942,14 @@ pub mod mock {
             _request: ModelRequest,
         ) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
             Box::pin(async move {
-            self.call_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(Err(ModelError::ProviderError {
-                    code: 0,
-                    message: "mock: no response queued".into(),
-                }))
+                self.call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.responses.lock().unwrap().pop_front().unwrap_or(Err(
+                    ModelError::ProviderError {
+                        code: 0,
+                        message: "mock: no response queued".into(),
+                    },
+                ))
             })
         }
 
@@ -956,15 +958,15 @@ pub mod mock {
             request: ModelRequest,
         ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
             Box::pin(async move {
-            let response = self.call(request).await?;
-            let stream = async_stream::stream! {
-                yield Ok(StreamEvent::MessageStart);
-                yield Ok(StreamEvent::MessageStop {
-                    usage: response.usage,
-                    stop_reason: response.stop_reason,
-                });
-            };
-            Ok::<ModelStream, ModelError>(Box::pin(stream))
+                let response = self.call(request).await?;
+                let stream = async_stream::stream! {
+                    yield Ok(StreamEvent::MessageStart);
+                    yield Ok(StreamEvent::MessageStop {
+                        usage: response.usage,
+                        stop_reason: response.stop_reason,
+                    });
+                };
+                Ok::<ModelStream, ModelError>(Box::pin(stream))
             })
         }
 
@@ -973,11 +975,11 @@ pub mod mock {
             _request: &'a ModelRequest,
         ) -> BoxFut<'a, Result<u32, ModelError>> {
             Box::pin(async move {
-            self.token_counts
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(Ok(0))
+                self.token_counts
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Ok(0))
             })
         }
 
@@ -1001,8 +1003,14 @@ mod tests {
     fn retryable_classifies_transient_vs_deterministic() {
         // SC-3: transport drops, mid-stream interruptions, timeouts and rate
         // limits are transient; provider/context/budget errors are deterministic.
-        assert!(ModelError::Transport { message: "x".into() }.retryable());
-        assert!(ModelError::StreamInterrupted { message: "x".into() }.retryable());
+        assert!(ModelError::Transport {
+            message: "x".into()
+        }
+        .retryable());
+        assert!(ModelError::StreamInterrupted {
+            message: "x".into()
+        }
+        .retryable());
         assert!(ModelError::Timeout.retryable());
         assert!(ModelError::RateLimited { retry_after: None }.retryable());
         assert!(!ModelError::ProviderError {

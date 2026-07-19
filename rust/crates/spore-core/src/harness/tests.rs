@@ -1,4 +1,3 @@
-
 use super::testing::*;
 use super::*;
 use crate::agent::{mock::MockAgent, AgentId};
@@ -427,6 +426,7 @@ async fn steering_message_injects_at_turn_boundary() {
 
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c1".into(),
@@ -505,6 +505,7 @@ async fn steering_message_injects_at_turn_boundary() {
 async fn tool_call_then_final_response_loops() {
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c1".into(),
@@ -619,8 +620,11 @@ async fn effective_registry_streams_tool_progress() {
     let events: Arc<std::sync::Mutex<Vec<StreamEvent>>> = Default::default();
     let sink_events = events.clone();
     let sink: StreamSink = Arc::new(move |ev| sink_events.lock().unwrap().push(ev));
-    let reg =
-        h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef(String::new()), Some(&sink));
+    let reg = h.effective_tool_registry(
+        &SessionId::new("s1"),
+        &ToolsetRef(String::new()),
+        Some(&sink),
+    );
 
     let out = reg
         .dispatch(ToolCall {
@@ -629,24 +633,35 @@ async fn effective_registry_streams_tool_progress() {
             input: serde_json::json!({ "script": "echo one; sleep 0.35; echo two" }),
         })
         .await;
-    assert!(matches!(out, ToolOutput::Success { .. }), "bash failed: {out:?}");
+    assert!(
+        matches!(out, ToolOutput::Success { .. }),
+        "bash failed: {out:?}"
+    );
 
     let events = events.lock().unwrap();
     let progress: Vec<_> = events
         .iter()
         .filter_map(|ev| match ev {
-            StreamEvent::ToolProgress { call_id, name, preview, .. } => {
-                Some((call_id.clone(), name.clone(), preview.clone()))
-            }
+            StreamEvent::ToolProgress {
+                call_id,
+                name,
+                preview,
+                ..
+            } => Some((call_id.clone(), name.clone(), preview.clone())),
             _ => None,
         })
         .collect();
-    assert!(!progress.is_empty(), "no ToolProgress events reached the sink");
+    assert!(
+        !progress.is_empty(),
+        "no ToolProgress events reached the sink"
+    );
     let (call_id, name, preview) = &progress[0];
     assert_eq!(call_id, "c-stream");
     assert_eq!(name, "bash_command");
-    assert!(preview.contains("one") && !preview.contains("two"),
-        "first preview should carry only the early output: {preview:?}");
+    assert!(
+        preview.contains("one") && !preview.contains("two"),
+        "first preview should carry only the early output: {preview:?}"
+    );
 }
 
 #[tokio::test]
@@ -744,7 +759,11 @@ async fn per_node_toolset_unknown_tool_is_recoverable_error() {
         .toolset_tools("plan-tools", vec![StandardTools::list_dir()])
         .build_config();
     let h = StandardHarness::new(cfg);
-    let reg = h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef("plan-tools".into()), None);
+    let reg = h.effective_tool_registry(
+        &SessionId::new("s1"),
+        &ToolsetRef("plan-tools".into()),
+        None,
+    );
     let out = reg
         .dispatch(ToolCall {
             id: "c".into(),
@@ -788,7 +807,8 @@ async fn unknown_toolset_handle_falls_back_to_global_catalogue() {
         .tools(vec![StandardTools::read_file()])
         .build_config();
     let h = StandardHarness::new(cfg);
-    let reg = h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef("not-wired".into()), None);
+    let reg =
+        h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef("not-wired".into()), None);
     assert!(reg.schemas().iter().any(|s| s.name == "read_file"));
 }
 
@@ -977,6 +997,7 @@ async fn harness_emits_spans_through_outbox_jsonl() {
     let tmp = tempfile::tempdir().unwrap();
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c1".into(),
@@ -1051,6 +1072,7 @@ async fn content_capture_on_writes_genai_content_to_jsonl() {
     let tmp = tempfile::tempdir().unwrap();
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c1".into(),
@@ -1131,6 +1153,7 @@ async fn content_capture_off_writes_no_genai_content() {
     let tmp = tempfile::tempdir().unwrap();
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c1".into(),
@@ -1299,6 +1322,89 @@ async fn content_capture_on_writes_input_messages_to_jsonl() {
         .any(|m| m["role"] == "user" && m["content"].as_str().is_some()));
 }
 
+// A tool result reaches the next turn's prompt CARRYING the id of the call it
+// answers, and the assistant's request carries the same id. Rendering both to
+// plain strings loses that link, which is what a repeated-tool-call
+// investigation needs: "was the result in context, and did it link back?" —
+// otherwise "result present but unlinked" and "result linked" look identical.
+#[tokio::test]
+async fn content_capture_links_tool_result_to_its_call_in_next_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = make_agent();
+    a.push(TurnResult::ToolCallRequested {
+        content: None,
+        reasoning: None,
+        calls: vec![ToolCall {
+            id: "chatcmpl-tool-abc123".into(),
+            name: "do_thing".into(),
+            input: serde_json::json!({ "k": "v" }),
+        }],
+        usage: usage(),
+    });
+    a.push(TurnResult::FinalResponse {
+        reasoning: None,
+        content: "done".into(),
+        usage: usage(),
+    });
+    let reg = Arc::new(ScriptedToolRegistry::new());
+    reg.push(ToolOutput::Success {
+        content: "tool result body".into(),
+        truncated: false,
+    });
+
+    let harness = HarnessBuilder::new(
+        a,
+        reg,
+        Arc::new(AllowAllSandbox),
+        Arc::new(NoopContextManager),
+        Arc::new(AlwaysContinuePolicy),
+    )
+    .with_observability_outbox(tmp.path())
+    .content_capture(ContentCaptureConfig {
+        enabled: true,
+        max_field_len: 8192,
+    })
+    .build();
+
+    harness.run(HarnessRunOptions::new(react(5))).await;
+
+    let body = std::fs::read_to_string(tmp.path().join("sessions/s1/trace.jsonl")).unwrap();
+    let lines: Vec<serde_json::Value> = body
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    // Turn B: the turn whose prompt already contains the tool result — i.e. the
+    // request the model made AFTER seeing it.
+    let turn_b = lines
+        .iter()
+        .filter(|l| l["kind"] == "turn")
+        .find(|l| {
+            l["attributes"]["gen_ai.prompt"]
+                .as_array()
+                .is_some_and(|p| p.iter().any(|m| m["role"] == "tool"))
+        })
+        .expect("a turn whose prompt carries the tool result");
+    let prompt = turn_b["attributes"]["gen_ai.prompt"].as_array().unwrap();
+
+    // The assistant request survives in history STRUCTURED — its id is not lost
+    // to the rendered string.
+    let asst = prompt
+        .iter()
+        .find(|m| m["role"] == "assistant" && !m["tool_calls"].is_null())
+        .expect("the assistant tool-call request survives in history");
+    assert_eq!(asst["tool_calls"][0]["id"], "chatcmpl-tool-abc123");
+    assert_eq!(asst["tool_calls"][0]["name"], "do_thing");
+
+    // The result reaches the next prompt, body intact and LINKED to the call it
+    // answers — so the join closes: result.tool_call_id == request.tool_calls[].id.
+    let tool_msg = prompt.iter().find(|m| m["role"] == "tool").unwrap();
+    assert_eq!(tool_msg["content"], "tool result body");
+    assert_eq!(tool_msg["tool_call_id"], "chatcmpl-tool-abc123");
+    assert_eq!(tool_msg["is_error"], false);
+    assert_eq!(asst["tool_calls"][0]["id"], tool_msg["tool_call_id"]);
+}
+
 // Issue #73: the builder defaults storage to an all-no-op StorageProvider,
 // and `.storage(...)` / `storage()` / `session_store()` round-trip.
 #[tokio::test]
@@ -1390,6 +1496,7 @@ async fn default_chunk_provider_empty_and_chunks_setter_round_trips() {
 async fn parallel_tool_calls_all_dispatched() {
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![
             ToolCall {
@@ -1432,6 +1539,7 @@ async fn budget_max_turns_exceeded() {
     let a = make_agent();
     for _ in 0..10 {
         a.push(TurnResult::ToolCallRequested {
+            content: None,
             reasoning: None,
             calls: vec![ToolCall {
                 id: "c".into(),
@@ -1471,6 +1579,7 @@ async fn react_leaf_cap_binding_propagates_partial() {
     // and hits the leaf's own cap (no global max_turns set).
     for i in 0..3 {
         a.push(TurnResult::ToolCallRequested {
+            content: None,
             reasoning: None,
             calls: vec![ToolCall {
                 id: format!("c{i}"),
@@ -1562,6 +1671,7 @@ async fn agent_error_terminates_with_agent_error_halt_reason() {
 async fn layer1_path_escape_halts() {
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c".into(),
@@ -1597,6 +1707,7 @@ async fn layer1_path_escape_halts() {
 async fn layer2_path_denied_continues_as_tool_error() {
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c".into(),
@@ -1630,6 +1741,7 @@ async fn layer2_path_denied_continues_as_tool_error() {
 async fn tool_sandbox_violation_recoverable_by_default() {
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c".into(),
@@ -1665,6 +1777,7 @@ async fn tool_sandbox_violation_recoverable_by_default() {
 async fn tool_sandbox_violation_halts_under_halt_policy() {
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c".into(),
@@ -1701,6 +1814,7 @@ async fn tool_sandbox_violation_halts_under_halt_policy() {
 async fn tool_layer2_violation_recoverable_even_under_halt_policy() {
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c".into(),
@@ -1799,6 +1913,7 @@ async fn middleware_surface_to_human_before_tool() {
         input: serde_json::json!({}),
     }];
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: calls.clone(),
         usage: usage(),
@@ -1952,6 +2067,7 @@ impl crate::middleware::Middleware for RewriteFirstResultMw {
 async fn after_tool_middleware_rewrites_result_in_place() {
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c1".into(),
@@ -2013,6 +2129,7 @@ async fn after_tool_middleware_rewrites_result_in_place() {
 async fn after_tool_rewrite_re_emits_revised_stream_event() {
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c1".into(),
@@ -2151,6 +2268,7 @@ impl crate::middleware::Middleware for TraceTagMw {
 async fn before_tool_middleware_mutates_calls_in_priority_order() {
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c1".into(),
@@ -2556,6 +2674,7 @@ async fn build_context_sources_populates_memory_from_provider() {
 async fn always_halt_tool_halts() {
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c".into(),
@@ -2583,6 +2702,7 @@ async fn always_halt_tool_halts() {
 async fn unrecoverable_tool_error_halts() {
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c".into(),
@@ -2617,6 +2737,7 @@ async fn tool_call_repair_fixes_bad_bool_arg() {
     let a = make_agent();
     // Turn 1: call the tool with a stringified bool (weak-model behaviour).
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c".into(),
@@ -2684,8 +2805,15 @@ async fn dispatch_with_repair_coerces_a_recoverable_calls_args() {
 
     // The arg was coerced "false" → false and re-dispatched to success.
     assert_eq!(effective.input, serde_json::json!({ "flag": false }));
-    assert!(matches!(output, ToolOutput::Success { .. }), "got {output:?}");
-    assert_eq!(reg.call_count.load(Ordering::SeqCst), 2, "original (fail) + repaired (ok)");
+    assert!(
+        matches!(output, ToolOutput::Success { .. }),
+        "got {output:?}"
+    );
+    assert_eq!(
+        reg.call_count.load(Ordering::SeqCst),
+        2,
+        "original (fail) + repaired (ok)"
+    );
 }
 
 // The enrichment gate: only PARAMETER-shaped errors get the schema+hint; a
@@ -2700,7 +2828,9 @@ fn is_param_error_distinguishes_malformed_from_command_failures() {
     assert!(StandardHarness::is_param_error(
         "schema validation failed for bash_command: missing required field `script`"
     ));
-    assert!(!StandardHarness::is_param_error("exit 101 ; stderr: test assertion failed"));
+    assert!(!StandardHarness::is_param_error(
+        "exit 101 ; stderr: test assertion failed"
+    ));
     assert!(!StandardHarness::is_param_error(
         "exit 1 ; stderr: error: no library targets found in package `tier1`"
     ));
@@ -2714,6 +2844,7 @@ async fn without_repair_bad_bool_arg_errors() {
 
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c".into(),
@@ -2753,6 +2884,7 @@ async fn without_repair_bad_bool_arg_errors() {
 async fn tool_waiting_for_human_propagates() {
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c".into(),
@@ -2813,6 +2945,7 @@ fn agent_with_tool_calls(n: usize) -> Arc<MockAgent> {
         })
         .collect();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls,
         usage: usage(),
@@ -2918,6 +3051,7 @@ async fn escalate_finalizes_observability_as_escalated() {
 async fn waiting_for_human_does_not_finalize_observability() {
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c".into(),
@@ -3398,14 +3532,14 @@ async fn resume_consult_routes_pending_calls_through_carried_toolset() {
     }
 
     // Was the scoped-only tool's pending call dispatched successfully? Scan the
-    // resumed session history for its tool-result message. `NoopContextManager`
-    // prefixes a recoverable error result with "[error]"; a success echoes the
-    // call input verbatim (so it contains "probe").
+    // resumed session history for its tool-result message: a success echoes the
+    // call input verbatim (so it contains "probe"). Failure is read from
+    // `is_error` rather than sniffing the rendered text for an "[error]" prefix.
     fn scoped_dispatched_ok(messages: &[Message]) -> bool {
         messages.iter().any(|m| {
             matches!(m.role, crate::model::Role::Tool)
                 && match &m.content {
-                    Content::Text { text } => text.contains("probe") && !text.contains("[error]"),
+                    Content::ToolResult(tr) => tr.content.contains("probe") && !tr.is_error,
                     _ => false,
                 }
         })
@@ -3463,13 +3597,14 @@ async fn resume_consult_routes_pending_calls_through_carried_toolset() {
         !scoped_dispatched_ok(&session_state.messages),
         "with the EMPTY handle the scoped-only tool is unknown → must NOT dispatch successfully"
     );
-    // And it produced the recoverable unknown-tool error result.
+    // And it produced the recoverable unknown-tool error result — read from
+    // `is_error`, not from a prefix in the rendered text.
     assert!(
         session_state
             .messages
             .iter()
             .any(|m| matches!(m.role, crate::model::Role::Tool)
-                && matches!(&m.content, Content::Text { text } if text.contains("[error]"))),
+                && matches!(&m.content, Content::ToolResult(tr) if tr.is_error)),
         "the scoped-only call must surface a recoverable error under the empty handle"
     );
 }
@@ -3589,6 +3724,7 @@ async fn send_message_emits_user_message_event() {
     use std::sync::Mutex;
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c".into(),
@@ -3931,6 +4067,7 @@ async fn plan_phase_runs_once_and_stores_exact_artifact() {
 async fn plan_phase_tool_call_fails_and_stores_no_artifact() {
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c1".into(),
@@ -4524,6 +4661,7 @@ async fn plan_phase_leaf_budget_exhaustion_fails_cleanly_not_no_terminal() {
     // plan leaf runs to its PerLoop(2) cap without producing a terminal.
     for _ in 0..4 {
         a.push(TurnResult::ToolCallRequested {
+            content: None,
             reasoning: None,
             calls: vec![ToolCall {
                 id: "c".into(),
@@ -4575,6 +4713,7 @@ async fn plan_phase_leaf_budget_exhaustion_surfaces_for_continuation() {
     let a = make_agent();
     for _ in 0..4 {
         a.push(TurnResult::ToolCallRequested {
+            content: None,
             reasoning: None,
             calls: vec![ToolCall {
                 id: "c".into(),
@@ -4912,6 +5051,7 @@ async fn execute_phase_no_per_task_turn_cap() {
     a.push(final_resp(r#"{"tasks":["a","b","c"]}"#));
     // Task a: 2 tool calls then runs dry (no 3rd scripted turn).
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "1".into(),
@@ -4921,6 +5061,7 @@ async fn execute_phase_no_per_task_turn_cap() {
         usage: usage(),
     });
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "2".into(),
@@ -5017,6 +5158,7 @@ async fn execute_phase_budget_grant_advances_and_makes_progress() {
                                                  // final grant; each ToolCallRequested is one turn against the leaf cap.
     for i in 0..3 {
         a.push(TurnResult::ToolCallRequested {
+            content: None,
             reasoning: None,
             calls: vec![ToolCall {
                 id: format!("e{i}"),
@@ -5142,6 +5284,7 @@ async fn execute_phase_compaction_in_loop() {
     let a = make_agent();
     a.push(final_resp(r#"{"tasks":["only"]}"#));
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "1".into(),
@@ -5322,6 +5465,7 @@ async fn execute_agent_can_add_tasks_midwalk() {
     let a = make_agent();
     // Task 1: call `task_list` add_task (appends task 2), then finish.
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         calls: vec![ToolCall {
             id: "c1".into(),
             name: "task_list".into(),
@@ -5517,6 +5661,7 @@ async fn dag_files_touched_observed_not_self_reported() {
     a.push(final_resp("I touched src/phantom.rs (but did not really)"));
     // Task 2: issue a real edit_file call carrying a path, then finalize.
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "e1".into(),
@@ -5567,6 +5712,7 @@ async fn observed_writes_seam_records_only_real_write_calls() {
     let a = make_agent();
     // One window that issues an edit_file then finalizes.
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "e1".into(),
@@ -6036,6 +6182,7 @@ async fn self_verifying_runs_non_react_inner_worker() {
 async fn aggregate_usage_accumulates() {
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c".into(),
@@ -6854,6 +7001,7 @@ impl ContextManager for RecordingContextManager {
 async fn tool_call_records_assistant_message_before_result() {
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c1".into(),
@@ -6940,6 +7088,7 @@ async fn resume_after_surface_to_human_records_assistant_once_before_result() {
         input: serde_json::json!({ "path": "a.txt" }),
     }];
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: calls.clone(),
         usage: usage(),
@@ -7224,6 +7373,7 @@ impl RecordingTurnAgent {
     }
     fn tool_call(name: &str) -> TurnResult {
         TurnResult::ToolCallRequested {
+            content: None,
             reasoning: None,
             calls: vec![ToolCall {
                 id: "c1".into(),
@@ -8491,6 +8641,7 @@ impl Agent for ToolLoopingAgent {
                     .unwrap();
             }
             TurnResult::ToolCallRequested {
+                content: None,
                 reasoning: None,
                 calls: vec![ToolCall {
                     id: format!("c{n}"),
@@ -10478,6 +10629,7 @@ mod session_threading {
     fn tool_then_final_agent() -> Arc<MockAgent> {
         let a = make_agent();
         a.push(TurnResult::ToolCallRequested {
+            content: None,
             reasoning: None,
             calls: vec![ToolCall {
                 id: "c1".into(),
@@ -10836,6 +10988,7 @@ mod session_threading {
         // tool-call turn was recorded into session_state.
         let a = make_agent();
         a.push(TurnResult::ToolCallRequested {
+            content: None,
             reasoning: None,
             calls: vec![ToolCall {
                 id: "c".into(),
@@ -11022,6 +11175,7 @@ fn budget_exhausting_agent(turns: usize) -> Arc<MockAgent> {
     let a = make_agent();
     for i in 0..turns {
         a.push(TurnResult::ToolCallRequested {
+            content: None,
             reasoning: None,
             calls: vec![ToolCall {
                 id: format!("c{i}"),
@@ -11111,6 +11265,7 @@ async fn surface_to_human_combinator_offers_skip() {
                                                       // Execute step: keep requesting tools past the leaf cap of 2.
     for i in 0..4 {
         a.push(TurnResult::ToolCallRequested {
+            content: None,
             reasoning: None,
             calls: vec![ToolCall {
                 id: format!("e{i}"),
@@ -11181,6 +11336,7 @@ async fn resume_continue_with_budget_grants_and_resumes() {
     let a = make_agent();
     // 2 tool turns to exhaust the cap, then a FinalResponse for the resume.
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c0".into(),
@@ -11190,6 +11346,7 @@ async fn resume_continue_with_budget_grants_and_resumes() {
         usage: usage(),
     });
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c1".into(),
@@ -11990,6 +12147,7 @@ async fn live_continue_loops_in_process_then_completes() {
     let a = make_agent();
     // First window: 2 tool turns exhaust the PerLoop{2} cap → Continue grant.
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c0".into(),
@@ -11999,6 +12157,7 @@ async fn live_continue_loops_in_process_then_completes() {
         usage: usage(),
     });
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c1".into(),
@@ -12048,6 +12207,7 @@ async fn auto_continue_grants_in_process_then_completes() {
     let a = make_agent();
     // First window: 2 tool turns exhaust the PerLoop{2} cap → Escalate.
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c0".into(),
@@ -12057,6 +12217,7 @@ async fn auto_continue_grants_in_process_then_completes() {
         usage: usage(),
     });
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "c1".into(),
@@ -12117,6 +12278,7 @@ async fn auto_continue_caps_at_max_grants_then_fails() {
     // only ends when the grant cap is reached — never on an empty queue.
     for i in 0..40 {
         a.push(TurnResult::ToolCallRequested {
+            content: None,
             reasoning: None,
             calls: vec![ToolCall {
                 id: format!("c{i}"),
@@ -12289,6 +12451,7 @@ async fn nested_leaf_propagates_does_not_self_resolve() {
     a.push(final_resp(r#"{"tasks":["x"]}"#)); // plan
     for i in 0..4 {
         a.push(TurnResult::ToolCallRequested {
+            content: None,
             reasoning: None,
             calls: vec![ToolCall {
                 id: format!("e{i}"),
@@ -12367,6 +12530,7 @@ fn tel_bad_args() -> serde_json::Value {
 fn tel_push_bad(a: &Arc<MockAgent>, k: u32, args: &serde_json::Value) {
     for _ in 0..k {
         a.push(TurnResult::ToolCallRequested {
+            content: None,
             reasoning: None,
             calls: vec![tel_bad_call(args.clone())],
             usage: usage(),
@@ -12425,6 +12589,7 @@ async fn tel_ac1_success_resets_counter_no_trip() {
     let a = make_agent();
     tel_push_bad(&a, 2, &tel_bad_args());
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![ToolCall {
             id: "ok".into(),
@@ -12469,11 +12634,13 @@ async fn tel_ac1_success_resets_counter_no_trip() {
 async fn tel_ac1_args_change_starts_fresh_run() {
     let a = make_agent();
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![tel_bad_call(serde_json::json!({ "task_list_id": "X" }))],
         usage: usage(),
     });
     a.push(TurnResult::ToolCallRequested {
+        content: None,
         reasoning: None,
         calls: vec![tel_bad_call(serde_json::json!({ "task_list_id": "Y" }))],
         usage: usage(),
@@ -12768,6 +12935,7 @@ async fn repeated_identical_successful_calls_hard_stop() {
     // for every dispatch, so these all succeed — the error breaker never fires.
     for _ in 0..8 {
         a.push(TurnResult::ToolCallRequested {
+            content: None,
             reasoning: None,
             calls: vec![ToolCall {
                 id: "c".into(),
@@ -12800,6 +12968,7 @@ async fn repeat_breaker_does_not_trip_on_alternating_calls() {
     let a = make_agent();
     for i in 0..4 {
         a.push(TurnResult::ToolCallRequested {
+            content: None,
             reasoning: None,
             calls: vec![ToolCall {
                 id: "c".into(),
@@ -13139,4 +13308,59 @@ async fn os_emits_retry_and_violation_events() {
         .collect();
     assert_eq!(retries, vec![1], "one retry event at attempt 1");
     assert_eq!(violations, vec![2], "one violation event, attempts == 2");
+}
+
+// Prose emitted alongside tool calls (progress narration) is recorded on the
+// session as an Assistant Text message BEFORE the tool-call message — so the
+// transcript and the model's later context keep the running account, not just
+// the tool traffic.
+#[tokio::test]
+async fn tool_turn_prose_is_recorded_on_the_session_before_the_calls() {
+    let a = make_agent();
+    a.push(TurnResult::ToolCallRequested {
+        content: Some("Scanning the folder now.".into()),
+        reasoning: None,
+        calls: vec![ToolCall {
+            id: "c1".into(),
+            name: "x".into(),
+            input: serde_json::json!({}),
+        }],
+        usage: usage(),
+    });
+    a.push(TurnResult::FinalResponse {
+        reasoning: None,
+        content: "done".into(),
+        usage: usage(),
+    });
+    let mut cfg = standard_config(a);
+    let reg = Arc::new(ScriptedToolRegistry::new());
+    reg.push(ToolOutput::Success {
+        content: "tool-ok".into(),
+        truncated: false,
+    });
+    cfg.tool_registry = reg;
+    let h = StandardHarness::new(cfg);
+    let r = h.run(HarnessRunOptions::new(react(5))).await;
+    match r {
+        RunResult::Success { session_state, .. } => {
+            let narration_idx = session_state
+                .messages
+                .iter()
+                .position(|m| {
+                    matches!(&m.content, Content::Text { text } if text == "Scanning the folder now.")
+                        && matches!(m.role, Role::Assistant)
+                })
+                .expect("narration message missing from session");
+            let call_idx = session_state
+                .messages
+                .iter()
+                .position(|m| matches!(&m.content, Content::ToolCall(tc) if tc.id == "c1"))
+                .expect("tool-call message missing from session");
+            assert!(
+                narration_idx < call_idx,
+                "narration must precede its tool calls (narration={narration_idx}, call={call_idx})"
+            );
+        }
+        other => panic!("expected Success, got {other:?}"),
+    }
 }

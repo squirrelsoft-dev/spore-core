@@ -13,44 +13,48 @@ use super::*;
 pub(crate) fn render_plan_read_files(session: &SessionState) -> String {
     use crate::model::{Content, Role};
 
-    // Tool CALLS are stored structurally (`Content::ToolCall`), but their RESULTS
-    // are stored as a SEPARATE `Role::Tool` `Content::Text` message with NO id
-    // back-link (the context manager renders results to text — see
-    // `append_tool_result`). Calls and results are appended 1:1 in the SAME order,
-    // so pair the Nth call with the Nth result BY POSITION. Record each call's
-    // `read_file` path (`None` for a non-read call) to keep the indexes aligned.
-    let mut call_read_paths: Vec<Option<&str>> = Vec::new();
+    // Calls and results are both stored structurally, and a result names the call
+    // it answers (`ToolResult::tool_use_id`). Join on that id. This used to pair
+    // the Nth call with the Nth result by POSITION, because results were flat
+    // `Content::Text` with no back-link — unsound the moment a turn issues
+    // parallel calls or a middleware rewrites one.
+    let mut read_path_by_call: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::new();
     for m in &session.messages {
         if let Content::ToolCall(tc) = &m.content {
-            call_read_paths.push(if tc.name == "read_file" {
-                tc.input.get("path").and_then(|v| v.as_str())
-            } else {
-                None
-            });
+            if tc.name == "read_file" {
+                if let Some(path) = tc.input.get("path").and_then(|v| v.as_str()) {
+                    read_path_by_call.insert(tc.id.as_str(), path);
+                }
+            }
         }
     }
-    if !call_read_paths.iter().any(|p| p.is_some()) {
+    if read_path_by_call.is_empty() {
         return String::new();
     }
-    let mut result_texts: Vec<&str> = Vec::new();
-    for m in &session.messages {
-        if matches!(m.role, Role::Tool) {
-            if let Content::Text { text } = &m.content {
-                result_texts.push(text);
-            }
-        }
-    }
 
-    // path -> most-recent read content, preserving first-seen order.
+    // path -> most-recent read content, preserving first-seen order. A failed
+    // read contributes nothing: handing the planner an error body as if it were
+    // file contents is worse than omitting the file.
     let mut order: Vec<&str> = Vec::new();
     let mut by_path: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    for (i, maybe_path) in call_read_paths.iter().enumerate() {
-        if let (Some(path), Some(&content)) = (*maybe_path, result_texts.get(i)) {
-            if !by_path.contains_key(path) {
-                order.push(path);
-            }
-            by_path.insert(path, content);
+    for m in &session.messages {
+        if !matches!(m.role, Role::Tool) {
+            continue;
         }
+        let Content::ToolResult(tr) = &m.content else {
+            continue;
+        };
+        if tr.is_error {
+            continue;
+        }
+        let Some(&path) = read_path_by_call.get(tr.tool_use_id.as_str()) else {
+            continue;
+        };
+        if !by_path.contains_key(path) {
+            order.push(path);
+        }
+        by_path.insert(path, tr.content.as_str());
     }
     if order.is_empty() {
         return String::new();
@@ -295,9 +299,7 @@ impl StandardHarness {
             }
         }
     }
-
 }
-
 
 // ── RunStrategy: the PlanExecute body (#124, moved from strategies.rs) ──
 impl RunStrategy for PlanExecuteConfig {
@@ -1301,14 +1303,35 @@ mod plan_read_files_tests {
         }
     }
 
-    // Results are stored as a `Role::Tool` `Content::Text` message (no id link) —
-    // paired with the preceding call BY POSITION, mirroring the context manager.
-    fn result(text: &str) -> Message {
-        Message { role: Role::Tool, content: Content::Text { text: text.into() } }
+    // Results are stored structurally and name the call they answer, mirroring
+    // the context manager.
+    fn result(call_id: &str, text: &str) -> Message {
+        Message {
+            role: Role::Tool,
+            content: Content::ToolResult(crate::model::ToolResult {
+                tool_use_id: call_id.into(),
+                content: text.into(),
+                is_error: false,
+            }),
+        }
+    }
+
+    fn error_result(call_id: &str, message: &str) -> Message {
+        Message {
+            role: Role::Tool,
+            content: Content::ToolResult(crate::model::ToolResult {
+                tool_use_id: call_id.into(),
+                content: message.into(),
+                is_error: true,
+            }),
+        }
     }
 
     fn session(messages: Vec<Message>) -> SessionState {
-        SessionState { messages, extras: Default::default() }
+        SessionState {
+            messages,
+            extras: Default::default(),
+        }
     }
 
     #[test]
@@ -1318,7 +1341,7 @@ mod plan_read_files_tests {
         assert_eq!(
             render_plan_read_files(&session(vec![
                 other_call("b1", "bash_command"),
-                result("ls output"),
+                result("b1", "ls output"),
             ])),
             ""
         );
@@ -1327,17 +1350,17 @@ mod plan_read_files_tests {
     #[test]
     fn threads_reads_dedupes_by_path_last_read_wins() {
         // One call per turn: call, result, call, result … (the real ordering). A
-        // non-read tool (grep) is interleaved to check the index alignment holds.
+        // non-read tool (grep) is interleaved to check it is not paired in.
         let out = render_plan_read_files(&session(vec![
             read_call("c1", "src/util.rs"),
-            result("fn a() {}"),
+            result("c1", "fn a() {}"),
             other_call("c2", "grep"),
-            result("2 matches"),
+            result("c2", "2 matches"),
             read_call("c3", "src/main.rs"),
-            result("fn main() {}"),
+            result("c3", "fn main() {}"),
             // Re-read util.rs with newer content — last read wins, single entry.
             read_call("c4", "src/util.rs"),
-            result("fn a() {} // v2"),
+            result("c4", "fn a() {} // v2"),
         ]));
         assert!(out.starts_with("<files>") && out.ends_with("</files>"));
         assert!(out.contains("path=\"src/main.rs\"") && out.contains("fn main() {}"));
@@ -1345,5 +1368,31 @@ mod plan_read_files_tests {
         assert_eq!(out.matches("path=\"src/util.rs\"").count(), 1);
         assert!(out.contains("fn a() {} // v2"));
         assert!(!out.contains("2 matches"));
+    }
+
+    // The case ordinal pairing could not express: a turn issues several calls at
+    // once and the results come back in a different order. Joining on the id is
+    // what makes this correct — by position, main.rs would get util.rs's body.
+    #[test]
+    fn pairs_parallel_results_by_id_not_position() {
+        let out = render_plan_read_files(&session(vec![
+            read_call("c1", "src/util.rs"),
+            read_call("c2", "src/main.rs"),
+            result("c2", "fn main() {}"),
+            result("c1", "fn a() {}"),
+        ]));
+        assert!(out.contains("<file path=\"src/util.rs\">\nfn a() {}"));
+        assert!(out.contains("<file path=\"src/main.rs\">\nfn main() {}"));
+    }
+
+    // A failed read must not be handed to the planner as if it were the file's
+    // contents — previously indistinguishable, since both were bare text.
+    #[test]
+    fn a_failed_read_contributes_no_file() {
+        let out = render_plan_read_files(&session(vec![
+            read_call("c1", "src/gone.rs"),
+            error_result("c1", "read failed: No such file or directory"),
+        ]));
+        assert_eq!(out, "");
     }
 }

@@ -132,7 +132,8 @@ where
                 }
                 let code = status.as_u16();
                 if retryable(code) && attempt < max_retries {
-                    let delay = retry_after(resp.headers()).unwrap_or_else(|| backoff_delay(attempt));
+                    let delay =
+                        retry_after(resp.headers()).unwrap_or_else(|| backoff_delay(attempt));
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                     continue;

@@ -39,7 +39,9 @@ pub use control::{AbortTool, AskUserQuestionTool, EnterPlanModeTool, ExitPlanMod
 pub use edit::EditFileTool;
 pub use error::ToolExecutionError;
 pub use exec::{BashCommandTool, ExecTool, RunTestsTool};
-pub use fs::{DeleteFileTool, ListDirTool, MoveFileTool, ReadFileTool, WriteFileTool};
+pub use fs::{
+    CreateDirTool, DeleteFileTool, ListDirTool, MoveFileTool, ReadFileTool, WriteFileTool,
+};
 pub use git::{GitCommitTool, GitDiffTool, GitLogTool, GitResetMode, GitResetTool, GitStatusTool};
 pub use http::{HttpGetTool, HttpPostTool};
 pub use memory::MemoryTool;

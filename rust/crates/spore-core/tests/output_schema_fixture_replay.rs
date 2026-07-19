@@ -89,6 +89,7 @@ fn harness_for(fixture: &str, max_retries: u32) -> StandardHarness {
         error_loop_threshold: 3,
         plan_empty_max_retries: 0,
         tool_call_nudge: false,
+        steering_source: None,
         tool_search: None,
         // #139: enforcement ON; N == `max_retries`.
         enforce_output_schemas: true,

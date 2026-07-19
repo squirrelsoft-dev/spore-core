@@ -1,0 +1,18 @@
+[package]
+name = "spore-sqlvec"
+version = "0.0.0"
+edition = "2021"
+description = "sqlite-vec VectorStore backend for spore-core"
+license = "Apache-2.0"
+
+[dependencies]
+spore-core = { path = "../spore-core" }
+tokio = { version = "1", features = ["sync", "rt"] }
+tokio-rusqlite = "0.6"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sqlite-vec = "0.1.9"
+serde_json = "1.0"
+thiserror = "1.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

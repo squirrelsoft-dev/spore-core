@@ -121,7 +121,10 @@ impl OpenAIModelInterface {
     }
 
     pub fn from_env(env_var: &str, model_id: impl Into<String>) -> Result<Self, ModelError> {
-        Ok(Self::new(crate::provider_http::key_from_env(env_var)?, model_id))
+        Ok(Self::new(
+            crate::provider_http::key_from_env(env_var)?,
+            model_id,
+        ))
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -330,7 +333,9 @@ struct OpenAIChoice {
 struct OpenAIResponseMessage {
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    /// `reasoning_content` is the key emitted by vLLM's reasoning parsers
+    /// (qwen3 et al.); `reasoning` is the OpenRouter/OpenAI-style key.
+    #[serde(default, alias = "reasoning_content")]
     reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Vec<OpenAIResponseToolCall>,
@@ -398,8 +403,7 @@ fn build_request(
 
     // SC-27: `OpenAICompat.reasoning_model` is OR'd OVER the id heuristic, so a
     // model the `o1`/`o3`/`o4` prefix check misses still gets reasoning shaping.
-    let is_reasoning =
-        OpenAIModelInterface::is_reasoning_model(model_id) || compat.reasoning_model;
+    let is_reasoning = OpenAIModelInterface::is_reasoning_model(model_id) || compat.reasoning_model;
     let (max_tokens, max_completion_tokens) = if is_reasoning {
         (None, req.params.max_tokens)
     } else {
@@ -621,30 +625,31 @@ async fn map_status_error(resp: reqwest::Response) -> ModelError {
 impl ModelInterface for OpenAIModelInterface {
     fn call<'a>(&'a self, request: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
         Box::pin(async move {
-        let body = build_request(&self.model_id, &request, false, &self.compat);
-        let url = format!("{}/chat/completions", self.base_url);
-        let api_key = self.api_key.clone();
-        let body = crate::provider_http::encode_body(&body)?;
-        let client = self.http_client.clone();
-        let resp = crate::provider_http::send_with_retry(
-            || {
-                client
-                    .post(&url)
-                    .header("authorization", format!("Bearer {api_key}"))
-                    .header("content-type", "application/json")
-                    .body(body.clone())
-            },
-            self.max_retries,
-            self.timeout,
-            crate::provider_http::is_retryable_status,
-            map_status_error,
-        )
-        .await?;
-        let parsed: OpenAIResponse = resp.json().await.map_err(|e| ModelError::ProviderError {
-            code: 0,
-            message: format!("response decode failed: {e}"),
-        })?;
-        Ok(parse_response(parsed))
+            let body = build_request(&self.model_id, &request, false, &self.compat);
+            let url = format!("{}/chat/completions", self.base_url);
+            let api_key = self.api_key.clone();
+            let body = crate::provider_http::encode_body(&body)?;
+            let client = self.http_client.clone();
+            let resp = crate::provider_http::send_with_retry(
+                || {
+                    client
+                        .post(&url)
+                        .header("authorization", format!("Bearer {api_key}"))
+                        .header("content-type", "application/json")
+                        .body(body.clone())
+                },
+                self.max_retries,
+                self.timeout,
+                crate::provider_http::is_retryable_status,
+                map_status_error,
+            )
+            .await?;
+            let parsed: OpenAIResponse =
+                resp.json().await.map_err(|e| ModelError::ProviderError {
+                    code: 0,
+                    message: format!("response decode failed: {e}"),
+                })?;
+            Ok(parse_response(parsed))
         })
     }
 
@@ -653,31 +658,31 @@ impl ModelInterface for OpenAIModelInterface {
         request: ModelRequest,
     ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
         Box::pin(async move {
-        let body = build_request(&self.model_id, &request, true, &self.compat);
-        let url = format!("{}/chat/completions", self.base_url);
-        let body = crate::provider_http::encode_body(&body)?;
-        let client = self.http_client.clone();
-        let api_key = self.api_key.clone();
-        // Route through `send_with_retry` so opening a stream gets the same
-        // retry/backoff on transient failures (timeouts, 429/5xx) as the
-        // non-streaming `call` path. Retries happen BEFORE the body is consumed;
-        // the closure rebuilds the request each attempt (`body.clone()`).
-        let resp = crate::provider_http::send_with_retry(
-            || {
-                client
-                    .post(&url)
-                    .header("authorization", format!("Bearer {api_key}"))
-                    .header("content-type", "application/json")
-                    .header("accept", "text/event-stream")
-                    .body(body.clone())
-            },
-            self.max_retries,
-            self.timeout,
-            crate::provider_http::is_retryable_status,
-            map_status_error,
-        )
-        .await?;
-        Ok::<ModelStream, ModelError>(Box::pin(sse_to_events(resp)))
+            let body = build_request(&self.model_id, &request, true, &self.compat);
+            let url = format!("{}/chat/completions", self.base_url);
+            let body = crate::provider_http::encode_body(&body)?;
+            let client = self.http_client.clone();
+            let api_key = self.api_key.clone();
+            // Route through `send_with_retry` so opening a stream gets the same
+            // retry/backoff on transient failures (timeouts, 429/5xx) as the
+            // non-streaming `call` path. Retries happen BEFORE the body is consumed;
+            // the closure rebuilds the request each attempt (`body.clone()`).
+            let resp = crate::provider_http::send_with_retry(
+                || {
+                    client
+                        .post(&url)
+                        .header("authorization", format!("Bearer {api_key}"))
+                        .header("content-type", "application/json")
+                        .header("accept", "text/event-stream")
+                        .body(body.clone())
+                },
+                self.max_retries,
+                self.timeout,
+                crate::provider_http::is_retryable_status,
+                map_status_error,
+            )
+            .await?;
+            Ok::<ModelStream, ModelError>(Box::pin(sse_to_events(resp)))
         })
     }
 
@@ -686,10 +691,10 @@ impl ModelInterface for OpenAIModelInterface {
         request: &'a ModelRequest,
     ) -> BoxFut<'a, Result<u32, ModelError>> {
         Box::pin(async move {
-        // OpenAI has no count_tokens endpoint. Use the shared bytes/4 heuristic
-        // (consistent with ReplayModelInterface) — sufficient for compaction
-        // decisions; exact counts come back via response usage.
-        Ok(crate::model::estimate_tokens(request))
+            // OpenAI has no count_tokens endpoint. Use the shared bytes/4 heuristic
+            // (consistent with ReplayModelInterface) — sufficient for compaction
+            // decisions; exact counts come back via response usage.
+            Ok(crate::model::estimate_tokens(request))
         })
     }
 
@@ -803,7 +808,13 @@ fn sse_to_events(
                         });
                     }
                 }
-                if let Some(reasoning) = delta.get("reasoning").and_then(|v| v.as_str()) {
+                // `reasoning` (OpenRouter/OpenAI-style) with a fallback to
+                // `reasoning_content` (vLLM reasoning parsers, qwen3 et al.).
+                if let Some(reasoning) = delta
+                    .get("reasoning")
+                    .or_else(|| delta.get("reasoning_content"))
+                    .and_then(|v| v.as_str())
+                {
                     if !reasoning.is_empty() {
                         // Reasoning is a SEPARATE block from text — it MUST NOT share
                         // `content_index`. A reasoning model (e.g. Qwen on vLLM)
@@ -922,12 +933,17 @@ mod tests {
     fn image_message_serializes_as_image_url_data_url() {
         let img = Message {
             role: Role::User,
-            content: Content::Image { media_type: "image/png".into(), data: "aGk=".into() },
+            content: Content::Image {
+                media_type: "image/png".into(),
+                data: "aGk=".into(),
+            },
         };
         let body = build_request("gpt-4o", &req(vec![img]), false, &OpenAICompat::default());
         let json = serde_json::to_value(&body.messages[0]).unwrap();
         // content is an ARRAY of parts carrying an image_url data URL — not a string.
-        let parts = json["content"].as_array().expect("content should be a parts array");
+        let parts = json["content"]
+            .as_array()
+            .expect("content should be a parts array");
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["type"], "image_url");
         assert_eq!(parts[0]["image_url"]["url"], "data:image/png;base64,aGk=");
@@ -937,7 +953,12 @@ mod tests {
     fn text_message_still_serializes_as_a_plain_string() {
         // The untagged content enum must keep ordinary text as a bare JSON string,
         // not wrap it in a parts array (would change every existing request).
-        let body = build_request("gpt-4o", &req(vec![user("hello")]), false, &OpenAICompat::default());
+        let body = build_request(
+            "gpt-4o",
+            &req(vec![user("hello")]),
+            false,
+            &OpenAICompat::default(),
+        );
         let json = serde_json::to_value(&body.messages[0]).unwrap();
         assert_eq!(json["content"], "hello");
     }
@@ -963,8 +984,12 @@ mod tests {
         r.params.min_p = Some(0.0);
         r.params.presence_penalty = Some(0.0);
         r.params.repetition_penalty = Some(1.0);
-        let body =
-            build_request("nvidia/Qwen3.6-35B-A3B-NVFP4", &r, false, &OpenAICompat::default());
+        let body = build_request(
+            "nvidia/Qwen3.6-35B-A3B-NVFP4",
+            &r,
+            false,
+            &OpenAICompat::default(),
+        );
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["temperature"], 0.5);
         assert_eq!(json["top_p"], 0.5);
@@ -978,10 +1003,21 @@ mod tests {
     fn unset_sampling_params_are_omitted() {
         // No sampling set → the fields are absent (byte-identical to the
         // pre-sampling request; the server default applies).
-        let body = build_request("gpt-4o", &req(vec![user("hi")]), false, &OpenAICompat::default());
+        let body = build_request(
+            "gpt-4o",
+            &req(vec![user("hi")]),
+            false,
+            &OpenAICompat::default(),
+        );
         let json = serde_json::to_value(&body).unwrap();
-        for k in ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repetition_penalty"]
-        {
+        for k in [
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "presence_penalty",
+            "repetition_penalty",
+        ] {
             assert!(json.get(k).is_none(), "{k} must be omitted when unset");
         }
     }
@@ -998,7 +1034,10 @@ mod tests {
         let body = build_request("o3-mini", &r, false, &OpenAICompat::default());
         let json = serde_json::to_value(&body).unwrap();
         for k in ["top_k", "min_p", "presence_penalty", "repetition_penalty"] {
-            assert!(json.get(k).is_none(), "{k} must be dropped for reasoning models");
+            assert!(
+                json.get(k).is_none(),
+                "{k} must be dropped for reasoning models"
+            );
         }
     }
 
@@ -1096,6 +1135,32 @@ mod tests {
         assert!(s.contains("\"content\":\"ok\""), "wire: {s}");
     }
 
+    // A `Role::Tool` message carrying bare `Content::Text` cannot produce a
+    // spec-valid tool message: there is no id to put in `tool_call_id`, and a
+    // server-side chat template needs that link to render the message as a tool
+    // response rather than as loose text.
+    //
+    // No context manager emits this shape any more — results are structural
+    // (`Content::ToolResult`, covered directly above). This pins the fallback so
+    // that if some future path reintroduces flat tool text, the silent failure
+    // mode it causes is at least documented here rather than discovered from a
+    // model looping in production.
+    #[test]
+    fn build_request_tool_role_text_message_has_no_tool_call_id() {
+        let r = req(vec![Message {
+            role: Role::Tool,
+            content: Content::Text { text: "ok".into() },
+        }]);
+        let body = build_request("gpt-4o", &r, false, &OpenAICompat::default());
+        assert_eq!(body.messages[0].role, "tool");
+        let s = serde_json::to_string(&body.messages[0]).unwrap();
+        assert!(s.contains("\"content\":\"ok\""), "wire: {s}");
+        assert!(
+            !s.contains("\"tool_call_id\":\""),
+            "tool results now carry their id on the wire — drop this test: {s}"
+        );
+    }
+
     #[test]
     fn build_request_streaming_sets_include_usage() {
         let r = req(vec![user("hi")]);
@@ -1164,6 +1229,27 @@ mod tests {
                 "message": {
                     "role": "assistant",
                     "reasoning": "let me think...",
+                    "content": "the answer is 4"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        }))
+        .unwrap();
+        let r = parse_response(body);
+        assert!(matches!(r.content[0], ContentBlock::Thinking { .. }));
+        assert!(matches!(r.content[1], ContentBlock::Text { .. }));
+    }
+
+    #[test]
+    fn parse_response_extracts_reasoning_content_as_thinking() {
+        // vLLM's reasoning parsers (qwen3 et al.) emit `reasoning_content`,
+        // not `reasoning` — the alias must map it onto the same field.
+        let body: OpenAIResponse = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "let me think...",
                     "content": "the answer is 4"
                 },
                 "finish_reason": "stop"
@@ -1559,6 +1645,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_reasoning_content_key_maps_to_thinking() {
+        // Same as above but with vLLM's `reasoning_content` delta key.
+        let sse = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"let me think\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"the answer\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(sse)
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenAIModelInterface::new("k", "gpt-4o").with_base_url(server.uri());
+        let mut stream = client.call_streaming(req(vec![user("hi")])).await.unwrap();
+        let mut events: Vec<StreamEvent> = vec![];
+        while let Some(ev) = stream.next().await {
+            events.push(ev.unwrap());
+        }
+        let thinking = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::ThinkingDelta { index, delta } => Some((*index, delta.clone())),
+                _ => None,
+            })
+            .expect("a ThinkingDelta for the reasoning_content key");
+        let content = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::ContentBlockDelta { index, delta } => Some((*index, delta.clone())),
+                _ => None,
+            })
+            .expect("a ContentBlockDelta for the answer");
+        assert_eq!(thinking.1, "let me think");
+        assert_eq!(content.1, "the answer");
+        assert_ne!(thinking.0, content.0);
+    }
+
+    #[tokio::test]
     async fn streaming_interruption_is_typed_and_retryable() {
         // SC-3: a connection dropped mid-stream surfaces as the typed, retryable
         // `StreamInterrupted` variant — a consumer drives its retry off
@@ -1574,9 +1704,9 @@ mod tests {
             if let Ok((mut sock, _)) = listener.accept() {
                 let mut buf = [0u8; 2048];
                 let _ = sock.read(&mut buf); // drain the request headers
-                // 200 OK so `call_streaming` returns Ok (headers arrived), then
-                // promise 200 body bytes but deliver only a partial SSE line and
-                // drop the socket — EOF before Content-Length errors the stream.
+                                             // 200 OK so `call_streaming` returns Ok (headers arrived), then
+                                             // promise 200 body bytes but deliver only a partial SSE line and
+                                             // drop the socket — EOF before Content-Length errors the stream.
                 let _ = sock.write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 200\r\n\r\ndata: partial",
                 );
@@ -1585,7 +1715,8 @@ mod tests {
             }
         });
 
-        let client = OpenAIModelInterface::new("k", "gpt-4o").with_base_url(format!("http://{addr}"));
+        let client =
+            OpenAIModelInterface::new("k", "gpt-4o").with_base_url(format!("http://{addr}"));
         let mut stream = client
             .call_streaming(req(vec![user("hi")]))
             .await

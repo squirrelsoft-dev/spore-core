@@ -66,6 +66,11 @@ pub struct ListDirParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateDirParams {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteFileParams {
     pub path: String,
 }

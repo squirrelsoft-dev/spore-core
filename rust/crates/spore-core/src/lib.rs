@@ -45,6 +45,8 @@ pub mod prompt_chunk_registry;
 pub mod prompt_tool_call;
 pub(crate) mod provider_http;
 pub mod sandbox;
+#[cfg(feature = "petri")]
+pub mod sandbox_petri;
 pub mod sensor;
 pub mod skills;
 pub mod storage;
@@ -90,21 +92,18 @@ pub use harness::{
     AgentRef, AggregateUsage, BudgetContext, BudgetExhausted, BudgetExhaustedBehavior,
     BudgetLimitType, BudgetLimits, BudgetPolicy, BudgetSnapshot, BudgetStack, BwrapProfile,
     ChildPausedState, CommandOutput, CommandProgressSink, CompleteOnFinalResponse,
-    ConsultHandlerEntry,
-    ConsultOverflowPolicy, ConsultRequest, ConsultResponse,
+    ConsultHandlerEntry, ConsultOverflowPolicy, ConsultRequest, ConsultResponse,
     ContextManager as HarnessContextManager, EmptyToolRegistry, EscalationAction, ExecutionContext,
     ExhaustionCause, FileRef, GitVcsProvider, HaltReason, Harness, HarnessBuilder, HarnessConfig,
     HarnessError, HarnessRunOptions, HarnessSignal, HillCandidate, HillClimbingConfig,
-    HillClimbingDirection, HumanRequest, HumanResponse, IsolationMode, LoopStrategy,
-    ModelConfig, NetworkPolicy, NodeAttr, NullSandbox, ObservabilityProvider,
-    Operation, PausedState, PlanExecuteConfig, RalphConfig, ReactConfig, ReadOnlySandbox,
-    RiskLevel, RunResult, RunStrategy, SandboxProvider, SandboxViolation, SchemaRef,
-    SelfVerifyingConfig, SessionId, SessionState, SpanStack, StandardHarness, SteeringSource,
-    StrategyOutcome, StrategyRef, StreamEvent as HarnessStreamEvent, Task, TaskId,
-    TerminationDecision,
-    TerminationPolicy, ToolOutput, ToolRegistry as HarnessToolRegistry,
-    ToolResult as HarnessToolResult, ToolsetRef, TruncatedOutput, VcsError, VcsLogArgs,
-    VcsProvider,
+    HillClimbingDirection, HumanRequest, HumanResponse, IsolationMode, LoopStrategy, ModelConfig,
+    NetworkPolicy, NodeAttr, NullSandbox, ObservabilityProvider, Operation, PausedState,
+    PlanExecuteConfig, RalphConfig, ReactConfig, ReadOnlySandbox, RiskLevel, RunResult,
+    RunStrategy, SandboxProvider, SandboxViolation, SchemaRef, SelfVerifyingConfig, SessionId,
+    SessionState, SpanStack, StandardHarness, SteeringSource, StrategyOutcome, StrategyRef,
+    StreamEvent as HarnessStreamEvent, Task, TaskId, TerminationDecision, TerminationPolicy,
+    ToolOutput, ToolRegistry as HarnessToolRegistry, ToolResult as HarnessToolResult, ToolsetRef,
+    TruncatedOutput, VcsError, VcsLogArgs, VcsProvider,
 };
 // `BoxFut` is the object-safe async return type every boundary trait uses
 // (`Tool`, `ModelInterface`, `EmbeddingModel`, `VectorStore`, …). Re-exported at
@@ -129,9 +128,17 @@ pub use middleware::{
     // it is exported under the plain `MiddlewareChain` / `MiddlewareDecision` /
     // `HookPoint` names (the former harness-local stubs were deleted). `HookContext`
     // stays aliased to avoid colliding with the harness's own (#69) `HookContext`.
-    HookContext as MiddlewareHookContext, HookPoint, LoopDetectionMiddleware, Middleware,
-    MiddlewareChain, MiddlewareDecision, MiddlewareError, PatchToolCallsMiddleware,
-    PreCompletionChecklistMiddleware, StandardMiddlewareChain, TokenBudgetMiddleware,
+    HookContext as MiddlewareHookContext,
+    HookPoint,
+    LoopDetectionMiddleware,
+    Middleware,
+    MiddlewareChain,
+    MiddlewareDecision,
+    MiddlewareError,
+    PatchToolCallsMiddleware,
+    PreCompletionChecklistMiddleware,
+    StandardMiddlewareChain,
+    TokenBudgetMiddleware,
     TracingMiddleware,
 };
 pub use model::{
@@ -223,9 +230,7 @@ pub use tool_registry::{
     ToolRegistry, ToolSchema as RegisteredToolSchema, ToolSearchConfig, ToolSearchRegistry,
     ToolSet,
 };
-pub use vector_store::{
-    MetadataFilter, VectorHit, VectorRecord, VectorStore, VectorStoreError,
-};
+pub use vector_store::{MetadataFilter, VectorHit, VectorRecord, VectorStore, VectorStoreError};
 pub use verifier::{
     CompositeVerifier, EvaluatorResponseVerifier, TestSuiteVerifier, Verifier, VerifierInput,
     VerifierVerdict,

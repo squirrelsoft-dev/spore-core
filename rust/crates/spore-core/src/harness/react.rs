@@ -27,11 +27,17 @@ impl StandardHarness {
         if let Some(repair) = self.config.tool_call_repair.as_ref() {
             let mut attempts_left = self.config.max_repair_attempts;
             while attempts_left > 0 {
-                let ToolOutput::Error { ref message, recoverable: true } = output else {
+                let ToolOutput::Error {
+                    ref message,
+                    recoverable: true,
+                } = output
+                else {
                     break;
                 };
-                let schema =
-                    tool_registry.schemas().into_iter().find(|s| s.name == effective_call.name);
+                let schema = tool_registry
+                    .schemas()
+                    .into_iter()
+                    .find(|s| s.name == effective_call.name);
                 let Some(repaired_call) = repair.repair(&effective_call, message, schema.as_ref())
                 else {
                     // Repair gave up. Enrich with the schema+hint ONLY for a
@@ -48,11 +54,21 @@ impl StandardHarness {
                 attempts_left -= 1;
                 effective_call = repaired_call;
                 output = tool_registry.dispatch(effective_call.clone()).await;
-                if !matches!(output, ToolOutput::Error { recoverable: true, .. }) {
+                if !matches!(
+                    output,
+                    ToolOutput::Error {
+                        recoverable: true,
+                        ..
+                    }
+                ) {
                     break;
                 }
                 if attempts_left == 0 {
-                    if let ToolOutput::Error { message: ref m, recoverable: true } = output {
+                    if let ToolOutput::Error {
+                        message: ref m,
+                        recoverable: true,
+                    } = output
+                    {
                         if Self::is_param_error(m) {
                             let schema = tool_registry
                                 .schemas()
@@ -184,19 +200,17 @@ impl StandardHarness {
         }
         // Fallback: empty handle (back-compat) or unregistered non-empty handle.
         match &self.config.catalogue_registry {
-            Some(catalogue) => {
-                self.maybe_tool_search(Arc::new(
-                    crate::tool_registry::RealToolRegistry::new(
-                        catalogue.clone(),
-                        self.config.sandbox.clone(),
-                        session_id.clone(),
-                        self.config.project_id.clone(),
-                        self.config.storage.run().clone(),
-                        self.config.storage.memory().clone(),
-                    )
-                    .with_progress(progress),
-                ))
-            }
+            Some(catalogue) => self.maybe_tool_search(Arc::new(
+                crate::tool_registry::RealToolRegistry::new(
+                    catalogue.clone(),
+                    self.config.sandbox.clone(),
+                    session_id.clone(),
+                    self.config.project_id.clone(),
+                    self.config.storage.run().clone(),
+                    self.config.storage.memory().clone(),
+                )
+                .with_progress(progress),
+            )),
             None => self.config.tool_registry.clone(),
         }
     }
@@ -257,8 +271,7 @@ impl StandardHarness {
         // Resolve the effective tool registry once per turn-loop window (all
         // strategies funnel through here). Bridges the per-node toolset catalogue
         // (or the global catalogue when the handle is empty) per-run.
-        let tool_registry =
-            self.effective_tool_registry(&session_id, &toolset, on_stream.as_ref());
+        let tool_registry = self.effective_tool_registry(&session_id, &toolset, on_stream.as_ref());
         // Reset the adaptive prompt-based-tool-calling escalation flag at the
         // start of this turn-loop window so detection is scoped to the window
         // and does not leak across `run()` calls (the flag is shared with the
@@ -639,10 +652,14 @@ impl StandardHarness {
                             TurnResult::FinalResponse { content, .. } => {
                                 let (content, truncated) =
                                     truncate_field(content, cc.max_field_len);
+                                // A final text response carries no tool linkage.
                                 Some(GenAiMessage {
                                     role: GenAiRole::Assistant,
                                     content,
                                     truncated,
+                                    tool_call_id: None,
+                                    tool_calls: None,
+                                    is_error: None,
                                 })
                             }
                             _ => None,
@@ -691,8 +708,8 @@ impl StandardHarness {
                     // PER-TURN (not only at end-of-run). Re-derived from `result`.
                     usage: match &result {
                         TurnResult::ToolCallRequested { usage, .. }
-                        | TurnResult::FinalResponse { usage, .. } => usage.clone(),
-                        TurnResult::Error { usage, .. } => usage.clone().unwrap_or_default(),
+                        | TurnResult::FinalResponse { usage, .. } => *usage,
+                        TurnResult::Error { usage, .. } => usage.unwrap_or_default(),
                     },
                     node: None,
                 },
@@ -1071,6 +1088,7 @@ report only what the tools returned."
                 TurnResult::ToolCallRequested {
                     mut calls,
                     usage: u,
+                    content,
                     ..
                 } => {
                     usage.add_turn(&u);
@@ -1100,6 +1118,23 @@ report only what the tools returned."
                     // resume_inner never has to append it. The recorded turn
                     // reflects the model's original request; a middleware or
                     // human modification changes only what is dispatched.
+                    //
+                    // Prose emitted alongside the calls (progress narration) is
+                    // recorded first, so the transcript — and the model's own
+                    // context on later turns — keeps the agent's running
+                    // account, not just its tool traffic.
+                    if let Some(text) = content.as_deref().filter(|t| !t.trim().is_empty()) {
+                        let msg = Message {
+                            role: Role::Assistant,
+                            content: Content::Text {
+                                text: text.to_string(),
+                            },
+                        };
+                        self.config
+                            .context_manager
+                            .append_assistant_message(&mut session_state, &msg)
+                            .await;
+                    }
                     for call in &calls {
                         let msg = Message {
                             role: Role::Assistant,
@@ -1244,8 +1279,9 @@ report only what the tools returned."
                         // shares it. `effective_call` is the call actually
                         // dispatched (repaired variant when repair fired); spans /
                         // results are stamped from it.
-                        let (effective_call, mut output) =
-                            self.dispatch_with_repair(tool_registry.as_ref(), call.clone()).await;
+                        let (effective_call, mut output) = self
+                            .dispatch_with_repair(tool_registry.as_ref(), call.clone())
+                            .await;
 
                         // Tool-surfaced sandbox violation: the HARNESS decides
                         // halt-vs-recoverable per `sandbox_violation_policy`, not
@@ -1996,7 +2032,6 @@ response (finalize the plan / answer the task).",
     //
     // No `// SPEC QUESTION:` markers — all four forks (D1–D4) are resolved.
 }
-
 
 // ── RunStrategy: the ReAct leaf body (#124, moved from strategies.rs) ──
 impl RunStrategy for ReactConfig {

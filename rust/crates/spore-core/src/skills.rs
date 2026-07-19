@@ -23,18 +23,20 @@
 //! within a harness's lifetime (sticky for the session — the catalog is held as an
 //! `Arc<SkillCatalog>` by both the tool and `HarnessConfig`).
 
+use crate::sync_util::MutexExt;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use crate::sync_util::MutexExt;
 
 use serde_json::json;
 
 use crate::guide_registry::Guide;
 use crate::harness::{BoxFut, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
-use crate::tool_registry::{Tool, ToolAnnotations, ToolContext, ToolSchema as RegisteredToolSchema};
+use crate::tool_registry::{
+    Tool, ToolAnnotations, ToolContext, ToolSchema as RegisteredToolSchema,
+};
 use crate::tools::StandardTool;
 
 /// The registered name of the skill-activation tool.
@@ -207,27 +209,19 @@ impl SkillCatalog {
         if !self.entries.iter().any(|e| e.name == name) {
             return false;
         }
-        self.active
-            .lock_recover()
-            .insert(name.to_string());
+        self.active.lock_recover().insert(name.to_string());
         true
     }
 
     /// Deactivate every skill (e.g. on a conversation reset). The manifest stays;
     /// only the sticky bodies are dropped.
     pub fn clear_active(&self) {
-        self.active
-            .lock_recover()
-            .clear();
+        self.active.lock_recover().clear();
     }
 
     /// The currently active skill names (sorted).
     pub fn active(&self) -> Vec<String> {
-        self.active
-            .lock_recover()
-            .iter()
-            .cloned()
-            .collect()
+        self.active.lock_recover().iter().cloned().collect()
     }
 
     /// The guides injected this turn (issue #115): a single manifest guide listing

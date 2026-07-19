@@ -909,9 +909,17 @@ impl<M: ModelInterface + 'static> ContextManager for StandardContextManager<M> {
                 text
             };
 
+            // Structural, not flat text — see `compaction_adapter`. The
+            // `[error] ` prefix on the rendered text is kept for continuity with
+            // what models already saw; `is_error` now carries the same fact in a
+            // form the provider serializers can act on.
             state.message_history.push(Message {
                 role: Role::Tool,
-                content: Content::Text { text: final_text },
+                content: Content::ToolResult(crate::model::ToolResult {
+                    tool_use_id: result.call_id.clone(),
+                    content: final_text,
+                    is_error: crate::compaction_adapter::tool_result_is_error(&result.output),
+                }),
             });
             Ok(())
         })
@@ -1043,16 +1051,13 @@ mod tests {
         }
     }
     impl ModelInterface for FakeModel {
-        fn call<'a>(
-            &'a self,
-            _req: ModelRequest,
-        ) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
+        fn call<'a>(&'a self, _req: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
             Box::pin(async move {
-            Ok(ModelResponse {
-                content: vec![],
-                stop_reason: StopReason::EndTurn,
-                usage: TokenUsage::default(),
-            })
+                Ok(ModelResponse {
+                    content: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                })
             })
         }
         fn call_streaming<'a>(
@@ -1398,13 +1403,16 @@ mod tests {
         };
         mgr.append_tool_result(&mut st, &result, &sb).await.unwrap();
         assert_eq!(st.message_history.len(), 1);
-        let text = match &st.message_history[0].content {
-            Content::Text { text } => text.clone(),
-            _ => panic!(),
+        let tr = match &st.message_history[0].content {
+            Content::ToolResult(tr) => tr.clone(),
+            other => panic!("expected a linked ToolResult, got {other:?}"),
         };
+        // Truncation must not cost the back-link.
+        assert_eq!(tr.tool_use_id, "c1");
+        assert!(!tr.is_error);
         // Must have been touched by truncation pipeline.
-        assert!(text.contains("[truncated"));
-        assert!(text.len() < big.len());
+        assert!(tr.content.contains("[truncated"));
+        assert!(tr.content.len() < big.len());
     }
 
     #[tokio::test]
@@ -1421,8 +1429,38 @@ mod tests {
         };
         mgr.append_tool_result(&mut st, &result, &sb).await.unwrap();
         match &st.message_history[0].content {
-            Content::Text { text } => assert_eq!(text, "hello"),
-            _ => panic!(),
+            Content::ToolResult(tr) => {
+                assert_eq!(tr.content, "hello");
+                assert_eq!(tr.tool_use_id, "c1");
+                assert!(!tr.is_error);
+            }
+            other => panic!("expected a linked ToolResult, got {other:?}"),
+        }
+    }
+
+    // An error result must be distinguishable from a successful one by SHAPE,
+    // not only by whatever prefix happens to be in the text. This is what lets a
+    // model tell which of several parallel calls actually failed.
+    #[tokio::test]
+    async fn append_tool_result_flags_an_error_result() {
+        let mgr = mk();
+        let mut st = state();
+        let sb = PassthroughSandbox;
+        let result = HarnessToolResult {
+            call_id: "c9".into(),
+            output: ToolOutput::Error {
+                message: "move failed: No such file or directory".into(),
+                recoverable: true,
+            },
+        };
+        mgr.append_tool_result(&mut st, &result, &sb).await.unwrap();
+        match &st.message_history[0].content {
+            Content::ToolResult(tr) => {
+                assert_eq!(tr.tool_use_id, "c9");
+                assert!(tr.is_error);
+                assert!(tr.content.contains("move failed"));
+            }
+            other => panic!("expected a linked ToolResult, got {other:?}"),
         }
     }
 
@@ -1912,10 +1950,7 @@ mod tests {
         context_window: u32,
     }
     impl ModelInterface for WindowModel {
-        fn call<'a>(
-            &'a self,
-            _req: ModelRequest,
-        ) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
+        fn call<'a>(&'a self, _req: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
             Box::pin(async move { unimplemented!() })
         }
         fn call_streaming<'a>(

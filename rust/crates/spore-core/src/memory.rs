@@ -30,9 +30,9 @@
 //!   - Versions are retained — `get_version_history` walks the
 //!     `previous_versions` chain.
 
+use crate::sync_util::MutexExt;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use crate::sync_util::MutexExt;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -320,8 +320,10 @@ pub trait MemoryProvider: Send + Sync {
         memory: SemanticMemory,
         on_conflict: MergeStrategy,
     ) -> BoxFut<'a, Result<MemoryId, MemoryError>>;
-    fn get_semantic<'a>(&'a self, id: &'a MemoryId)
-        -> BoxFut<'a, Result<SemanticMemory, MemoryError>>;
+    fn get_semantic<'a>(
+        &'a self,
+        id: &'a MemoryId,
+    ) -> BoxFut<'a, Result<SemanticMemory, MemoryError>>;
 
     /// Primary retrieval path. Returns items with score >= `min_relevance`,
     /// capped at `max_items`, sorted by score descending. Only `Active` memories.

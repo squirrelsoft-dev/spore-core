@@ -16,6 +16,9 @@
 //!   - [`read_file`](StandardTools::read_file) → `read_file` (EXISTING #5 tool)
 //!   - [`write_file`](StandardTools::write_file) → `write_file` (EXISTING)
 //!   - [`edit_file`](StandardTools::edit_file) → `edit_file` (NEW)
+//!   - [`create_dir`](StandardTools::create_dir) → `create_dir` (NEW, mkdir -p)
+//!   - [`move_file`](StandardTools::move_file) → `move_file` (EXISTING #5 impl, catalogued later)
+//!   - [`delete_file`](StandardTools::delete_file) → `delete_file` (EXISTING #5 impl, catalogued later)
 //!   - [`list_dir`](StandardTools::list_dir) → `list_dir` (EXISTING)
 //!   - [`grep_files`](StandardTools::grep_files) → `grep_files` (EXISTING)
 //!   - [`grep`](StandardTools::grep) → `grep` (NEW, output modes)
@@ -64,7 +67,9 @@ use crate::tool_registry::{Tool, ToolSchema};
 use crate::tools::control::{AbortTool, AskUserQuestionTool, EnterPlanModeTool, ExitPlanModeTool};
 use crate::tools::edit::EditFileTool;
 use crate::tools::exec::BashCommandTool;
-use crate::tools::fs::{ListDirTool, ReadFileTool, WriteFileTool};
+use crate::tools::fs::{
+    CreateDirTool, DeleteFileTool, ListDirTool, MoveFileTool, ReadFileTool, WriteFileTool,
+};
 use crate::tools::memory::MemoryTool;
 use crate::tools::message::SendMessageTool;
 use crate::tools::search::{FindFilesTool, GrepFilesTool, GrepTool};
@@ -118,6 +123,25 @@ impl StandardTools {
     /// `edit_file` — NEW unique-match in-place edit (alongside `write_file`).
     pub fn edit_file() -> StandardTool {
         StandardTool::new(Box::new(EditFileTool::new()), EditFileTool::schema())
+    }
+
+    /// `create_dir` — NEW; mkdir -p inside the sandbox. `write_file` also
+    /// creates missing parents implicitly; this is the explicit form so a
+    /// model can lay out directory structure ahead of the files.
+    pub fn create_dir() -> StandardTool {
+        StandardTool::new(Box::new(CreateDirTool::new()), CreateDirTool::schema())
+    }
+
+    /// `move_file` — EXISTING #5 impl; rename/move within the sandbox,
+    /// creating the destination directory as needed. The atomic alternative
+    /// to a read/write/delete chain.
+    pub fn move_file() -> StandardTool {
+        StandardTool::new(Box::new(MoveFileTool::new()), MoveFileTool::schema())
+    }
+
+    /// `delete_file` — EXISTING #5 impl; remove a single file in the sandbox.
+    pub fn delete_file() -> StandardTool {
+        StandardTool::new(Box::new(DeleteFileTool::new()), DeleteFileTool::schema())
     }
 
     /// `list_dir` — EXISTING #5 tool (Q5 overlap: reused, not renamed).
@@ -257,6 +281,9 @@ impl StandardTools {
             Self::read_file(),
             Self::write_file(),
             Self::edit_file(),
+            Self::create_dir(),
+            Self::move_file(),
+            Self::delete_file(),
             Self::list_dir(),
             Self::grep_files(),
             Self::grep(),
@@ -315,6 +342,9 @@ mod tests {
         for forbidden in [
             "write_file",
             "edit_file",
+            "create_dir",
+            "move_file",
+            "delete_file",
             "bash_command",
             "todo_write",
             "enter_plan_mode",

@@ -125,12 +125,12 @@
 //! Memory addressing stays [`SessionId`]-keyed for v1. v2 should address
 //! session-independent / cross-session memory keying — do not introduce it here.
 
+use crate::sync_util::MutexExt;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use crate::sync_util::MutexExt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;

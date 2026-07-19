@@ -5,13 +5,13 @@ use serde_json::json;
 
 use crate::harness::{BoxFut, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
-use crate::tools::tool_try;
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::error::ToolExecutionError;
 use crate::tools::finish_with_possible_truncation;
 use crate::tools::params::{
     parse_params, GitCommitParams, GitDiffParams, GitLogParams, GitResetParams,
 };
+use crate::tools::tool_try;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

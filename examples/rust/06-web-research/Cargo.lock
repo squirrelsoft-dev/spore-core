@@ -1244,10 +1244,12 @@ name = "spore-core"
 version = "0.0.0"
 dependencies = [
  "async-stream",
+ "base64",
  "futures-core",
  "futures-util",
  "glob",
  "ignore",
+ "libc",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

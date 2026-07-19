@@ -40,9 +40,16 @@ impl ContextManager for NoopContextManager {
                 ToolOutput::AwaitingClarification { .. } => "[clarification]".into(),
                 ToolOutput::Consult { .. } => "[consult]".into(),
             };
+            // Mirrors the real context managers: results are structural and name
+            // the call they answer. A double that flattened this to text would
+            // let a test pass while production shipped unlinked tool messages.
             session.messages.push(Message {
                 role: crate::model::Role::Tool,
-                content: crate::model::Content::Text { text },
+                content: crate::model::Content::ToolResult(crate::model::ToolResult {
+                    tool_use_id: result.call_id.clone(),
+                    content: text,
+                    is_error: crate::compaction_adapter::tool_result_is_error(&result.output),
+                }),
             });
         })
     }

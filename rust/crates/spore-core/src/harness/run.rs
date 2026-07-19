@@ -68,8 +68,7 @@ impl StandardHarness {
         // pending calls) through the pausing leaf's own toolset handle, restoring
         // its scoped per-node catalogue. An empty handle (the default) still falls
         // back to the global catalogue, so pre-#140 blobs behave unchanged.
-        let tool_registry =
-            self.effective_tool_registry(&session_id, &toolset, on_stream.as_ref());
+        let tool_registry = self.effective_tool_registry(&session_id, &toolset, on_stream.as_ref());
 
         // Inject the consult answer as the RESULT of the head pending (consult)
         // call, then dispatch the remaining pending calls in the same batch.
@@ -88,8 +87,11 @@ impl StandardHarness {
                 .await;
         }
         for call in pending {
-            let output =
-                self.normalize_sandbox_violation(self.dispatch_with_repair(tool_registry.as_ref(), call.clone()).await.1);
+            let output = self.normalize_sandbox_violation(
+                self.dispatch_with_repair(tool_registry.as_ref(), call.clone())
+                    .await
+                    .1,
+            );
             let tr = ToolResult {
                 call_id: call.id,
                 output,
@@ -650,11 +652,17 @@ impl StandardHarness {
             let result = match output {
                 ToolOutput::Success { content, .. } => {
                     let (content, t) = truncate_field(content, cc.max_field_len);
-                    Some(ToolResultContent { content, truncated: t })
+                    Some(ToolResultContent {
+                        content,
+                        truncated: t,
+                    })
                 }
                 ToolOutput::Error { message, .. } => {
                     let (content, t) = truncate_field(message, cc.max_field_len);
-                    Some(ToolResultContent { content, truncated: t })
+                    Some(ToolResultContent {
+                        content,
+                        truncated: t,
+                    })
                 }
                 _ => None,
             };
@@ -683,7 +691,9 @@ impl StandardHarness {
             started_at,
         );
         let status = if matches!(output, ToolOutput::Error { .. }) {
-            SpanStatus::Error { message: "tool returned a recoverable error".into() }
+            SpanStatus::Error {
+                message: "tool returned a recoverable error".into(),
+            }
         } else {
             SpanStatus::Ok
         };
@@ -864,8 +874,7 @@ impl StandardHarness {
         // per-leaf toolsets during the re-drive — so this line is only reached by
         // the Clarification / direct-resume paths whose pending calls need the
         // carried handle.
-        let tool_registry =
-            self.effective_tool_registry(&session_id, &toolset, on_stream.as_ref());
+        let tool_registry = self.effective_tool_registry(&session_id, &toolset, on_stream.as_ref());
 
         // Clarification resume (issue #81, Q4b): if this pause came from
         // `ToolOutput::AwaitingClarification`, the human's answer is injected as
@@ -895,8 +904,11 @@ impl StandardHarness {
                 for call in pending {
                     let tool_started_at = Timestamp::now();
                     let tool_clock = std::time::Instant::now();
-                    let output = self
-                        .normalize_sandbox_violation(self.dispatch_with_repair(tool_registry.as_ref(), call.clone()).await.1);
+                    let output = self.normalize_sandbox_violation(
+                        self.dispatch_with_repair(tool_registry.as_ref(), call.clone())
+                            .await
+                            .1,
+                    );
                     self.emit_resumed_tool_call(
                         &session_id,
                         &task,
@@ -1039,8 +1051,11 @@ impl StandardHarness {
                     );
                     let tool_started_at = Timestamp::now();
                     let tool_clock = std::time::Instant::now();
-                    let output = self
-                        .normalize_sandbox_violation(self.dispatch_with_repair(tool_registry.as_ref(), call.clone()).await.1);
+                    let output = self.normalize_sandbox_violation(
+                        self.dispatch_with_repair(tool_registry.as_ref(), call.clone())
+                            .await
+                            .1,
+                    );
                     // Observability span — gated tools dispatch on the resume path;
                     // emit here too, else they are missing from the trace (the
                     // single inline emit in `react.rs` never runs for them).
@@ -1092,8 +1107,11 @@ impl StandardHarness {
                     );
                     let tool_started_at = Timestamp::now();
                     let tool_clock = std::time::Instant::now();
-                    let output = self
-                        .normalize_sandbox_violation(self.dispatch_with_repair(tool_registry.as_ref(), call.clone()).await.1);
+                    let output = self.normalize_sandbox_violation(
+                        self.dispatch_with_repair(tool_registry.as_ref(), call.clone())
+                            .await
+                            .1,
+                    );
                     // Observability span — gated tools dispatch on the resume path;
                     // emit here too, else they are missing from the trace (the
                     // single inline emit in `react.rs` never runs for them).

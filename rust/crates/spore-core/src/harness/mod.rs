@@ -171,14 +171,14 @@ use crate::verifier::{VerifierInput, VerifierVerdict};
 /// return shape.
 pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-mod react;
-mod self_verifying;
-mod ralph;
+mod compaction;
 mod hill_climbing;
 mod plan_execute;
-mod compaction;
-mod strategy_executor;
+mod ralph;
+mod react;
 mod run;
+mod self_verifying;
+mod strategy_executor;
 
 mod budget;
 pub use budget::*;
@@ -244,7 +244,6 @@ fn random_id() -> String {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     format!("{n:016x}")
 }
-
 
 // ============================================================================
 // Task + loop strategy
@@ -707,7 +706,6 @@ pub enum StrategyOutcome {
     /// The strategy halted with a harness error.
     Failed(HarnessError),
 }
-
 
 /// The one shared, mutable runtime context threaded through a whole nested
 /// strategy tree. Borrows the [`ExecutionRegistry`] for the duration of the
@@ -1201,16 +1199,11 @@ pub trait HillExecutor: CoreExecutor {
 /// `&dyn StrategyExecutor` and each `*Config::run` body still reaches whatever
 /// primitives it needs (supertrait methods are callable on the trait object),
 /// while the trait *definitions* are now segregated by concern (ISP).
-pub trait StrategyExecutor:
-    ReactExecutor + PlanExecutor + RalphExecutor + HillExecutor
-{
-}
-
+pub trait StrategyExecutor: ReactExecutor + PlanExecutor + RalphExecutor + HillExecutor {}
 
 // ============================================================================
 // StandardHarness — the canonical implementation
 // ============================================================================
-
 
 pub struct StandardHarness {
     config: HarnessConfig,
@@ -1531,6 +1524,7 @@ impl StandardHarness {
             name: call.name.clone(),
             arguments,
             arguments_truncated: truncated,
+            id: Some(call.id.clone()),
         }
     }
 
@@ -1542,6 +1536,12 @@ impl StandardHarness {
     ///   - `ToolResult(tr)`       → `tr.content` (role stays `Tool`)
     ///   - `ToolCall(tc)`         → `"<name> <compact-json-args>"` (assistant)
     ///   - `Image { media_type }` → `"[image <media_type>]"` — NEVER the base64
+    ///
+    /// The rendering above is lossy BY DESIGN (it is what a human reads), so the
+    /// tool-linkage ids that `ToolCall` / `ToolResult` carry are ALSO captured
+    /// structurally on the [`GenAiMessage`] rather than only rendered into the
+    /// string. Without them a trace cannot distinguish "the result linked back to
+    /// the call" from "the result arrived unlinked" — the two render identically.
     ///
     /// System-first, then history order is preserved because the assembled
     /// `messages` already lead with the `Role::System` prompt.
@@ -1565,10 +1565,26 @@ impl StandardHarness {
                     Content::Image { media_type, .. } => format!("[image {media_type}]"),
                 };
                 let (content, truncated) = truncate_field(&rendered, max);
+                // Mirror the linkage verbatim from the typed content — never
+                // parse it back out of `rendered`.
+                let (tool_call_id, tool_calls, is_error) = match &m.content {
+                    Content::ToolResult(tr) => {
+                        (Some(tr.tool_use_id.clone()), None, Some(tr.is_error))
+                    }
+                    Content::ToolCall(tc) => (
+                        None,
+                        Some(vec![Self::capture_tool_call_args(tc, max)]),
+                        None,
+                    ),
+                    _ => (None, None, None),
+                };
                 GenAiMessage {
                     role,
                     content,
                     truncated,
+                    tool_call_id,
+                    tool_calls,
+                    is_error,
                 }
             })
             .collect()
@@ -1744,7 +1760,6 @@ impl StandardHarness {
             LoopStrategy::HillClimbing(c) => self.worker_agent_key(&c.inner),
         }
     }
-
 }
 
 impl Harness for StandardHarness {

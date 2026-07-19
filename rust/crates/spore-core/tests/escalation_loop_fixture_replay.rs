@@ -73,6 +73,7 @@ async fn escalation_loop_returns_escalate_and_skips_history_append() {
         error_loop_threshold: 3,
         plan_empty_max_retries: 0,
         tool_call_nudge: false,
+        steering_source: None,
         tool_search: None,
         enforce_output_schemas: false,
         output_schema_max_retries: 2,

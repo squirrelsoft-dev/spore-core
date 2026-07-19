@@ -67,7 +67,7 @@ mod tests {
 
     use serde_json::json;
     use spore_core::harness::BoxFut;
-    use spore_core::storage::InMemoryStorageProvider;
+    use spore_core::storage::{InMemoryStorageProvider, ProjectId};
     use spore_core::{
         SandboxProvider, SandboxViolation, SessionId, ToolCall, ToolContext, ToolOutput,
     };
@@ -86,7 +86,12 @@ mod tests {
 
     fn in_memory_ctx() -> ToolContext {
         let backend = Arc::new(InMemoryStorageProvider::new());
-        ToolContext::new(SessionId::new(SESSION), backend.clone(), backend)
+        ToolContext::new(
+            SessionId::new(SESSION),
+            ProjectId::from_canonical_path("/example-project"),
+            backend.clone(),
+            backend,
+        )
     }
 
     fn recall_call(input: serde_json::Value) -> ToolCall {

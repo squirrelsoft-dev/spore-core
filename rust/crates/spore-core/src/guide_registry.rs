@@ -40,9 +40,9 @@
 //!     supply a `now` via [`StandardGuideRegistry::set_now`] for deterministic
 //!     tests; otherwise the system clock is used.
 
+use crate::sync_util::MutexExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use crate::sync_util::MutexExt;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};

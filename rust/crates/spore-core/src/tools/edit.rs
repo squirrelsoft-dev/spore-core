@@ -15,6 +15,7 @@
 //!    both sides (per-line trailing whitespace stripped; smart quotes,
 //!    Unicode dashes, and exotic spaces mapped to ASCII) and, if that finds a
 //!    UNIQUE match, maps it back to the original byte span and replaces it.
+//!
 //! Uniqueness is still required on whichever pass matches — the fallback
 //! loosens the comparison, never the contract.
 //!
@@ -25,10 +26,10 @@ use serde_json::json;
 
 use crate::harness::{BoxFut, Operation, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
-use crate::tools::tool_try;
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::error::ToolExecutionError;
 use crate::tools::params::{parse_params, EditFileParams};
+use crate::tools::tool_try;
 
 pub struct EditFileTool;
 
@@ -93,7 +94,10 @@ impl Tool for EditFileTool {
                     recoverable: true,
                 };
             }
-            let resolved = tool_try!(sandbox.resolve_path(&params.path, Operation::Write).await.map_err(ToolExecutionError::SandboxViolation));
+            let resolved = tool_try!(sandbox
+                .resolve_path(&params.path, Operation::Write)
+                .await
+                .map_err(ToolExecutionError::SandboxViolation));
             let raw = match tokio::fs::read_to_string(&resolved).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -239,7 +243,11 @@ fn normalize_for_fuzzy(source: &str) -> (String, Vec<usize>) {
             '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
             '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
             '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}' | '\u{2212}' => '-',
-            '\u{00A0}' | '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}'
+            '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200A}'
+            | '\u{202F}'
+            | '\u{205F}'
             | '\u{3000}' => ' ',
             other => other,
         };
@@ -422,7 +430,9 @@ mod tests {
     async fn edit_crlf_file_with_lf_old_string_preserves_crlf() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("a.txt");
-        tokio::fs::write(&path, "one\r\ntwo\r\nthree\r\n").await.unwrap();
+        tokio::fs::write(&path, "one\r\ntwo\r\nthree\r\n")
+            .await
+            .unwrap();
         let r = run_edit(&path, "one\ntwo\n", "uno\ndos\n").await;
         assert!(matches!(r, ToolOutput::Success { .. }), "got {r:?}");
         assert_eq!(
@@ -440,8 +450,12 @@ mod tests {
         tokio::fs::write(&path, "fn main() {   \n    body();\t\n}\n")
             .await
             .unwrap();
-        let r = run_edit(&path, "fn main() {\n    body();\n}", "fn main() {\n    improved();\n}")
-            .await;
+        let r = run_edit(
+            &path,
+            "fn main() {\n    body();\n}",
+            "fn main() {\n    improved();\n}",
+        )
+        .await;
         match &r {
             ToolOutput::Success { content, .. } => {
                 assert!(content.contains("whitespace-tolerant"), "got {content:?}")
@@ -459,9 +473,12 @@ mod tests {
     async fn edit_tolerates_smart_punctuation() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("a.md");
-        tokio::fs::write(&path, "It\u{2019}s a \u{201C}test\u{201D} \u{2014} really\n")
-            .await
-            .unwrap();
+        tokio::fs::write(
+            &path,
+            "It\u{2019}s a \u{201C}test\u{201D} \u{2014} really\n",
+        )
+        .await
+        .unwrap();
         let r = run_edit(&path, "It's a \"test\" - really", "plain now").await;
         assert!(matches!(r, ToolOutput::Success { .. }), "got {r:?}");
         assert_eq!(
@@ -477,10 +494,15 @@ mod tests {
         let path = dir.path().join("a.txt");
         // "line()\n" is in the file only with trailing whitespace before the
         // newline, so the exact pass misses and the fallback sees TWO matches.
-        tokio::fs::write(&path, "line()  \nline()\t\n").await.unwrap();
+        tokio::fs::write(&path, "line()  \nline()\t\n")
+            .await
+            .unwrap();
         let r = run_edit(&path, "line()\n", "other()\n").await;
         match r {
-            ToolOutput::Error { message, recoverable } => {
+            ToolOutput::Error {
+                message,
+                recoverable,
+            } => {
                 assert!(recoverable);
                 assert!(message.contains("not unique"), "got {message:?}");
                 assert!(message.contains("whitespace-tolerant"), "got {message:?}");
@@ -493,7 +515,9 @@ mod tests {
     async fn edit_preserves_bom() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("a.txt");
-        tokio::fs::write(&path, "\u{FEFF}hello world\n").await.unwrap();
+        tokio::fs::write(&path, "\u{FEFF}hello world\n")
+            .await
+            .unwrap();
         let r = run_edit(&path, "world", "there").await;
         assert!(matches!(r, ToolOutput::Success { .. }), "got {r:?}");
         assert_eq!(
@@ -509,7 +533,10 @@ mod tests {
         tokio::fs::write(&path, "hello\n").await.unwrap();
         let r = run_edit(&path, "", "x").await;
         match r {
-            ToolOutput::Error { message, recoverable } => {
+            ToolOutput::Error {
+                message,
+                recoverable,
+            } => {
                 assert!(recoverable);
                 assert!(message.contains("write_file"), "got {message:?}");
             }
@@ -524,7 +551,10 @@ mod tests {
         tokio::fs::write(&path, "hello\n").await.unwrap();
         let r = run_edit(&path, "hello", "hello").await;
         match r {
-            ToolOutput::Error { message, recoverable } => {
+            ToolOutput::Error {
+                message,
+                recoverable,
+            } => {
                 assert!(recoverable);
                 assert!(message.contains("identical"), "got {message:?}");
             }

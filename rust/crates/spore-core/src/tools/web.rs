@@ -62,11 +62,11 @@ use thiserror::Error;
 
 use crate::harness::{BoxFut, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
-use crate::tools::tool_try;
 use crate::text_util::floor_char_boundary;
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::finish_with_possible_truncation;
 use crate::tools::params::{parse_params, WebFetchParams, WebSearchParams};
+use crate::tools::tool_try;
 
 use crate::tools::shared_client;
 
@@ -96,7 +96,9 @@ pub struct UrlPolicy {
 impl UrlPolicy {
     /// Allow every URL (the default). No SSRF restrictions.
     pub fn permissive() -> Self {
-        Self { deny_private: false }
+        Self {
+            deny_private: false,
+        }
     }
 
     /// Reject non-`http(s)` schemes and private/loopback/link-local/metadata

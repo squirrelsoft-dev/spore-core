@@ -227,9 +227,7 @@ impl StandardHarness {
         }
         out
     }
-
 }
-
 
 // ── RunStrategy: the HillClimbing body (#124, moved from strategies.rs) ──
 impl RunStrategy for HillClimbingConfig {

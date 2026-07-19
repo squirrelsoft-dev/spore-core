@@ -219,7 +219,10 @@ fn parse_tool_call_block(block: &str) -> Option<(String, serde_json::Value)> {
         if key.is_empty() {
             continue;
         }
-        map.insert(key.to_string(), serde_json::Value::String(v.as_str().trim().to_string()));
+        map.insert(
+            key.to_string(),
+            serde_json::Value::String(v.as_str().trim().to_string()),
+        );
     }
     if !map.is_empty() {
         return Some((name, serde_json::Value::Object(map)));
@@ -397,9 +400,9 @@ impl<M: ModelInterface + 'static> ModelInterface for PromptBasedToolCallModelInt
         mut request: ModelRequest,
     ) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
         Box::pin(async move {
-        inject_tool_prompt(&mut request);
-        let response = self.inner.call(request).await?;
-        Ok(parse_prose_response(response))
+            inject_tool_prompt(&mut request);
+            let response = self.inner.call(request).await?;
+            Ok(parse_prose_response(response))
         })
     }
 
@@ -458,12 +461,12 @@ impl<M: ModelInterface + 'static> ModelInterface for AdaptiveToolCallModelInterf
         mut request: ModelRequest,
     ) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
         Box::pin(async move {
-        if !self.flag.load(Ordering::Acquire) {
-            return self.inner.call(request).await;
-        }
-        inject_tool_prompt(&mut request);
-        let response = self.inner.call(request).await?;
-        Ok(parse_prose_response(response))
+            if !self.flag.load(Ordering::Acquire) {
+                return self.inner.call(request).await;
+            }
+            inject_tool_prompt(&mut request);
+            let response = self.inner.call(request).await?;
+            Ok(parse_prose_response(response))
         })
     }
 
@@ -472,10 +475,10 @@ impl<M: ModelInterface + 'static> ModelInterface for AdaptiveToolCallModelInterf
         request: ModelRequest,
     ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
         Box::pin(async move {
-        if !self.flag.load(Ordering::Acquire) {
-            return self.inner.call_streaming(request).await;
-        }
-        streaming_prompt_call(&self.inner, request).await
+            if !self.flag.load(Ordering::Acquire) {
+                return self.inner.call_streaming(request).await;
+            }
+            streaming_prompt_call(&self.inner, request).await
         })
     }
 
@@ -625,7 +628,10 @@ mod tests {
             Content::Text { text } => text,
             _ => panic!("system message must be text"),
         };
-        assert!(sys.contains("<name>calculator</name>"), "tool still described in prompt");
+        assert!(
+            sys.contains("<name>calculator</name>"),
+            "tool still described in prompt"
+        );
     }
 
     // --- parsing -------------------------------------------------------------
@@ -750,7 +756,10 @@ mod tests {
             [ContentBlock::ToolUse(tc)] => {
                 assert_eq!(tc.name, "edit_file");
                 assert_eq!(tc.input["path"], serde_json::json!("src/App.jsx"));
-                assert_eq!(tc.input["old_string"], serde_json::json!("function App() {"));
+                assert_eq!(
+                    tc.input["old_string"],
+                    serde_json::json!("function App() {")
+                );
                 assert_eq!(
                     tc.input["new_string"],
                     serde_json::json!("/**\n * Renders a todo app.\n */\nfunction App() {")
@@ -793,7 +802,10 @@ mod tests {
             calls,
             vec![
                 ("list_dir".to_string(), serde_json::json!({ "path": "." })),
-                ("read_file".to_string(), serde_json::json!({ "path": "package.json" })),
+                (
+                    "read_file".to_string(),
+                    serde_json::json!({ "path": "package.json" })
+                ),
             ]
         );
     }

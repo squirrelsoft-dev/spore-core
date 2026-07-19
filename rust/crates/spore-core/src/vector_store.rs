@@ -36,11 +36,7 @@ pub struct VectorRecord {
 }
 
 impl VectorRecord {
-    pub fn new(
-        id: impl Into<String>,
-        vector: Vec<f32>,
-        metadata: serde_json::Value,
-    ) -> Self {
+    pub fn new(id: impl Into<String>, vector: Vec<f32>, metadata: serde_json::Value) -> Self {
         Self {
             id: id.into(),
             vector,
@@ -303,12 +299,21 @@ mod tests {
     #[tokio::test]
     async fn upsert_and_delete_and_len() {
         let store = InMemoryVectorStore::new(2);
-        store.add(vec![rec("a", vec![1.0, 0.0], "chunk")]).await.unwrap();
+        store
+            .add(vec![rec("a", vec![1.0, 0.0], "chunk")])
+            .await
+            .unwrap();
         // Re-adding the same id upserts rather than duplicating.
-        store.add(vec![rec("a", vec![0.0, 1.0], "chunk")]).await.unwrap();
+        store
+            .add(vec![rec("a", vec![0.0, 1.0], "chunk")])
+            .await
+            .unwrap();
         assert_eq!(store.len().await.unwrap(), 1);
 
-        store.add(vec![rec("b", vec![0.0, 1.0], "summary")]).await.unwrap();
+        store
+            .add(vec![rec("b", vec![0.0, 1.0], "summary")])
+            .await
+            .unwrap();
         let removed = store
             .delete(MetadataFilter::new().eq("kind", "chunk"))
             .await

@@ -109,6 +109,18 @@ fn render_context_block(sources: &ContextSources) -> String {
     parts.join("\n\n")
 }
 
+/// Whether a tool result should reach the model flagged as an error.
+///
+/// Only the outcomes that mean "this did not work". A flat text rendering cannot
+/// express this, which is why a failed result and a successful one were
+/// previously indistinguishable in history.
+pub(crate) fn tool_result_is_error(output: &ToolOutput) -> bool {
+    matches!(
+        output,
+        ToolOutput::Error { .. } | ToolOutput::SandboxViolation { .. }
+    )
+}
+
 /// Render a tool result into the flat text the adapter records as a `Role::Tool`
 /// message. Shared by `append_tool_result` (the normal path) and
 /// `replace_tool_result` (the AfterTool middleware in-place rewrite, SC-9) so the
@@ -201,10 +213,20 @@ impl<M: ModelInterface + 'static> HarnessContextManager for StandardCompactionAd
         result: &'a ToolResult,
     ) -> BoxFut<'a, ()> {
         let text = render_tool_result_text(&result.output);
+        let is_error = tool_result_is_error(&result.output);
         Box::pin(async move {
+            // Structural, not flat text: the `tool_use_id` back-link is what lets
+            // a provider serializer emit a spec-valid tool message (OpenAI
+            // `tool_call_id`, Anthropic `tool_result.tool_use_id`). Without it a
+            // model given several parallel calls cannot tell which result answers
+            // which call.
             session.messages.push(Message {
                 role: Role::Tool,
-                content: Content::Text { text },
+                content: Content::ToolResult(crate::model::ToolResult {
+                    tool_use_id: result.call_id.clone(),
+                    content: text,
+                    is_error,
+                }),
             });
         })
     }
@@ -220,11 +242,19 @@ impl<M: ModelInterface + 'static> HarnessContextManager for StandardCompactionAd
         result: &'a ToolResult,
     ) -> BoxFut<'a, ()> {
         let text = render_tool_result_text(&result.output);
+        let is_error = tool_result_is_error(&result.output);
         Box::pin(async move {
             if let Some(msg) = session.messages.get_mut(message_index) {
+                // Must mirror `append_tool_result` exactly — a rewrite that
+                // dropped the back-link would silently unlink the one result a
+                // middleware cared enough about to rewrite.
                 *msg = Message {
                     role: Role::Tool,
-                    content: Content::Text { text },
+                    content: Content::ToolResult(crate::model::ToolResult {
+                        tool_use_id: result.call_id.clone(),
+                        content: text,
+                        is_error,
+                    }),
                 };
             }
         })
@@ -393,16 +423,13 @@ mod tests {
 
     struct StubModel;
     impl ModelInterface for StubModel {
-        fn call<'a>(
-            &'a self,
-            _req: ModelRequest,
-        ) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
+        fn call<'a>(&'a self, _req: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
             Box::pin(async move {
-            Ok(ModelResponse {
-                content: vec![],
-                stop_reason: StopReason::EndTurn,
-                usage: TokenUsage::default(),
-            })
+                Ok(ModelResponse {
+                    content: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                })
             })
         }
         fn call_streaming<'a>(
@@ -497,7 +524,9 @@ mod tests {
         let idx = state.messages.len() - 1;
         assert!(matches!(
             &state.messages[idx].content,
-            Content::Text { text } if text == "ORIGINAL"
+            Content::ToolResult(tr) if tr.content == "ORIGINAL"
+                && tr.tool_use_id == "c1"
+                && !tr.is_error
         ));
 
         // A middleware rewrote the result; re-render the recorded message.
@@ -508,11 +537,17 @@ mod tests {
                 recoverable: true,
             },
         };
-        adapter.replace_tool_result(&mut state, idx, &rewritten).await;
+        adapter
+            .replace_tool_result(&mut state, idx, &rewritten)
+            .await;
         assert_eq!(state.messages.len(), 1, "no message added on replace");
+        // The rewrite keeps the back-link AND picks up the new error status —
+        // a middleware turning a success into an error must be visible as one.
         assert!(matches!(
             (&state.messages[idx].role, &state.messages[idx].content),
-            (Role::Tool, Content::Text { text }) if text == "REWRITTEN"
+            (Role::Tool, Content::ToolResult(tr)) if tr.content == "REWRITTEN"
+                && tr.tool_use_id == "c1"
+                && tr.is_error
         ));
 
         // Out-of-range index is a defensive no-op.
