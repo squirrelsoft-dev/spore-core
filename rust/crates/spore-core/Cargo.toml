@@ -30,9 +30,11 @@ opentelemetry-otlp = { version = "0.30", default-features = false, features = ["
 # MicroVM isolation backend (feature `petri`): the sibling petri sandbox
 # runtime. Pinned to a rev until petri publishes to crates.io; macOS/Apple-silicon
 # only at runtime, but the crate itself builds everywhere. NOTE: cargo resolves
-# path/git deps even when the feature is OFF, so this must stay fetchable — a
-# local path here would break the build for anyone without a sibling checkout.
-petri = { git = "ssh://git@github.com/squirrelsoft-dev/petri.git", rev = "0e56420f2066b4766385250436361ee96e2296da", optional = true }
+# path/git deps even when the feature is OFF, so this must stay fetchable by a
+# bare CI runner — a local path breaks anyone without a sibling checkout, and an
+# ssh:// URL needs a key the runner does not have. petri is public, so https
+# fetches anonymously with no credentials.
+petri = { git = "https://github.com/squirrelsoft-dev/petri.git", rev = "0e56420f2066b4766385250436361ee96e2296da", optional = true }
 
 # Process-group kill for `execute_command` timeouts/aborts (kill(-pgid)):
 # tokio's kill_on_drop only reaps the DIRECT child, orphaning grandchildren
