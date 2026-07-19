@@ -296,26 +296,34 @@ describe("executeCommand spawn failure (SC-15)", () => {
 
   // SC-15 breadth parity (#164): a start failure whose errno is NOT ENOENT/EACCES
   // must still become exec_spawn_failed (Rust/Python/Go convert ANY start error).
-  // An empty 0755 file is "executable" to the OS but not a valid binary, so
-  // exec(2) fails with ENOEXEC — which Node raises as a SYNCHRONOUS spawn() throw
-  // (not the async `"error"` event). The handler converts that throw too.
-  it.runIf(IS_UNIX)("a non-ENOENT start failure (ENOEXEC) yields exec_spawn_failed", async () => {
-    const root = tmp();
-    const notABinary = join(root, "not-a-binary");
-    writeFileSync(notABinary, "");
-    chmodSync(notABinary, 0o755);
-    const out = await sb_run(root, notABinary);
-    expect("kind" in out).toBe(true);
-    const v = out as SandboxViolation;
-    expect(v.kind).toBe("exec_spawn_failed");
-    if (v.kind === "exec_spawn_failed") {
-      expect(v.command).toBe(notABinary);
-      // Prove the broadening: the errno is neither ENOENT nor EACCES.
-      expect(v.message).not.toContain("ENOENT");
-      expect(v.message).not.toContain("EACCES");
-    }
-    expect(sandboxViolationIsAlwaysHalt(v)).toBe(false);
-  });
+  // A path component longer than NAME_MAX (255 on both Linux and macOS) fails
+  // with ENAMETOOLONG, which Node raises as a SYNCHRONOUS spawn() throw (not the
+  // async `"error"` event). The handler converts that throw too.
+  //
+  // Do NOT reach for an empty 0755 file to provoke ENOEXEC here: that is
+  // macOS-only behaviour. glibc's execvp retries an ENOEXEC failure as
+  // `/bin/sh <file>`, so on Linux the empty file runs as an empty shell script
+  // and exits 0 — the spawn SUCCEEDS and there is no violation to assert on.
+  // ENAMETOOLONG comes out of kernel path resolution, before exec ever inspects
+  // the file, so no libc fallback can intercept it on either platform.
+  it.runIf(IS_UNIX)(
+    "a non-ENOENT start failure (ENAMETOOLONG) yields exec_spawn_failed",
+    async () => {
+      const root = tmp();
+      const tooLongName = join(root, "x".repeat(300));
+      const out = await sb_run(root, tooLongName);
+      expect("kind" in out).toBe(true);
+      const v = out as SandboxViolation;
+      expect(v.kind).toBe("exec_spawn_failed");
+      if (v.kind === "exec_spawn_failed") {
+        expect(v.command).toBe(tooLongName);
+        // Prove the broadening: the errno is neither ENOENT nor EACCES.
+        expect(v.message).not.toContain("ENOENT");
+        expect(v.message).not.toContain("EACCES");
+      }
+      expect(sandboxViolationIsAlwaysHalt(v)).toBe(false);
+    },
+  );
 
   it.runIf(IS_UNIX)(
     "a timeout keeps the legacy CommandOutput { exit_code: -1, timed_out }",
