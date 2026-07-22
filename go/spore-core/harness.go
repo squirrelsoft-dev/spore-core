@@ -2713,6 +2713,12 @@ const (
 	// detected error loop, not because the step budget ran out. Carries the
 	// offending Tool name and the ConsecutiveErrors count at the hard stop (2*N).
 	HaltToolErrorLoop HaltReasonKind = "tool_error_loop"
+	// HaltRepeatedToolCall (the no-progress twin of the error breaker, #137): the
+	// model called the SAME tool with identical args and SUCCEEDED 2*N times in a
+	// row, so the run hard-stops. The same N/2N error_loop_threshold drives both
+	// breakers; the offending tool name reuses the Tool field and the count reuses
+	// ConsecutiveErrors. send_message is exempt (benign narration).
+	HaltRepeatedToolCall HaltReasonKind = "repeated_tool_call"
 	// HaltOutputSchemaViolation (issue #139) is returned when output-schema
 	// enforcement is ON (HarnessConfig.EnforceOutputSchemas) for a ReactConfig
 	// leaf carrying Output != nil, and the leaf's terminal FinalResponse STILL
@@ -5130,6 +5136,14 @@ func (h *StandardHarness) runReActInner(
 	// 2*N.
 	errorLoopN := h.config.effectiveErrorLoopThreshold()
 	errorRuns := map[string]*errorRun{}
+	// Repeated-identical-successful-call breaker state (#137, the no-progress
+	// twin of the error breaker). lastSuccessSig is the (name, args) of the last
+	// SUCCESS; repeatCount is the consecutive identical-success run; repeatInjected
+	// records whether the N-threshold nudge has fired for the current run. Driven
+	// by the SAME errorLoopN / 2N thresholds; send_message is exempt.
+	var lastSuccessSig string
+	var repeatCount uint32
+	var repeatInjected bool
 
 	// Output-schema enforcement state (issue #139), loop-local to this window.
 	// outputSchemaRetriesUsed counts the EXTRA retry turns spent on validation
@@ -5963,8 +5977,52 @@ func (h *StandardHarness) runReActInner(
 						pendingCorrective = corrective
 					}
 				} else {
-					// AC1: ANY success for this tool resets its run.
+					// AC1: ANY success for this tool resets its error run.
 					delete(errorRuns, call.Name)
+
+					// ── Repeated-identical-successful-call breaker (#137, no-progress twin) ──
+					// A model that calls the SAME tool with the SAME args and keeps
+					// SUCCEEDING is spinning: it makes no progress and never reaches a
+					// terminal answer. Track consecutive identical successes; nudge once
+					// at N, hard-stop at 2N. send_message is exempt (benign narration a
+					// model may legitimately repeat). Mirrors the Rust reference.
+					if errorLoopN > 0 && call.Name != sendMessageToolName {
+						sig := call.Name + "\x00" + string(call.Input)
+						if lastSuccessSig == sig {
+							repeatCount++
+						} else {
+							lastSuccessSig = sig
+							repeatCount = 1
+							repeatInjected = false
+						}
+						twoN := errorLoopN * 2
+						// 2N: HARD STOP. Do NOT append this result or continue — end with a
+						// typed terminal so the caller/operator can redirect. No remaining
+						// budget is burned.
+						if repeatCount >= twoN {
+							return RunResult{
+								Kind: RunFailure,
+								Reason: HaltReason{
+									Kind:              HaltRepeatedToolCall,
+									Tool:              call.Name,
+									ConsecutiveErrors: repeatCount,
+								},
+								SessionID: sessionID, Usage: usage, Turns: budget.Turns,
+								SessionState: session,
+							}
+						}
+						// N: inject ONE corrective USER message (the same channel the error
+						// breaker uses), once per run, appended after this result.
+						if repeatCount >= errorLoopN && !repeatInjected {
+							repeatInjected = true
+							pendingCorrective = fmt.Sprintf(
+								"You have called the `%s` tool with the same arguments %d times in a row, "+
+									"each returning the same result. Repeating an identical call will not make "+
+									"progress. Take a DIFFERENT action now — or, if you already have what you "+
+									"need, produce your final response (finalize the plan / answer the task).",
+								call.Name, repeatCount)
+						}
+					}
 				}
 
 				// Tool-call span (issue #12), child of the current turn.
