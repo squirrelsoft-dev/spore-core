@@ -820,6 +820,21 @@ from .image import (
     load_image_content,
     media_type_for_extension,
 )
+from .embedding import (
+    EmbeddingInfo,
+    EmbeddingModel,
+    OllamaEmbeddingModel,
+    OpenAIEmbeddingModel,
+    cosine_similarity,
+)
+from .vector_store import (
+    InMemoryVectorStore,
+    MetadataFilter,
+    VectorHit,
+    VectorRecord,
+    VectorStore,
+    VectorStoreError,
+)
 
 __all__ = [
     "ALL_EVENTS",
@@ -1586,4 +1601,17 @@ __all__ = [
     "is_image_path",
     "load_image_content",
     "media_type_for_extension",
+    # Embedding (#parity)
+    "EmbeddingInfo",
+    "EmbeddingModel",
+    "OllamaEmbeddingModel",
+    "OpenAIEmbeddingModel",
+    "cosine_similarity",
+    # VectorStore (#parity)
+    "InMemoryVectorStore",
+    "MetadataFilter",
+    "VectorHit",
+    "VectorRecord",
+    "VectorStore",
+    "VectorStoreError",
 ]
