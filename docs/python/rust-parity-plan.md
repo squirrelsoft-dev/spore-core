@@ -675,11 +675,35 @@ change. The Go and TypeScript parity tasks are prohibited from editing
     `test_provider_retry.py`, `test_tool_dispatch_concurrency.py`).
 13. Final matrix update + full suite + PR.
 
-## 12. Final parity matrix (to be filled at completion)
+## 12. Final parity matrix (implementation complete)
 
-This section will be updated at implementation completion to map every
-planned capability to its implementation commit and passing evidence. Until
-then, all remaining gaps are explicit in §5.
+Rust authoritative revision: `7058db115b4f05b6b7cde1a3f62ba345c202bcde`.
+Python suite: **1715 passed, 8 skipped**; `ruff check` clean; `ruff format --check` clean; all 12 `examples/python/*` import + per-example tests pass.
+
+| Step | Capability | Implementation | Evidence |
+|---|---|---|---|
+| §5.2 | Missing `__init__` re-exports | `__init__.py` import + `__all__` additions | `test_public_api.py` (7) |
+| §5.1/§5.7/§5.9 | Stream-event wire format (`NodeAttr`, `TurnEnd.usage`, `ToolResult.revised`, `UserMessage.steered`, `StreamToolProgress`) | `harness.py` `_StreamEvent` base + `NodeAttr` + `wrap_node_sink` wired in react leaf + 4 combinators; resume-path `StreamToolCall`/`StreamToolResult` emission | `test_harness_stream_events.py` (9); golden `test_harness_streaming.py` normalized |
+| §5.4 | Mid-run `steering_source` | `HarnessConfig`/`HarnessBuilder.steering_source` + react-loop drain → `StreamUserMessage(steered=True)` | `test_harness_stream_events.py` steering test |
+| §5.6 | `CommandProgressSink` + `ToolProgress` | `harness.py` `CommandProgressSink` + `SandboxProvider.execute_command_streaming`; `tool_registry.py` `ToolProgressUpdate`/`ToolProgressSink` + `ToolContext.command_progress`/`with_progress`; `_effective_tool_registry` bridges stream→`StreamToolProgress` | `test_harness_stream_events.py` ToolProgress test |
+| §5.5 | Tool-call repair | new `tool_call_repair.py` (`coerce_tool_args`/`ToolCallFailure`/`detect_prose_response`/`StandardToolCallRepair`); `HarnessConfig.tool_call_repair`/`max_repair_attempts`; `_dispatch_with_repair` in react loop + 4 resume dispatches | `test_tool_call_repair.py` (15) |
+| §5.3 | Hill-climbing VCS-aware revert | `HillCandidate`; `VcsProvider.head/commit_checkpoint/reset_to`; `_hill_climbing_head_sha/commit_accepted/reset_to/apply_winner`; `hill_iteration` mutates `cand`; winner applied at exits; `best_sha` in partial JSON | `test_harness_hill_climbing.py` VCS-aware + winner tests |
+| §5.10/§5.11 | Tool-registry progress + search | `ToolProgressSink`/`ToolProgressUpdate`; `ToolNamespace`/`ToolSearchConfig`/`ToolSearchRegistry` (LRU, budget eviction, namespace collision drop, dispatch-not-gated) | `test_tool_search_registry.py` (10) |
+| §5.12 | `HarnessContextManagerExt` | `compaction_adapter.py` name-parity shim | re-export + `test_public_api.py` |
+| §5.13 | `CustomCondition` | `CustomPredicate` re-export (already implemented) | re-export |
+| §5.14 | `embedding` + `vector_store` (full provider impls) | new `embedding.py` (`cosine_similarity`/`EmbeddingModel`/`OllamaEmbeddingModel`/`OpenAIEmbeddingModel`); new `vector_store.py` (`VectorStore`/`InMemoryVectorStore`/…) | `test_embedding.py` (18) |
+| §5.15 | `image` module | new `image.py` (`media_type_for_extension`/`is_image_path`/`image_content`/`load_image_content`) | `test_image.py` (5) |
+| §5.16 | `set_plan` + `StandardTools` | new `spore_tools/tools/set_plan.py` + `StandardTools.set_plan()` preset | `test_set_plan.py` (6) |
+| §5.17 | Eval/CLI executable validation | `test_eval_cli_fixture.py` pins CLI to shared `core_suite.json` | `test_eval_cli_fixture.py` (7) |
+| §4.15 | Cancellation/timeout/retry/concurrency regression | `test_parity_lifecycle.py` (retryable set, backoff curve, `retryable()`, wall-time budget, `dispatch_all` concurrency) | `test_parity_lifecycle.py` (5) |
+| §10 | `AGENTS.md` parity rule | `AGENTS.md` Rust-authoritative + read-only rule | committed |
+
+### Remaining gaps (explicit)
+
+None outstanding from the approved plan. All 13 implementation steps landed with
+passing tests. The following were confirmed **not applicable** (Rust-internal or
+feature-gated): `text_util`/`sync_util`/`macros`/`provider_http` (internal),
+`sandbox_petri` (feature-gated), `BoxFut` (Rust async type).
 
 ---
 
