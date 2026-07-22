@@ -4487,6 +4487,14 @@ class CommandOutput(_Model):
     truncated: bool = False
 
 
+#: Live progress sink for a RUNNING subprocess (pi-style bash streaming). Each
+#: call delivers a sanitized TAIL SNAPSHOT of the output accumulated so far —
+#: consumers REPLACE the previous preview, never append. Invoked from the
+#: executor's wait loop at most every ~100ms, and only when the snapshot
+#: changed; it must not block. Mirrors Rust's ``CommandProgressSink``.
+CommandProgressSink = Callable[[str], None]
+
+
 class FileRef(_Model):
     """Reference to a file holding offloaded tool output."""
 
@@ -4635,6 +4643,15 @@ class SandboxProvider(Protocol):
         timeout: float | None = None,
     ) -> CommandOutput: ...
 
+    async def execute_command_streaming(
+        self,
+        command: str,
+        args: list[str],
+        working_dir: Path | None = None,
+        timeout: float | None = None,
+        progress: CommandProgressSink | None = None,
+    ) -> CommandOutput: ...
+
     async def handle_large_output(
         self,
         content: str,
@@ -4779,6 +4796,21 @@ class BaseSandboxProvider:
 
     async def validate(self, call: ToolCall) -> SandboxViolation | None:
         return None
+
+    async def execute_command_streaming(
+        self,
+        command: str,
+        args: list[str],
+        working_dir: Path | None = None,
+        timeout: float | None = None,
+        progress: CommandProgressSink | None = None,
+    ) -> CommandOutput:
+        # Default impl ignores ``progress`` and delegates to
+        # :meth:`execute_command` — sandboxes that capture output incrementally
+        # override THIS method (and delegate ``execute_command`` to it). Mirrors
+        # Rust's ``SandboxProvider::execute_command_streaming`` default.
+        _ = progress
+        return await self.execute_command(command, args, working_dir, timeout)
 
     async def execute_command(
         self,
@@ -5966,6 +5998,7 @@ class HarnessConfig:
         consult_handlers: dict[str, ConsultHandlerEntry] | None = None,
         registry: ExecutionRegistry | None = None,
         escalation_mode: EscalationMode | None = None,
+        steering_source: Callable[[], list[str]] | None = None,
     ) -> None:
         # #124: the legacy single-collaborator fields (``agent`` / ``verifier`` /
         # ``planner_agent`` / ``evaluator_agent`` / ``metric_evaluator``) are GONE
@@ -6241,6 +6274,14 @@ class HarnessConfig:
 
             escalation_mode = EscalationModeSurfaceToHuman()
         self.escalation_mode: EscalationMode = escalation_mode
+        # Mid-run steering (pi-style, ``HarnessConfig::steering_source``): a
+        # callback drained at each turn boundary BEFORE the next model call —
+        # after the previous turn's tool calls fully executed, so steering
+        # redirects the next turn without ever cancelling in-flight work. Each
+        # drained message is recorded on the session via the ContextManager seam
+        # and emitted as a ``StreamUserMessage(steered=True)``. ``None`` (default)
+        # disables steering. Mirrors Rust's ``HarnessConfig::steering_source``.
+        self.steering_source: Callable[[], list[str]] | None = steering_source
 
     def with_sandbox(self, sandbox: SandboxProvider) -> HarnessConfig:
         """A full copy of this config with only ``sandbox`` swapped (#124). Every
@@ -6286,6 +6327,7 @@ class HarnessConfig:
             consult_handlers=self.consult_handlers,
             registry=self.registry,
             escalation_mode=self.escalation_mode,
+            steering_source=self.steering_source,
         )
 
 
@@ -6442,6 +6484,8 @@ class HarnessBuilder:
         # :class:`AdaptiveToolCallModelInterface` holding the same holder. ``None``
         # on the plain constructor leaves adaptive escalation off.
         self._prompt_tool_call_flag: PromptToolCallFlag | None = None
+        # Mid-run steering callback (pi-style). ``None`` disables steering.
+        self._steering_source: Callable[[], list[str]] | None = None
         # Per-kind consult handlers (issue #114). Empty by default — consults
         # degrade gracefully (R6). Populated via :meth:`consult_handler`.
         self._consult_handlers: dict[str, ConsultHandlerEntry] = {}
@@ -6881,6 +6925,17 @@ class HarnessBuilder:
         self._escalation_mode = mode
         return self
 
+    def steering_source(self, source: Callable[[], list[str]]) -> HarnessBuilder:
+        """Wire a mid-run steering callback (pi-style) drained at each turn
+        boundary BEFORE the next model call — after the previous turn's tool
+        calls fully executed, so steering redirects the next turn without ever
+        cancelling in-flight work. Each drained message is recorded on the
+        session via the ContextManager seam and emitted as a
+        ``StreamUserMessage(steered=True)``. Mirrors Rust's
+        ``HarnessBuilder::steering_source``."""
+        self._steering_source = source
+        return self
+
     def drain_tools_into_registry(self) -> StandardToolRegistry:
         """Drain the accumulated catalogue tools into a populated
         :class:`StandardToolRegistry`, registering each with last-wins upsert
@@ -7163,6 +7218,7 @@ class HarnessBuilder:
             consult_handlers=self._consult_handlers,
             registry=self._registry,
             escalation_mode=self._escalation_mode,
+            steering_source=self._steering_source,
         )
 
     def build(self) -> StandardHarness:
@@ -7525,7 +7581,7 @@ class StandardHarness:
         return self._config.storage.session()
 
     def _effective_tool_registry(
-        self, session_id: SessionId, toolset: ToolsetRef = ""
+        self, session_id: SessionId, toolset: ToolsetRef = "", on_stream: StreamSink | None = None
     ) -> ToolRegistry:
         """The harness-loop tool registry to use for a run keyed by
         ``session_id`` (issue #91).
@@ -7544,8 +7600,22 @@ class StandardHarness:
         Otherwise (empty handle, or non-empty handle with no per-key catalogue)
         the existing global-catalogue / ``tool_registry`` seam fallback applies, so
         examples 01–11 that use ``.tools()`` keep working byte-for-byte. Mirrors
-        Rust's ``StandardHarness::effective_tool_registry``."""
-        from .tool_registry import RealToolRegistry
+        Rust's ``StandardHarness::effective_tool_registry``.
+
+        When ``on_stream`` is given, the run's stream sink is bridged into the
+        :class:`ToolContext` progress seam so a running tool's tail-preview
+        snapshots surface as :class:`StreamToolProgress` events (mirrors Rust's
+        ``effective_tool_registry`` progress bridge)."""
+        from .tool_registry import RealToolRegistry, ToolProgressSink, ToolProgressUpdate
+
+        progress: ToolProgressSink | None = None
+        if on_stream is not None:
+            sink = on_stream
+
+            def _bridge(u: ToolProgressUpdate) -> None:
+                sink(StreamToolProgress(call_id=u.call_id, name=u.tool, preview=u.preview))
+
+            progress = _bridge
 
         # Strict per-node scoping: a non-empty handle with its own catalogue.
         if toolset:
@@ -7558,7 +7628,7 @@ class StandardHarness:
                     self._config.project_id,
                     self._config.storage.run(),
                     self._config.storage.memory(),
-                )
+                ).with_progress(progress)
         # Fallback: empty handle (back-compat) or unregistered non-empty handle.
         catalogue = self._config.catalogue_registry
         if catalogue is None:
@@ -7570,7 +7640,7 @@ class StandardHarness:
             self._config.project_id,
             self._config.storage.run(),
             self._config.storage.memory(),
-        )
+        ).with_progress(progress)
 
     # ---- helpers ----------------------------------------------------
 
@@ -7943,7 +8013,7 @@ class StandardHarness:
         # via ``_drive_strategy``, which re-resolves per-leaf toolsets during the
         # re-drive — so this registry is only used by the Clarification /
         # direct-resume paths whose pending calls need the carried handle.
-        tool_registry = self._effective_tool_registry(session_id, state.toolset)
+        tool_registry = self._effective_tool_registry(session_id, state.toolset, on_stream)
 
         # Clarification resume (issue #81, Q4b): if this pause came from
         # :class:`ToolOutputAwaitingClarification`, the human's answer is
@@ -8232,7 +8302,7 @@ class StandardHarness:
         # pending calls) through the pausing leaf's own toolset handle, restoring
         # its scoped per-node catalogue. An empty handle (the default) still falls
         # back to the global catalogue, so pre-#140 blobs behave unchanged.
-        tool_registry = self._effective_tool_registry(session_id, state.toolset)
+        tool_registry = self._effective_tool_registry(session_id, state.toolset, on_stream)
 
         if isinstance(response, ConsultResponseAnswer):
             text, answered = response.text, True
@@ -9735,7 +9805,7 @@ class StandardHarness:
         # Resolve the effective tool registry once per turn-loop window (all
         # strategies funnel through here). Bridges the per-node toolset catalogue
         # (or the global catalogue when the handle is empty) per-run.
-        tool_registry = self._effective_tool_registry(session_id, toolset)
+        tool_registry = self._effective_tool_registry(session_id, toolset, on_stream)
         # Reset the adaptive prompt-based-tool-calling escalation flag at the
         # start of this turn-loop window so detection is scoped to the window and
         # does not leak across run() calls (the flag is shared with the model
@@ -9775,6 +9845,18 @@ class StandardHarness:
         config = self._config
 
         while True:
+            # Mid-run steering (pi-style, ``HarnessConfig::steering_source``):
+            # drain any user messages queued since the last turn boundary and
+            # inject them BEFORE the next model call — after the previous turn's
+            # tool calls fully executed, so steering redirects the next turn
+            # without ever cancelling in-flight work. Each is recorded on the
+            # session via the ContextManager seam and emitted as a
+            # ``StreamUserMessage(steered=True)``. Mirrors Rust's react.rs steering.
+            if config.steering_source is not None:
+                for _text in config.steering_source():
+                    await config.context_manager.append_user_message(session_state, _text)
+                    self._emit(on_stream, StreamUserMessage(content=_text, steered=True))
+
             # Layer-1 budget gates before the turn.
             if budget_used.turns >= effective_turn_cap:
                 return self._fail(

@@ -68,8 +68,8 @@ Rules enforced here (mirror Rust reference byte-for-byte):
 
 from __future__ import annotations
 
-from collections.abc import Awaitable
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
@@ -81,6 +81,7 @@ from .harness import (
 )
 from .harness import (
     BaseSandboxProvider,
+    CommandProgressSink,
     SandboxProvider,
     SandboxViolation,
     SessionId,
@@ -149,6 +150,11 @@ class ToolContext:
       provider this is the scope-routing memory slot; for the never-null
       contract it is at worst a :class:`NoOpStorageProvider`. ``MemoryTool``
       (#82) picks up this already-threaded seam.
+    * ``progress`` — optional run-level live-progress sink (pi-style bash
+      streaming). Set by the harness bridge
+      (:meth:`RealToolRegistry.with_progress`) when the run has a stream sink;
+      tools derive a per-call emitter via :meth:`command_progress`. ``None``
+      (default) means no consumer is listening — tools skip streaming entirely.
 
     It is a **dataclass** (not a tuple) so future fields can be added without
     breaking the trait signature again. The :class:`SandboxProvider` is
@@ -161,6 +167,43 @@ class ToolContext:
     project_id: ProjectId
     run_store: RunStore
     memory_store: MemoryStore
+    progress: ToolProgressSink | None = None
+
+    def command_progress(self, call: ToolCall) -> CommandProgressSink | None:
+        """Derive a per-call :class:`CommandProgressSink` that forwards tail
+        snapshots to the run's :class:`ToolProgressSink`, labeled with this
+        call's tool name + id. Returns ``None`` when no run sink is wired so
+        tools skip streaming. Mirrors Rust's ``ToolContext::command_progress``.
+        """
+        sink = self.progress
+        if sink is None:
+            return None
+        tool = call.name
+        call_id = call.id
+
+        def _emit(preview: str) -> None:
+            sink(ToolProgressUpdate(tool=tool, call_id=call_id, preview=preview))
+
+        return _emit
+
+
+@dataclass
+class ToolProgressUpdate:
+    """One live-progress update from a RUNNING tool, labeled with the call it
+    belongs to. The harness bridge maps it onto
+    :class:`spore_core.harness.StreamToolProgress` for UIs. Mirrors Rust's
+    ``ToolProgressUpdate``.
+    """
+
+    tool: str
+    call_id: str
+    preview: str
+
+
+#: Run-level sink for :class:`ToolProgressUpdate`-es. Must not block (called
+#: from the executor's ~100ms wait-loop tick). Mirrors Rust's
+#: ``ToolProgressSink``.
+ToolProgressSink = Callable[[ToolProgressUpdate], None]
 
 
 # ============================================================================
@@ -581,6 +624,13 @@ class RealToolRegistry:
         live."""
         return self._ctx
 
+    def with_progress(self, sink: ToolProgressSink | None) -> RealToolRegistry:
+        """Wire a run-level :class:`ToolProgressSink` into the threaded
+        :class:`ToolContext` so tools can emit live progress. Mirrors Rust's
+        ``RealToolRegistry::with_progress``."""
+        self._ctx = replace(self._ctx, progress=sink)
+        return self
+
     async def dispatch(self, call: ToolCall) -> ToolOutput:
         try:
             result = await self._inner.dispatch(call, self._sandbox, self._ctx)
@@ -775,6 +825,8 @@ __all__ = [
     "Tool",
     "ToolAnnotations",
     "ToolContext",
+    "ToolProgressSink",
+    "ToolProgressUpdate",
     "ToolRegistry",
     "ToolResult",
     "ToolSchema",

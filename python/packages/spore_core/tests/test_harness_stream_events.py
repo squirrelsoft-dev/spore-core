@@ -19,6 +19,7 @@ from spore_core import (
     AgentId,
     AllowAllSandbox,
     AlwaysContinuePolicy,
+    HarnessBuilder,
     HarnessConfig,
     HarnessRunOptions,
     HarnessStreamEvent,
@@ -246,3 +247,123 @@ def test_stream_tool_progress_shape() -> None:
     assert ev.kind == "tool_progress"
     assert ev.preview == "building..."
     assert ev.node is None
+
+
+# ---------------------------------------------------------------------------
+# Mid-run steering (steering_source) — §5.4
+# ---------------------------------------------------------------------------
+
+
+class _Queue:
+    """A steering_source callback that returns queued messages per call."""
+
+    def __init__(self) -> None:
+        self.queues: list[list[str]] = []
+
+    def push(self, *msgs: str) -> None:
+        self.queues.append(list(msgs))
+
+    def __call__(self) -> list[str]:
+        if self.queues:
+            return self.queues.pop(0)
+        return []
+
+
+async def test_steering_source_injects_steered_user_messages() -> None:
+    agent = _replay_agent(
+        [
+            ModelResponse(
+                content=[TextBlock(text="first")],
+                usage=_usage(),
+                stop_reason=StopReason.END_TURN,
+            )
+        ]
+    )
+    queue = _Queue()
+    # First turn boundary: inject one steering message; subsequent calls empty.
+    queue.push("pivot to topic B")
+    builder = HarnessBuilder(
+        agent=agent,
+        tool_registry=ScriptedToolRegistry(),
+        sandbox=AllowAllSandbox(),
+        context_manager=NoopContextManager(),
+        termination_policy=AlwaysContinuePolicy(),
+    ).steering_source(queue)
+    events, sink = _collect()
+    h = builder.build()
+    await h.run(HarnessRunOptions(_react_task(), on_stream=sink))
+    steered = [e for e in events if isinstance(e, StreamUserMessage) and e.steered]
+    assert steered, "expected a steered StreamUserMessage"
+    assert steered[0].content == "pivot to topic B"
+    assert steered[0].steered is True
+
+
+# ---------------------------------------------------------------------------
+# ToolProgress bridge (CommandProgressSink → StreamToolProgress) — §5.6
+# ---------------------------------------------------------------------------
+
+
+class _ProgressTool:
+    """A minimal tool that emits a progress snapshot then succeeds."""
+
+    def name(self) -> str:
+        return "progress_tool"
+
+    def is_subagent_tool(self) -> bool:
+        return False
+
+    def may_produce_large_output(self) -> bool:
+        return False
+
+    async def execute(self, call: Any, sandbox: Any, ctx: Any) -> Any:
+        progress = ctx.command_progress(call)
+        if progress is not None:
+            progress("halfway")
+        return ToolOutputSuccess(content="done")
+
+
+async def test_tool_progress_surfaces_on_stream() -> None:
+    from dataclasses import dataclass
+
+    from spore_core import HarnessBuilder, RegistryToolSchema, ToolAnnotations
+
+    @dataclass
+    class _Bundle:
+        implementation: Any
+        schema: Any
+
+    schema = RegistryToolSchema(
+        name="progress_tool",
+        description="emits progress",
+        parameters={"type": "object", "properties": {}},
+        annotations=ToolAnnotations(),
+    )
+    bundle = _Bundle(implementation=_ProgressTool(), schema=schema)
+    agent = _replay_agent(
+        [
+            ModelResponse(
+                content=[ToolUseBlock(id="toolu_1", name="progress_tool", input={})],
+                usage=_usage(),
+                stop_reason=StopReason.TOOL_USE,
+            ),
+            ModelResponse(
+                content=[TextBlock(text="done")],
+                usage=_usage(),
+                stop_reason=StopReason.END_TURN,
+            ),
+        ]
+    )
+    builder = HarnessBuilder(
+        agent=agent,
+        tool_registry=ScriptedToolRegistry(),
+        sandbox=AllowAllSandbox(),
+        context_manager=NoopContextManager(),
+        termination_policy=AlwaysContinuePolicy(),
+    ).tool(bundle)
+    events, sink = _collect()
+    h = builder.build()
+    await h.run(HarnessRunOptions(_react_task(), on_stream=sink))
+    progress = [e for e in events if isinstance(e, StreamToolProgress)]
+    assert progress, "expected a StreamToolProgress event"
+    assert progress[0].name == "progress_tool"
+    assert progress[0].preview == "halfway"
