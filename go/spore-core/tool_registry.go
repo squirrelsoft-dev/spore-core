@@ -343,7 +343,26 @@ type ToolContext struct {
 	ProjectNamespace SessionID
 	RunStore         ToolRunStore
 	MemoryStore      ToolMemoryStore
+	// Optional run-level live-progress sink. Set by the harness bridge when a
+	// stream sink is attached; tools derive per-call command emitters via
+	// CommandProgress. nil means no consumer is listening.
+	Progress ToolProgressSink
 }
+
+// ToolProgressUpdate is one live-progress update from a RUNNING tool, labeled
+// with the call it belongs to. The harness maps it to tool_progress stream
+// events; Preview is a sanitized tail snapshot that REPLACES the previous UI
+// preview for the call.
+type ToolProgressUpdate struct {
+	Tool    string
+	CallID  string
+	Preview string
+}
+
+// ToolProgressSink consumes run-level live-progress updates. It should not
+// block; WorkspaceScopedSandbox calls command progress from its ~100ms wait
+// loop while the process is running.
+type ToolProgressSink func(ToolProgressUpdate)
 
 // NewToolContext builds a ToolContext from the run's session id and the storage
 // seams. A nil runStore yields a context whose RunStore reads empty and discards
@@ -365,6 +384,32 @@ func NewToolContextWithProject(sessionID, projectNamespace SessionID, runStore T
 		ProjectNamespace: projectNamespace,
 		RunStore:         runStore,
 		MemoryStore:      memStore,
+	}
+}
+
+// WithProgress returns a copy of c carrying the run-level live-progress sink.
+// Passing nil clears progress. A nil receiver yields a minimal no-op context
+// with the supplied sink.
+func (c *ToolContext) WithProgress(sink ToolProgressSink) *ToolContext {
+	if c == nil {
+		return &ToolContext{Progress: sink}
+	}
+	cp := *c
+	cp.Progress = sink
+	return &cp
+}
+
+// CommandProgress derives the per-call command-progress emitter for call. It
+// wraps the run-level sink with the tool name and call id so command executors
+// only emit plain preview strings. nil means no consumer is listening.
+func (c *ToolContext) CommandProgress(call ToolCall) CommandProgressSink {
+	if c == nil || c.Progress == nil {
+		return nil
+	}
+	tool := call.Name
+	callID := call.ID
+	return func(preview string) {
+		c.Progress(ToolProgressUpdate{Tool: tool, CallID: callID, Preview: preview})
 	}
 }
 

@@ -293,6 +293,7 @@ const (
 	HarnessStreamTurnEnd       HarnessStreamEventKind = "turn_end"
 	HarnessStreamToolCall      HarnessStreamEventKind = "tool_call"
 	HarnessStreamToolResult    HarnessStreamEventKind = "tool_result"
+	HarnessStreamToolProgress  HarnessStreamEventKind = "tool_progress"
 	HarnessStreamFinalResponse HarnessStreamEventKind = "final_response"
 	HarnessStreamBudgetWarning HarnessStreamEventKind = "budget_warning"
 	// HarnessStreamUserMessage — the send_message tool (#81) surfaces an
@@ -384,6 +385,8 @@ type HarnessStreamEvent struct {
 	IsError bool `json:"-"`
 	// final_response, user_message, text_delta, reasoning_delta
 	Content string `json:"-"`
+	// tool_progress: sanitized tail snapshot that REPLACES the previous preview.
+	Preview string `json:"-"`
 	// budget_warning
 	LimitType BudgetLimitType `json:"-"`
 	// tool_call (Q5): final, fully-accumulated tool-call arguments (parsed JSON
@@ -501,6 +504,14 @@ func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
 			Revised bool                   `json:"revised"`
 			Node    *NodeAttr              `json:"node,omitempty"`
 		}{e.Kind, e.CallID, e.IsError, e.ResultContent, e.Revised, e.Node})
+	case HarnessStreamToolProgress:
+		return json.Marshal(struct {
+			Kind    HarnessStreamEventKind `json:"kind"`
+			CallID  string                 `json:"call_id"`
+			Name    string                 `json:"name"`
+			Preview string                 `json:"preview"`
+			Node    *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.CallID, e.Name, e.Preview, e.Node})
 	case HarnessStreamFinalResponse:
 		return json.Marshal(struct {
 			Kind    HarnessStreamEventKind `json:"kind"`
@@ -582,6 +593,11 @@ func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
 
 // StreamSink consumes harness stream events. May be nil.
 type StreamSink func(HarnessStreamEvent)
+
+// CommandProgressSink consumes sanitized tail previews for a running command.
+// Tools derive this from ToolContext.CommandProgress and pass it to
+// SandboxProvider.ExecuteCommandStreaming.
+type CommandProgressSink func(string)
 
 // turnStreamState is the per-turn mutable state threaded through
 // mapModelStreamEvent (issue #103). It correlates a block index to its
@@ -1498,6 +1514,24 @@ type SandboxProvider interface {
 
 	// WorkspaceRoot returns the canonical workspace root path.
 	WorkspaceRoot() string
+}
+
+// StreamingSandboxProvider is the optional §E2 extension seam for live command
+// progress. It is intentionally NOT folded into SandboxProvider because Go
+// interfaces cannot provide Rust-style default method bodies; keeping this as a
+// sub-interface preserves existing custom sandboxes while canonical sandboxes
+// can opt in.
+type StreamingSandboxProvider interface {
+	ExecuteCommandStreaming(ctx context.Context, command string, args []string, workingDir string, timeout time.Duration, progress CommandProgressSink) (CommandOutput, *SandboxViolation)
+}
+
+// ExecuteCommandStreaming runs a command with progress when the sandbox opts
+// into StreamingSandboxProvider; otherwise it falls back to ExecuteCommand.
+func ExecuteCommandStreaming(ctx context.Context, sandbox SandboxProvider, command string, args []string, workingDir string, timeout time.Duration, progress CommandProgressSink) (CommandOutput, *SandboxViolation) {
+	if s, ok := sandbox.(StreamingSandboxProvider); ok {
+		return s.ExecuteCommandStreaming(ctx, command, args, workingDir, timeout, progress)
+	}
+	return sandbox.ExecuteCommand(ctx, command, args, workingDir, timeout)
 }
 
 // CommandOutput is the result of a subprocess executed via the sandbox.
@@ -4671,6 +4705,27 @@ func (h *StandardHarness) finalizeObservability(ctx context.Context, sessionID S
 // fallback applies, so examples 01–11 that use .Tools() keep working
 // byte-for-byte. Mirrors Rust effective_tool_registry.
 func (h *StandardHarness) effectiveToolRegistry(sessionID SessionID, toolset ToolsetRef) ToolRegistry {
+	return h.effectiveToolRegistryWithProgress(sessionID, toolset, nil)
+}
+
+// effectiveToolRegistryWithProgress is the run-loop variant of
+// effectiveToolRegistry: when a stream sink exists, catalogue ToolContexts get a
+// progress bridge that maps ToolProgressUpdate onto tool_progress stream events.
+// Existing tests and no-stream runs call effectiveToolRegistry and stay
+// byte-identical (nil progress).
+func (h *StandardHarness) effectiveToolRegistryWithProgress(sessionID SessionID, toolset ToolsetRef, onStream StreamSink) ToolRegistry {
+	baseCtx := NewToolContextWithProject(sessionID, h.config.ProjectNamespace, h.config.ToolRunStore, h.config.ToolMemoryStore)
+	if onStream != nil {
+		baseCtx = baseCtx.WithProgress(func(update ToolProgressUpdate) {
+			emit(onStream, HarnessStreamEvent{
+				Kind:    HarnessStreamToolProgress,
+				CallID:  update.CallID,
+				Name:    update.Tool,
+				Preview: update.Preview,
+			})
+		})
+	}
+
 	// Strict per-node scoping: a non-empty handle with its own catalogue.
 	if toolset != "" {
 		if catalogue, ok := h.config.ToolsetCatalogues[string(toolset)]; ok && catalogue != nil {
@@ -4678,7 +4733,7 @@ func (h *StandardHarness) effectiveToolRegistry(sessionID SessionID, toolset Too
 				// #142: pin the stable project namespace so the catalogue task_list
 				// tool keys its DURABLE blob by project_id (surviving Ralph window
 				// resets), while ephemeral session state stays on sessionID.
-				NewToolContextWithProject(sessionID, h.config.ProjectNamespace, h.config.ToolRunStore, h.config.ToolMemoryStore),
+				baseCtx,
 			)
 			return catalogue
 		}
@@ -4687,9 +4742,7 @@ func (h *StandardHarness) effectiveToolRegistry(sessionID SessionID, toolset Too
 	if h.config.CatalogueRegistry == nil {
 		return h.config.ToolRegistry
 	}
-	h.config.CatalogueRegistry.SetToolContext(
-		NewToolContextWithProject(sessionID, h.config.ProjectNamespace, h.config.ToolRunStore, h.config.ToolMemoryStore),
-	)
+	h.config.CatalogueRegistry.SetToolContext(baseCtx)
 	return h.config.CatalogueRegistry
 }
 
@@ -5183,7 +5236,7 @@ func (h *StandardHarness) runReActInner(
 	// per-node toolset catalogue (or the global catalogue when the handle is
 	// empty) per-run (re-injects its ToolContext with this run's SessionID +
 	// storage); otherwise returns the injected ToolRegistry seam.
-	toolRegistry := h.effectiveToolRegistry(sessionID, toolset)
+	toolRegistry := h.effectiveToolRegistryWithProgress(sessionID, toolset, onStream)
 	startedAt := time.Now()
 	usage := AggregateUsage{}
 
@@ -6526,7 +6579,7 @@ func (h *StandardHarness) resumeConsultInner(
 	// pending calls) through the pausing leaf's own toolset handle, restoring its
 	// scoped per-node catalogue. An empty handle (the default) still falls back to
 	// the global catalogue, so pre-#140 blobs behave unchanged.
-	toolRegistry := h.effectiveToolRegistry(state.SessionID, state.Toolset)
+	toolRegistry := h.effectiveToolRegistryWithProgress(state.SessionID, state.Toolset, onStream)
 
 	// Inject the consult answer as the RESULT of the head pending (consult)
 	// call, then dispatch the remaining pending calls in the same batch.
@@ -6606,7 +6659,7 @@ func (h *StandardHarness) resumeInner(
 	// now routes through the pausing leaf's own toolset handle, restoring its
 	// scoped per-node catalogue. An empty handle (the default) still falls back to
 	// the global catalogue, so pre-#140 blobs and root pauses behave unchanged.
-	toolRegistry := h.effectiveToolRegistry(state.SessionID, state.Toolset)
+	toolRegistry := h.effectiveToolRegistryWithProgress(state.SessionID, state.Toolset, onStream)
 
 	// Subagent depth-1: a child state, if present, would be resumed via the
 	// caller-installed SubagentTool. Wiring lands with #4/#5. The harness

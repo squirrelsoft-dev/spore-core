@@ -17,7 +17,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // ============================================================================
@@ -347,6 +349,59 @@ func (s *WorkspaceScopedSandbox) ExecuteCommand(
 	workingDir string,
 	timeout time.Duration,
 ) (CommandOutput, *SandboxViolation) {
+	return s.ExecuteCommandStreaming(ctx, command, args, workingDir, timeout, nil)
+}
+
+const progressInterval = 100 * time.Millisecond
+const progressTailBytes = 2048
+
+type sharedOutputBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *sharedOutputBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *sharedOutputBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func progressPreview(stdout, stderr *sharedOutputBuffer) string {
+	combined := stdout.String()
+	if err := stderr.String(); err != "" {
+		if combined != "" && !strings.HasSuffix(combined, "\n") {
+			combined += "\n"
+		}
+		combined += err
+	}
+	trimmed := strings.TrimRight(combined, "\r\n\t ")
+	if len(trimmed) <= progressTailBytes {
+		return trimmed
+	}
+	start := len(trimmed) - progressTailBytes
+	for start < len(trimmed) && !utf8.RuneStart(trimmed[start]) {
+		start++
+	}
+	return trimmed[start:]
+}
+
+// ExecuteCommandStreaming runs a subprocess and, when progress is non-nil,
+// emits sanitized tail previews while it is still running. Final stdout/stderr
+// are identical to ExecuteCommand.
+func (s *WorkspaceScopedSandbox) ExecuteCommandStreaming(
+	ctx context.Context,
+	command string,
+	args []string,
+	workingDir string,
+	timeout time.Duration,
+	progress CommandProgressSink,
+) (CommandOutput, *SandboxViolation) {
 	switch s.isolationMode.(type) {
 	case IsolationBubblewrap:
 		return CommandOutput{}, &SandboxViolation{
@@ -413,12 +468,12 @@ func (s *WorkspaceScopedSandbox) ExecuteCommand(
 		}
 	}
 
-	// Drain stdout/stderr into buffers so the pipes don't fill and block the
-	// child, and so the bytes captured so far remain reachable after a
-	// group-kill (mirrors the Rust shared-buffer drain).
-	var stdoutBuf, stderrBuf bytes.Buffer
-	cmd.Stdout = &stdoutBuf
-	cmd.Stderr = &stderrBuf
+	// Drain stdout/stderr into shared buffers so the pipes don't fill and block
+	// the child, and so bytes captured so far remain reachable after a group-kill
+	// and while the progress ticker snapshots the tail.
+	stdoutBuf, stderrBuf := &sharedOutputBuffer{}, &sharedOutputBuffer{}
+	cmd.Stdout = stdoutBuf
+	cmd.Stderr = stderrBuf
 	if err := cmd.Start(); err != nil {
 		// SC-15: a failed spawn is a typed violation, not a fake
 		// CommandOutput{ExitCode: -1}.
@@ -432,48 +487,65 @@ func (s *WorkspaceScopedSandbox) ExecuteCommand(
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
 
-	select {
-	case err := <-waitCh:
-		// Normal exit. The group guard is disarmed (nothing to reap).
-		exitCode := 0
-		if err != nil {
-			if ee, ok := err.(*exec.ExitError); ok {
-				exitCode = ee.ExitCode()
-			} else {
-				// Should not happen after a successful Start, but stay safe.
-				return CommandOutput{}, &SandboxViolation{
-					Kind:    SandboxExecSpawnFailed,
-					Command: command,
-					Message: err.Error(),
+	var ticker *time.Ticker
+	var tick <-chan time.Time
+	if progress != nil {
+		ticker = time.NewTicker(progressInterval)
+		defer ticker.Stop()
+		tick = ticker.C
+	}
+	lastPreview := ""
+
+	for {
+		select {
+		case err := <-waitCh:
+			// Normal exit. The group guard is disarmed (nothing to reap).
+			exitCode := 0
+			if err != nil {
+				if ee, ok := err.(*exec.ExitError); ok {
+					exitCode = ee.ExitCode()
+				} else {
+					// Should not happen after a successful Start, but stay safe.
+					return CommandOutput{}, &SandboxViolation{
+						Kind:    SandboxExecSpawnFailed,
+						Command: command,
+						Message: err.Error(),
+					}
 				}
 			}
-		}
-		return CommandOutput{
-			Stdout:   stdoutBuf.String(),
-			Stderr:   stderrBuf.String(),
-			ExitCode: exitCode,
-		}, nil
-	case <-runCtx.Done():
-		// Cancel/timeout: kill the WHOLE process group (child + grandchildren),
-		// then reap the child so it doesn't zombie.
-		killProcessGroup(pgid)
-		<-waitCh
-		if runCtx.Err() == context.DeadlineExceeded {
 			return CommandOutput{
 				Stdout:   stdoutBuf.String(),
-				Stderr:   fmt.Sprintf("command timed out after %s", effectiveTimeout),
+				Stderr:   stderrBuf.String(),
+				ExitCode: exitCode,
+			}, nil
+		case <-tick:
+			preview := progressPreview(stdoutBuf, stderrBuf)
+			if preview != "" && preview != lastPreview {
+				progress(preview)
+				lastPreview = preview
+			}
+		case <-runCtx.Done():
+			// Cancel/timeout: kill the WHOLE process group (child + grandchildren),
+			// then reap the child so it doesn't zombie.
+			killProcessGroup(pgid)
+			<-waitCh
+			if runCtx.Err() == context.DeadlineExceeded {
+				return CommandOutput{
+					Stdout:   stdoutBuf.String(),
+					Stderr:   fmt.Sprintf("command timed out after %s", effectiveTimeout),
+					ExitCode: -1,
+					TimedOut: true,
+				}, nil
+			}
+			// Outer context cancelled (not a deadline). Surface as a signal-killed
+			// CommandOutput — not TimedOut — so callers can distinguish cancel vs
+			// timeout. The group has been reaped.
+			return CommandOutput{
+				Stdout:   stdoutBuf.String(),
+				Stderr:   "command cancelled",
 				ExitCode: -1,
-				TimedOut: true,
 			}, nil
 		}
-		// Outer context cancelled (not a deadline). Surface as a signal-killed
-		// CommandOutput — not TimedOut — so callers can distinguish cancel vs
-		// timeout. The group has been reaped.
-		return CommandOutput{
-			Stdout:   stdoutBuf.String(),
-			Stderr:   "command cancelled",
-			ExitCode: -1,
-		}, nil
 	}
 }
 

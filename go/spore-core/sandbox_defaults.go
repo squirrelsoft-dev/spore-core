@@ -33,12 +33,27 @@ type DefaultSandbox struct{}
 // spawn failure (missing binary, OS refusal) returns a typed
 // SandboxExecSpawnFailed violation (SC-15) — never started is no longer
 // conflated with ran-and-exited -1; timeouts still land in CommandOutput.
-func (DefaultSandbox) ExecuteCommand(
+func (s DefaultSandbox) ExecuteCommand(
 	ctx context.Context,
 	command string,
 	args []string,
 	workingDir string,
 	timeout time.Duration,
+) (CommandOutput, *SandboxViolation) {
+	return s.ExecuteCommandStreaming(ctx, command, args, workingDir, timeout, nil)
+}
+
+// ExecuteCommandStreaming is the non-sandboxed default implementation. It uses
+// os/exec.CommandContext and does not emit live progress (WorkspaceScopedSandbox
+// provides the incremental pipe-drain/ticker implementation); final output is
+// identical to ExecuteCommand.
+func (DefaultSandbox) ExecuteCommandStreaming(
+	ctx context.Context,
+	command string,
+	args []string,
+	workingDir string,
+	timeout time.Duration,
+	_ CommandProgressSink,
 ) (CommandOutput, *SandboxViolation) {
 	runCtx := ctx
 	var cancel context.CancelFunc

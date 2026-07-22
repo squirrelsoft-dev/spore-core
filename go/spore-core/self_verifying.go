@@ -142,6 +142,12 @@ func (s *ReadOnlySandbox) ExecuteCommand(_ context.Context, command string, _ []
 	return CommandOutput{}, &SandboxViolation{Kind: SandboxReadOnly, Path: command}
 }
 
+// ExecuteCommandStreaming is also forbidden outright — subprocesses may have
+// arbitrary write side effects, progress or not.
+func (s *ReadOnlySandbox) ExecuteCommandStreaming(_ context.Context, command string, _ []string, _ string, _ time.Duration, _ CommandProgressSink) (CommandOutput, *SandboxViolation) {
+	return CommandOutput{}, &SandboxViolation{Kind: SandboxReadOnly, Path: command}
+}
+
 // HandleLargeOutput delegates (a read-side concern).
 func (s *ReadOnlySandbox) HandleLargeOutput(ctx context.Context, content string, callID string, headTokens uint32, tailTokens uint32) TruncatedOutput {
 	return s.inner.HandleLargeOutput(ctx, content, callID, headTokens, tailTokens)

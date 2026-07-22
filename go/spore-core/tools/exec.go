@@ -86,7 +86,7 @@ func (*ExecTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *ExecTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
+func (t *ExecTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, toolCtx *sporecore.ToolContext) sporecore.ToolOutput {
 	var params ExecParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
@@ -95,7 +95,7 @@ func (t *ExecTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox
 	if params.Timeout != nil {
 		timeout = time.Duration(*params.Timeout) * time.Second
 	}
-	out, v := sandbox.ExecuteCommand(ctx, params.Command, params.Args, "", timeout)
+	out, v := sporecore.ExecuteCommandStreaming(ctx, sandbox, params.Command, params.Args, "", timeout, toolCtx.CommandProgress(call))
 	if v != nil {
 		return SandboxViolationError(v).ToToolOutput()
 	}
@@ -161,7 +161,7 @@ func (*BashCommandTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *BashCommandTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
+func (t *BashCommandTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, toolCtx *sporecore.ToolContext) sporecore.ToolOutput {
 	var params ShellCommandParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
@@ -181,7 +181,7 @@ func (t *BashCommandTool) Execute(ctx context.Context, call sporecore.ToolCall, 
 		working = resolved
 	}
 	args := []string{"-c", params.Script}
-	out, v := sandbox.ExecuteCommand(ctx, "/bin/sh", args, working, timeout)
+	out, v := sporecore.ExecuteCommandStreaming(ctx, sandbox, "/bin/sh", args, working, timeout, toolCtx.CommandProgress(call))
 	if v != nil {
 		return SandboxViolationError(v).ToToolOutput()
 	}
@@ -237,7 +237,7 @@ func (*RunTestsTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *RunTestsTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
+func (t *RunTestsTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, toolCtx *sporecore.ToolContext) sporecore.ToolOutput {
 	var params RunTestsParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
@@ -256,7 +256,7 @@ func (t *RunTestsTool) Execute(ctx context.Context, call sporecore.ToolCall, san
 	}
 	program := parts[0]
 	args := parts[1:]
-	out, sv := sandbox.ExecuteCommand(ctx, program, args, working, timeout)
+	out, sv := sporecore.ExecuteCommandStreaming(ctx, sandbox, program, args, working, timeout, toolCtx.CommandProgress(call))
 	if sv != nil {
 		return SandboxViolationError(sv).ToToolOutput()
 	}
