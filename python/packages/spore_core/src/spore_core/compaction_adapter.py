@@ -434,8 +434,22 @@ def into_harness_adapter(inner: StandardContextManager) -> HarnessContextManager
     return StandardCompactionAdapter(inner)
 
 
+class HarnessContextManagerExt:
+    """Name-parity shim for Rust's ``HarnessContextManagerExt`` trait.
+
+    Rust's ``HarnessContextManagerExt`` adds ``into_harness_adapter(self)`` to
+    ``Arc<StandardContextManager>``. Python uses a free function instead; this
+    class exposes the same helper as a static method so the public API name is
+    importable from :mod:`spore_core` for cross-language parity."""
+
+    @staticmethod
+    def into_harness_adapter(inner: StandardContextManager) -> HarnessContextManager:
+        return into_harness_adapter(inner)
+
+
 __all__ = [
     "RICH_STATE_KEY",
+    "HarnessContextManagerExt",
     "StandardCompactionAdapter",
     "estimate_message_tokens",
     "estimate_tokens",

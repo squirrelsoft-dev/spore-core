@@ -328,6 +328,7 @@ from .context import (
 )
 from .compaction_adapter import (
     RICH_STATE_KEY,
+    HarnessContextManagerExt,
     StandardCompactionAdapter,
     into_harness_adapter,
     seed_rich_state,
@@ -599,6 +600,7 @@ from .prompt_assembly import (
     ChunkProviderError,
     CompositeChunkProvider,
     ContextSourcesBuilder,
+    CustomPredicate,
     EmbeddedChunkProvider,
     InMemoryChunkProvider,
     StorageScope,
@@ -812,6 +814,12 @@ from .tool_call_repair import (
     coerce_tool_args,
     detect_prose_response as detect_prose_tool_call_failure,
 )
+from .image import (
+    image_content,
+    is_image_path,
+    load_image_content,
+    media_type_for_extension,
+)
 
 __all__ = [
     "ALL_EVENTS",
@@ -1022,6 +1030,7 @@ __all__ = [
     # Compaction adapter (#55)
     "RICH_STATE_KEY",
     "StandardCompactionAdapter",
+    "HarnessContextManagerExt",
     "into_harness_adapter",
     "seed_rich_state",
     # Skills (#115 / SC-26)
@@ -1453,6 +1462,7 @@ __all__ = [
     "ChunkProviderError",
     "CompositeChunkProvider",
     "ContextSourcesBuilder",
+    "CustomPredicate",
     "EmbeddedChunkProvider",
     "InMemoryChunkProvider",
     "StorageScope",
@@ -1571,4 +1581,9 @@ __all__ = [
     "UnknownTool",
     "coerce_tool_args",
     "detect_prose_tool_call_failure",
+    # Image helpers (#parity)
+    "image_content",
+    "is_image_path",
+    "load_image_content",
+    "media_type_for_extension",
 ]
