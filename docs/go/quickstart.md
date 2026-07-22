@@ -1,27 +1,33 @@
-# Quickstart — Go
+# Go quickstart
 
-> 🚧 **Stub.** Full Go guide pages are in progress. The Go implementation tracks the same
-> specification as Rust; until these pages fill in, read the language-agnostic
-> [quickstart guide](../guides/quickstart.md) for the concepts and follow the
-> [Rust quickstart](../rust/quickstart.md) for the shape of the code.
+Install the Go module from this repository path:
 
-## The shape
+```go
+import sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
+```
 
-The five-line path is the same in every language:
+Create a task with a loop strategy, configure a harness, and run it:
 
-1. Construct a model interface (Ollama for zero-setup local runs, or a hosted provider).
-2. Build a conversational harness from the model — the preset defaults every required component.
-3. Create a task from an instruction.
-4. Run it and get the result.
-5. Match the result — `Success` carries the output, turn count, usage, and post-run session state.
+```go
+agent := sporecore.NewMockAgent("example") // replace with a real Agent
+agent.Push(sporecore.NewFinalResponse("done", sporecore.TokenUsage{}))
 
-See the [architecture concept](../concepts/architecture.md) for what those components are.
+cfg := sporecore.HarnessConfig{
+    Agent:             agent,
+    ToolRegistry:      sporecore.NewScriptedToolRegistry(),
+    Sandbox:           sporecore.AllowAllSandbox{},
+    ContextManager:    sporecore.NoopContextManager{},
+    TerminationPolicy: sporecore.AlwaysContinuePolicy{},
+    EscalationMode:    sporecore.AutonomousEscalation(),
+}
+h := sporecore.NewStandardHarness(cfg)
 
-## Runnable examples
+task := sporecore.NewTask(
+    "Do the work",
+    sporecore.SessionID("session-1"),
+    sporecore.ReActStrategy(10),
+)
+result := h.Run(context.Background(), sporecore.NewHarnessRunOptions(task))
+```
 
-Three runnable Go programs build the path up step by step
-(`observability.NewConversationalHarness(model)` + `sporecore.SimpleTask(...)`):
-
-- [`examples/go/01-hello-agent`](../../examples/go/01-hello-agent) — the smallest live agent: one turn, one greeting.
-- [`examples/go/02-conversational-repl`](../../examples/go/02-conversational-repl) — a chat loop that remembers earlier turns by threading session state.
-- [`examples/go/03-tool-use`](../../examples/go/03-tool-use) — a ReAct agent that calls local tools in a Think → Act → Observe loop.
+For catalogue tools, use `StandardToolRegistry` and the standard tool constructors from `go/spore-core/tools`. The harness injects per-run `ToolContext` storage automatically for catalogue registries.

@@ -1,9 +1,10 @@
 # Rust → Go Behavioral Parity Plan (revised)
 
-> **Status:** revised plan-review checkpoint. No implementation code has been
-> written. Authoritative Rust revision recorded below. Rust source/tests/
-> examples/config were read **read-only**; nothing under `rust/`, `docs/rust/`,
-> `examples/rust/`, or Rust-specific configuration was modified.
+> **Status:** implementation complete on branch `fm/parity-go` for the approved
+> bounded Go core+eval parity scope. Authoritative Rust revision recorded below.
+> Rust source/tests/examples/config were read **read-only**; nothing under
+> `rust/`, `docs/rust/`, `examples/rust/`, or Rust-specific configuration was
+> modified.
 
 **Authoritative Rust revision:** `7058db115b4f05b6b7cde1a3f62ba345c202bcde`
 (recorded via `git rev-parse HEAD` on the disposable worktree's detached HEAD,
@@ -962,3 +963,29 @@ end-to-end scenarios; run the full Go test/lint/format/build suite after each.
 ---
 
 needs-decision: revised plan-review checkpoint — §B1 expanded to full OpenAI embedding behavior (retry/backoff/retry-after, bearer auth, error-envelope mapping, sort-by-index, default dimensions, from-env validation, timeout/transport mapping, 9 mocked-HTTP assertions, Go interface default-EmbedOne caveat + shared helper); §4.1 adds explicit context-cancellation executable tests (cancelled model/tool call stops + reaps, not only timeout); §C1 adds MaxRepairAttempts setter/default validation (default 1, ignored without a repair provider, pointer-sentinel/effective-reader idiom); captain scope decision incorporated (core+eval+embedding+vector+docs in scope; MCP/sqlvec/petri documented as known gaps, not created); no implementation started
+
+## 11. Final implementation matrix
+
+| Item | Final Go status |
+|---|---|
+| §4.1 cancellation/process cleanup | Complete: cancellation tests and process-group reap parity added. |
+| §A tools/catalogue | Complete: `set_plan`, `create_dir`, and catalogue exposure added. |
+| §B1 embeddings | Complete: `embedding` module with batch `Embed`, `EmbedOne`, Ollama/OpenAI providers. |
+| §B2 image helpers | Complete. |
+| §B3 extended sampling | Complete: model params and OpenAI wire support. |
+| §B4 Ollama thinking/reasoning | Complete. |
+| §C1 tool-call repair | Complete: provider/config/default-attempt behavior and harness wiring. |
+| §C2 tool search | Complete: `ToolNamespace`, `ToolSearchConfig`, `ToolSearchRegistry`, harness opt-in wiring. |
+| §D1 vector store | Complete: `vectorstore` package and tests. |
+| §E1 `NodeAttr` | Complete: event field, JSON emission, and nested stamping wrappers. |
+| §E2 `ToolProgress` | Complete: stream event, progress sink, optional streaming sandbox seam. |
+| §E3/§E4/§E7/§E9 | Complete: revised/steered/steering source, `SignalPlanRecorded`, turn-end usage. |
+| §E5 tool-call nudge | Complete: default-off structural/behavioral execute-step nudge. |
+| §E6 empty-plan retries | Complete: default-0 `PlanEmptyMaxRetries` and retry loop. Go adapter documents the lack of one-shot schema/no-tools override in the current plan subtree seam. |
+| §E8 narration refund | Complete: ReAct window-gate behavior ported and tested. |
+| §E10 repeated tool-call breaker | Complete: `HaltRepeatedToolCall`. |
+| §F1 chunk provider | Complete: harness-level structural provider adapter and SelfVerifying role chunk override. |
+| §G1 Go docs | Complete: quickstart, building tools, conversation/events, custom harness. |
+| §H known gaps | Complete: MCP, sqlite-vec, and Petri documented as known gaps, not implemented. |
+
+Final validation is recorded in the branch commit history and status file; the final PR notes include the latest full Go build/vet/test/race results.
