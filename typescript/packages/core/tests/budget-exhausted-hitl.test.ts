@@ -669,7 +669,7 @@ describe("#138 AC1 — skip-plan reconciles already-Completed tasks", () => {
       },
       execute: { kind: "react", budget: { kind: "per_loop", value: 12 }, agent: "", toolset: "" },
     };
-    const r = await h.run({ task: newTask("audit", session, planStrategy) });
+    const r = await h.run({ task: newTask("audit", session, planStrategy), continue_task_list: true });
     expect(r.kind).toBe("success");
     if (r.kind === "success") expect(r.output).toBe("did two");
 

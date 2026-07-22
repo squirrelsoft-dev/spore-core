@@ -252,7 +252,7 @@ describe("PlanExecute DAG executor (#126)", () => {
     addTask(tl, "four", [2, 3]);
     await seedDag(h, SID, tl);
 
-    const r = await h.run({ task: planTask() });
+    const r = await h.run({ task: planTask(), continue_task_list: true });
     expect(r.kind).toBe("success");
     if (r.kind === "success") expect(r.output).toBe("did 4");
     // #138 AC1: plan SKIPPED → 4 steps in order, no plan turn.
@@ -282,7 +282,7 @@ describe("PlanExecute DAG executor (#126)", () => {
     addTask(tl, "independent", []);
     await seedDag(h, SID, tl);
 
-    const r = await h.run({ task: planTask() });
+    const r = await h.run({ task: planTask(), continue_task_list: true });
     expect(r.kind).toBe("success");
     // Run order by lowest-ready id: 1, 2, 3 (indices 0, 1, 2 — plan skipped).
     const childCtx = ctxText(a.seen[1]!); // task 2
@@ -317,7 +317,7 @@ describe("PlanExecute DAG executor (#126)", () => {
     addTask(tl, "four", [2, 3]);
     await seedDag(h, SID, tl);
 
-    await h.run({ task: planTask() });
+    await h.run({ task: planTask(), continue_task_list: true });
     const twoCtx = ctxText(a.seen[1]!); // task 2 (index 1 — plan skipped)
     const fourCtx = ctxText(a.seen[3]!); // task 4 (index 3 — plan skipped)
     // Task 2's seed carries task 1's output but NOT task 3's (a sibling, not a blocker).
@@ -358,7 +358,7 @@ describe("PlanExecute DAG executor (#126)", () => {
     addTask(tl, "downstream", [2]);
     await seedDag(h, SID, tl);
 
-    const r = await h.run({ task: planTask() });
+    const r = await h.run({ task: planTask(), continue_task_list: true });
     expect(r.kind).toBe("success");
     // Task 3's context carries the Tier-2 ledger. Task 2's row has the OBSERVED
     // file as a `[files: ...]` suffix; task 1 (narrate-only) has NO files suffix —
@@ -417,7 +417,7 @@ describe("PlanExecute DAG executor (#126)", () => {
     addTask(tl, "indep", []);
     await seedDag(h, SID, tl);
 
-    const r = await h.run({ task: planTask() });
+    const r = await h.run({ task: planTask(), continue_task_list: true });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") {
       expect(r.reason.kind).toBe("tasks_blocked_by_failure");
@@ -453,7 +453,7 @@ describe("PlanExecute DAG executor (#126)", () => {
     };
     await seedDag(h, SID, cyclic);
 
-    const r = await h.run({ task: planTask() });
+    const r = await h.run({ task: planTask(), continue_task_list: true });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") {
       expect(r.reason.kind).toBe("task_graph_cycle");

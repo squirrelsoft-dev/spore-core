@@ -101,7 +101,10 @@ describe("PlanExecute DAG executor fixture replay (#126)", () => {
     addTask(tl, "three", [2]);
     addTask(tl, "four", [3]);
     const h = await harnessFor("plan_execute_dag_order.jsonl", session, tl);
-    const r = await h.run({ task: newTask("build a diamond", session, PLAN_STRATEGY) });
+    const r = await h.run({
+      task: newTask("build a diamond", session, PLAN_STRATEGY),
+      continue_task_list: true,
+    });
     expect(r.kind).toBe("success");
     if (r.kind === "success") expect(r.output).toBe("did 4");
   });
@@ -114,7 +117,10 @@ describe("PlanExecute DAG executor fixture replay (#126)", () => {
     addTask(tl, "child of root", [1]);
     addTask(tl, "independent", []);
     const h = await harnessFor("plan_execute_dag_branch_isolation.jsonl", session, tl);
-    const r = await h.run({ task: newTask("root, child, independent", session, PLAN_STRATEGY) });
+    const r = await h.run({
+      task: newTask("root, child, independent", session, PLAN_STRATEGY),
+      continue_task_list: true,
+    });
     expect(r.kind).toBe("success");
     if (r.kind === "success") expect(r.output).toBe("INDEP_OUTPUT_CCC");
   });
@@ -129,7 +135,10 @@ describe("PlanExecute DAG executor fixture replay (#126)", () => {
     addTask(tl, "leaf", [2]);
     addTask(tl, "indep", []);
     const h = await harnessFor("plan_execute_dag_failure_cascade.jsonl", session, tl);
-    const r = await h.run({ task: newTask("root, mid, leaf, indep", session, PLAN_STRATEGY) });
+    const r = await h.run({
+      task: newTask("root, mid, leaf, indep", session, PLAN_STRATEGY),
+      continue_task_list: true,
+    });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") {
       expect(r.reason.kind).toBe("tasks_blocked_by_failure");
@@ -153,6 +162,7 @@ describe("PlanExecute DAG executor fixture replay (#126)", () => {
     const h = await harnessFor("plan_execute_dag_budget_fail_cascade.jsonl", session, tl);
     const r = await h.run({
       task: newTask("root, mid, leaf, indep (budget-fail cascade twin)", session, PLAN_STRATEGY),
+      continue_task_list: true,
     });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") {
@@ -178,6 +188,7 @@ describe("PlanExecute DAG executor fixture replay (#126)", () => {
     const h = await harnessFor("plan_execute_dag_cycle_rejection.jsonl", session, cyclic);
     const r = await h.run({
       task: newTask("cyclic graph (rejected at execute entry)", session, PLAN_STRATEGY),
+      continue_task_list: true,
     });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") expect(r.reason.kind).toBe("task_graph_cycle");

@@ -69,9 +69,29 @@ export class MetadataFilter {
   matches(metadata: unknown): boolean {
     if (this.equals.length === 0) return true;
     const obj = metadata as Record<string, unknown> | null | undefined;
-    if (obj == null || typeof obj !== "object") return false;
-    return this.equals.every(([k, v]) => obj[k] === v);
+    if (obj == null || typeof obj !== "object" || Array.isArray(obj)) return false;
+    return this.equals.every(([k, v]) => jsonValueEqual(obj[k], v));
   }
+}
+
+/** Structural JSON equality matching Rust `serde_json::Value` equality. */
+export function jsonValueEqual(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (a === null || b === null) return a === b;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((v, i) => jsonValueEqual(v, b[i]));
+  }
+  if (typeof a === "object" || typeof b === "object") {
+    if (typeof a !== "object" || typeof b !== "object") return false;
+    const aa = a as Record<string, unknown>;
+    const bb = b as Record<string, unknown>;
+    const ak = Object.keys(aa).sort();
+    const bk = Object.keys(bb).sort();
+    if (ak.length !== bk.length) return false;
+    return ak.every((k, i) => k === bk[i] && jsonValueEqual(aa[k], bb[k]));
+  }
+  return false;
 }
 
 // ============================================================================
@@ -88,6 +108,24 @@ export function dimensionMismatch(expected: number, actual: number): VectorStore
 
 export function backendError(message: string): VectorStoreError {
   return { kind: "backend", message };
+}
+
+/** Error subclass carrying a structured {@link VectorStoreError} detail. */
+export class VectorStoreErrorException extends Error {
+  override readonly name = "VectorStoreErrorException";
+
+  constructor(readonly detail: VectorStoreError) {
+    super(vectorStoreErrorMessage(detail));
+  }
+}
+
+export function vectorStoreErrorMessage(error: VectorStoreError): string {
+  switch (error.kind) {
+    case "dimension_mismatch":
+      return `dimension mismatch: expected ${error.expected}, got ${error.actual}`;
+    case "backend":
+      return error.message;
+  }
 }
 
 // ============================================================================

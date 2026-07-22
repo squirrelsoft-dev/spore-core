@@ -745,24 +745,29 @@ are closed by this decision. Rust remains strictly read-only throughout.
 
 ## 10. Final evidence matrix
 
-All gaps in §5 are implemented and green. Final gates (§7): `pnpm -r test`
-(core 1546 passed | 7 skipped, tools 277, eval 46), `pnpm -r lint` clean,
-`pnpm -r typecheck` clean (0 `tsc --noEmit` errors across core/tools/eval).
+All gaps in §5 are implemented and green, including the PR #169 independent-review
+remediations for PlanExecute continuation/stream/retry parity, workspace command
+progress, repair-on-resume bookkeeping, typed public errors, embedding wire shape,
+and abort-aware async waits. Final gates (§7): `pnpm -r test` (core 1559 passed |
+7 skipped, tools 278, eval 46), `pnpm -r lint` clean, `pnpm -r typecheck` clean
+(0 `tsc --noEmit` errors across core/tools/eval), and `pnpm -r build` confirmed
+there are no selected package build scripts. TypeScript examples 05-12 were
+installed with frozen locks and their available `test`/`lint` scripts passed.
 
 | Gap | Status | Tests | Notes |
 | --- | --- | --- | --- |
-| G-A NodeAttr attribution | **DONE** | `harness-parity-features.test.ts` (2) | `WithNode` wrapper on `HarnessStreamEvent`; react leaf + 4 combinators stamp `node`. Tests strip `node` before compare (mirrors Rust `*got_norm.node_mut() = None`). |
-| G-B ToolProgress streaming | **DONE** | `harness-parity-features.test.ts` (1) + `tool-progress.test.ts` | `tool_progress` event variant; `ToolProgressSink` on `ToolContext`; `RealToolRegistry` threads `progressSink`; `ReadOnlySandbox` forwards `executeCommandStreaming`. |
-| G-C revised/steered fields | **DONE** | `harness-parity-features.test.ts` | `tool_result.revised?` + `user_message.steered?` on `HarnessStreamEvent`; `continue_with_modification` emits revised; `send_message` emits `steered:false`. |
+| G-A NodeAttr attribution | **DONE** | `harness-parity-features.test.ts` (2), `plan-phase.test.ts` | `WithNode` wrapper on `HarnessStreamEvent`; react leaf + 4 combinators stamp `node`; PlanExecute child streams preserve nested paths like `["plan_execute","react"]`. Tests strip `node` before compare (mirrors Rust `*got_norm.node_mut() = None`). |
+| G-B ToolProgress streaming | **DONE** | `harness-parity-features.test.ts` (1), `exec.test.ts` | `tool_progress` event variant; `ToolProgressSink` on `ToolContext`; `RealToolRegistry` threads `progressSink`; `ReadOnlySandbox` and `WorkspaceScopedSandbox` forward `executeCommandStreaming` tail snapshots. |
+| G-C revised/steered fields | **DONE** | `harness-parity-features.test.ts` | `tool_result.revised?` + `user_message.steered?` on `HarnessStreamEvent`; `continue_with_modification` emits revised only when the stream-visible result changes; `send_message` emits `steered:false`. |
 | G-D SteeringSource | **DONE** | `harness-parity-features.test.ts` | `steeringSource?` config + `HarnessBuilder.steeringSource()`; react loop drains steering at turn boundary, emits `user_message{steered:true}`. |
-| G-E ToolCallRepair | **DONE** | `harness-parity-features.test.ts` (1) | `StandardToolCallRepair` + `coerceToolArgs`; `dispatchWithRepair` wired into react dispatch; `toolCallRepair?`/`maxRepairAttempts?` config. |
+| G-E ToolCallRepair | **DONE** | `harness-parity-features.test.ts` | `StandardToolCallRepair` + `coerceToolArgs`; `dispatchWithRepair` wired into react dispatch plus resume/consult pending-call drains; repaired effective calls feed observed writes, spans, history, and enriched parameter errors. |
 | G-F ToolCallNudge | **DONE** | `harness-parity-features.test.ts` | `toolCallNudge?` config; zero-tools-called nudge, bounded `MAX_TOOL_CALL_NUDGES=2`. |
-| G-G planEmptyMaxRetries | **DONE** | `plan-phase.test.ts` (2) | `planEmptyMaxRetries?` config; plan-phase re-ask loop with corrective nudge + folded discarded usage. |
+| G-G planEmptyMaxRetries | **DONE** | `plan-phase.test.ts` (3) | `planEmptyMaxRetries?` config; plan-phase re-ask loop with corrective nudge, tools suppressed, forced `{tasks,rationale}` output schema, and folded discarded usage. |
 | G-H SetPlanTool | **DONE** | `set-plan.test.ts` (7) | `SetPlanTool` writes durable task_list store; `plan_recorded` signal variant; catalogue + `codingSet` membership. |
 | G-I CreateDirTool | **DONE** | `fs.test.ts` | `CreateDirTool` + `CreateDirParamsSchema`; `createDir`/`moveFile`/`deleteFile` in `StandardTools` + `codingSet`. |
 | G-J Narration refund | **DONE** | `harness-parity-features.test.ts` | `narrationRefund` tracking + `budgetExceeded` `turnCapOverride`; send_message-only turns refund at window gate. |
-| G-K Image helpers | **DONE** | `image.test.ts` (5) | `mediaTypeForExtension`, `isImagePath`, `imageContent`, `loadImageContent`. |
-| G-L VectorStore/EmbeddingModel | **DONE** | `embedding.test.ts` + `vector-store.test.ts` (24) | `VectorStore`/`EmbeddingModel` traits + Ollama/OpenAI providers with mocked-HTTP retry. |
+| G-K Image helpers | **DONE** | `image.test.ts` (6) | `mediaTypeForExtension`, `isImagePath`, `imageContent`, cancellable `loadImageContent`, typed unsupported-extension errors. |
+| G-L VectorStore/EmbeddingModel | **DONE** | `embedding.test.ts` + `vector-store.test.ts` (29) | `VectorStore`/`EmbeddingModel` traits + Ollama/OpenAI providers with mocked-HTTP retry, Rust `model_id` wire shape, structural metadata equality, typed vector errors, Ollama timeouts, and abort-aware retry waits. |
 | G-M Docs | **DONE** | — | `building-a-tool.md`, `conversation.md`, `custom-harness.md` authored; `quickstart.md` cross-linked. |
 | G-N tsc cleanup | **DONE** | — | 0 `tsc --noEmit` errors; `typecheck` script added to all 3 packages. |
 
@@ -776,4 +781,4 @@ All gaps in §5 are implemented and green. Final gates (§7): `pnpm -r test`
 
 ---
 
-done: all gaps implemented; final gates green; PR pending
+done: all gaps implemented; PR #169 review findings fixed; final gates green

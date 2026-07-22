@@ -26,6 +26,7 @@ import type { ToolCall } from "../model/schemas.js";
 import type {
   AnyIsolationMode,
   CommandOutput,
+  CommandProgressSink,
   ExecConfig,
   FileRef,
   IsolationMode,
@@ -357,6 +358,28 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
     timeoutMs?: number | null,
     signal?: AbortSignal,
   ): Promise<CommandOutput | SandboxViolation> {
+    return this.executeCommandWithProgress(command, args, cwd ?? null, timeoutMs ?? null, signal);
+  }
+
+  async executeCommandStreaming(
+    command: string,
+    args: readonly string[],
+    cwd: string | null,
+    timeoutMs: number | null,
+    progress: CommandProgressSink | undefined,
+    signal?: AbortSignal,
+  ): Promise<CommandOutput | SandboxViolation> {
+    return this.executeCommandWithProgress(command, args, cwd, timeoutMs, signal, progress);
+  }
+
+  private async executeCommandWithProgress(
+    command: string,
+    args: readonly string[],
+    cwd: string | null,
+    timeoutMs: number | null,
+    signal?: AbortSignal,
+    progress?: CommandProgressSink,
+  ): Promise<CommandOutput | SandboxViolation> {
     switch (this.mode.kind) {
       case "none":
       case "workspace_scoped":
@@ -424,6 +447,21 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
       // fires before it, the process never started (a spawn/start failure of
       // ANY errno — ENOENT, EACCES, EPERM, ENOTDIR, EISDIR, …).
       let spawned = false;
+      let lastPreview = "";
+      const sanitizePreview = (text: string): string =>
+        text
+          // Strip ANSI escape sequences and non-printing control chars except
+          // whitespace that preserves command output structure.
+          .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "")
+          .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+      const emitProgress = (): void => {
+        if (progress == null) return;
+        const combined = stdout + (stderr.length > 0 ? `\n${stderr}` : "");
+        const preview = sanitizePreview(combined).slice(-4000);
+        if (preview.length === 0 || preview === lastPreview) return;
+        lastPreview = preview;
+        progress(preview);
+      };
 
       const cleanup = (): void => {
         if (timer) clearTimeout(timer);
@@ -463,9 +501,11 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
       });
       child.stdout?.on("data", (chunk: Buffer) => {
         stdout += chunk.toString("utf8");
+        emitProgress();
       });
       child.stderr?.on("data", (chunk: Buffer) => {
         stderr += chunk.toString("utf8");
+        emitProgress();
       });
       child.on("error", (err) => {
         cleanup();

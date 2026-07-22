@@ -29,7 +29,7 @@ export interface EmbeddingInfo {
   /** Provider name, e.g. `"ollama"` / `"openai"`. */
   readonly provider: string;
   /** Provider model id, e.g. `"nomic-embed-text"` / `"text-embedding-3-small"`. */
-  readonly modelId: string;
+  readonly model_id: string;
   /** Length of the vectors this model produces (`0` when not yet known). */
   readonly dimensions: number;
 }

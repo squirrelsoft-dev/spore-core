@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  ImageContentError,
   imageContent,
   isImagePath,
   loadImageContent,
@@ -50,7 +51,23 @@ describe("image helpers", () => {
     }
   });
 
-  it("loadImageContent rejects an unrecognized extension", async () => {
-    await expect(loadImageContent("file.bmp")).rejects.toThrow(/unsupported image extension/);
+  it("loadImageContent rejects an unrecognized extension with typed error", async () => {
+    const err = await loadImageContent("file.bmp").catch((e) => e);
+    expect(err).toBeInstanceOf(ImageContentError);
+    expect((err as ImageContentError).detail.kind).toBe("unsupported_extension");
+  });
+
+  it("loadImageContent passes AbortSignal to the file read", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "spore-img-"));
+    try {
+      const p = join(dir, "x.png");
+      await writeFile(p, new Uint8Array([1, 2, 3]));
+      const controller = new AbortController();
+      controller.abort();
+      const err = await loadImageContent(p, controller.signal).catch((e) => e);
+      expect((err as Error).name).toBe("AbortError");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

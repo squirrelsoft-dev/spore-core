@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import { InMemoryVectorStore } from "../src/vector-store/standard.js";
-import { MetadataFilter, dimensionMismatch, vectorRecord } from "../src/vector-store/types.js";
+import {
+  MetadataFilter,
+  VectorStoreErrorException,
+  dimensionMismatch,
+  vectorRecord,
+} from "../src/vector-store/types.js";
 
 function rec(id: string, vector: number[], kind: string) {
   return vectorRecord(id, vector, { kind });
@@ -58,10 +63,25 @@ describe("InMemoryVectorStore", () => {
     expect(await store.isEmpty()).toBe(true);
   });
 
-  it("dimension mismatch rejected", async () => {
+  it("dimension mismatch rejected with typed Error carrying structured detail", async () => {
     const store = new InMemoryVectorStore(3);
     const err = await store.add([rec("a", [1, 0], "chunk")]).catch((e) => e);
-    expect(err).toEqual(dimensionMismatch(3, 2));
+    expect(err).toBeInstanceOf(VectorStoreErrorException);
+    expect((err as VectorStoreErrorException).detail).toEqual(dimensionMismatch(3, 2));
+  });
+
+  it("metadata filters compare arrays/objects structurally", async () => {
+    const store = new InMemoryVectorStore(2);
+    await store.add([
+      vectorRecord("a", [1, 0], { kind: "chunk", tags: ["a", "b"], scope: { project: "p" } }),
+      vectorRecord("b", [1, 0], { kind: "chunk", tags: ["b"], scope: { project: "p" } }),
+    ]);
+    const hits = await store.search(
+      [1, 0],
+      10,
+      MetadataFilter.new().eq("tags", ["a", "b"]).eq("scope", { project: "p" }),
+    );
+    expect(hits.map((h) => h.id)).toEqual(["a"]);
   });
 
   it("per-instance isolation: two stores do not share rows", async () => {

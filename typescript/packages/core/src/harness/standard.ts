@@ -186,6 +186,7 @@ import {
   reactMaxIterations,
   reactPerLoop,
   runStrategy,
+  NO_TOOLS_TOOLSET,
   type PausedState,
   type RunResult,
   type RunStrategy,
@@ -796,6 +797,13 @@ export class StandardHarness implements Harness, StrategyExecutor {
     toolset: ToolsetRef,
     progressSink?: ToolProgressSink,
   ): ToolRegistry {
+    // Reserved handle: advertise NO tools (plan-empty re-ask). Intercepted
+    // before the catalogue lookup so it never falls through to the full
+    // registry. Dispatch is unreachable — the model is offered nothing.
+    // Mirrors Rust `NO_TOOLS_TOOLSET` handling.
+    if (toolset === NO_TOOLS_TOOLSET) {
+      return new EmptyToolRegistry();
+    }
     const store = this.storage();
     // Strict per-node scoping: a non-empty handle with its own catalogue.
     if (toolset.length > 0) {
@@ -868,6 +876,20 @@ export class StandardHarness implements Harness, StrategyExecutor {
       "\n\nHint: provide arguments as correctly-typed JSON (e.g. true/false as a bool, " +
       '42 as a number, ["a"] as an array) rather than as quoted strings.';
     return enriched;
+  }
+
+  /** Whether a recoverable tool-error message is a PARAMETER problem. */
+  private static isParamError(message: string): boolean {
+    const m = message.toLowerCase();
+    return (
+      m.includes("invalid parameters") ||
+      m.includes("invalid type") ||
+      m.includes("missing required field") ||
+      m.includes("missing field") ||
+      m.includes("schema validation failed") ||
+      m.includes("unknown field") ||
+      m.includes("unknown variant")
+    );
   }
 
   /**
@@ -1094,7 +1116,14 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // Instruction seeding stays OWNED by the leaf {@link reactWindow} / the
     // combinators' own build sub-loops (byte-for-byte parity with the ported
     // bodies, AC6) rather than being lifted to the entry.
-    return this.driveStrategy(task, resolvedState, budgetUsed, options.on_stream, options.signal);
+    return this.driveStrategy(
+      task,
+      resolvedState,
+      budgetUsed,
+      options.on_stream,
+      options.signal,
+      options.continue_task_list,
+    );
   }
 
   /**
@@ -1111,6 +1140,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
     budgetUsed: BudgetSnapshot,
     onStream: StreamSink | undefined,
     signal: AbortSignal | undefined,
+    continueTaskList: boolean | undefined,
   ): Promise<RunResult> {
     return this.driveStrategyWithResumeSeed(
       task,
@@ -1120,6 +1150,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
       signal,
       undefined,
       undefined,
+      continueTaskList,
     );
   }
 
@@ -1156,6 +1187,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
     signal: AbortSignal | undefined,
     resumeContinues: [string, number] | undefined,
     resumeSeed: SessionState | undefined,
+    continueTaskList: boolean | undefined,
   ): Promise<RunResult> {
     const sessionId = task.session_id;
     const registry = this.config.registry ?? ExecutionRegistry.empty();
@@ -1174,6 +1206,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // #131/#138: the resume seed is consumed by the FIRST round's PlanExecute
     // walk only; later in-process rounds run normally.
     let resumeSeedNext = resumeSeed;
+    // #138 AC1: the continuation signal is consumed by the FIRST round's
+    // PlanExecute walk only; later in-process rounds run normally.
+    let continueTaskListNext = continueTaskList;
     // SC-5: auto-grants spent at the BARE-LEAF Escalate site under the
     // `auto_continue` EscalationMode. The scope is rebuilt each round here (unlike
     // the in-loop combinator scopes, which carry their own `autoGrantsUsed`), so
@@ -1190,8 +1225,10 @@ export class StandardHarness implements Harness, StrategyExecutor {
       cx.scratch.task = currentTask;
       cx.scratch.resumeContinues = seed;
       cx.scratch.resumeSeed = resumeSeedNext;
+      cx.scratch.continueTaskList = continueTaskListNext;
       seed = undefined;
       resumeSeedNext = undefined;
+      continueTaskListNext = undefined;
 
       const outcome = await runStrategy(currentTask.loop_strategy, cx);
 
@@ -1502,6 +1539,8 @@ export class StandardHarness implements Harness, StrategyExecutor {
     planTask: Task,
     planSession: SessionState,
     budgetUsed: BudgetSnapshot,
+    onStream: StreamSink | undefined,
+    forcedOutputSchema: unknown | undefined,
     signal: AbortSignal | undefined,
   ): Promise<RunResult | undefined> {
     // #124 Q1: the planner concept is DROPPED — the plan child's leaf
@@ -1512,9 +1551,11 @@ export class StandardHarness implements Harness, StrategyExecutor {
     const cx: ExecutionContext = newExecutionContext(registry);
     cx.executor = this;
     cx.signal = signal;
+    cx.stream = onStream;
     cx.scratch.runSession = planSession;
     cx.scratch.runBudget = budgetUsed;
     cx.scratch.task = planTask;
+    cx.scratch.forcedOutputSchema = forcedOutputSchema;
     await runStrategy(plan, cx);
     return cx.scratch.terminalOverride;
   }
@@ -2035,6 +2076,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
             signal,
             resumeSeed,
             carriedSeed,
+            false,
           );
         }
         // Skip: the node is marked skipped and the outer loop advances. For a
@@ -2050,6 +2092,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
               state.budget_used,
               onStream,
               signal,
+              true,
             );
           }
           return {
@@ -2117,8 +2160,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
         // #150: drain paths append to history but have no place to issue a typed
         // halt — flatten any sandbox-violation output to a recoverable-or-not
         // error per the policy (the main loop owns the typed halt).
-        const output = this.normalizeSandboxViolation(await toolRegistry.dispatch(call, signal));
-        const tr: ToolResultRecord = { call_id: call.id, output };
+        const repaired = await this.dispatchWithRepair(toolRegistry, call, signal);
+        const output = this.normalizeSandboxViolation(repaired.output);
+        const tr: ToolResultRecord = { call_id: repaired.call.id, output };
         await this.config.contextManager.appendToolResult(sessionState, tr);
       }
       // SC-BUG-1: a clarification that surfaced from inside a composed tree
@@ -2139,6 +2183,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
           signal,
           undefined,
           sessionState,
+          false,
         );
       }
       const maxIter =
@@ -2199,8 +2244,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
           // #150: this approval-flush path has no place to issue a typed halt —
           // flatten any sandbox-violation output to a recoverable-or-not error
           // per the policy (the main loop owns the typed halt).
-          const output = this.normalizeSandboxViolation(await toolRegistry.dispatch(call, signal));
-          const tr: ToolResultRecord = { call_id: call.id, output };
+          const repaired = await this.dispatchWithRepair(toolRegistry, call, signal);
+          const output = this.normalizeSandboxViolation(repaired.output);
+          const tr: ToolResultRecord = { call_id: repaired.call.id, output };
           await this.config.contextManager.appendToolResult(sessionState, tr);
         }
         break;
@@ -2211,8 +2257,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
           // #150: this approval-flush path has no place to issue a typed halt —
           // flatten any sandbox-violation output to a recoverable-or-not error
           // per the policy (the main loop owns the typed halt).
-          const output = this.normalizeSandboxViolation(await toolRegistry.dispatch(call, signal));
-          const tr: ToolResultRecord = { call_id: call.id, output };
+          const repaired = await this.dispatchWithRepair(toolRegistry, call, signal);
+          const output = this.normalizeSandboxViolation(repaired.output);
+          const tr: ToolResultRecord = { call_id: repaired.call.id, output };
           await this.config.contextManager.appendToolResult(sessionState, tr);
         }
         break;
@@ -2258,6 +2305,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
         signal,
         undefined,
         sessionState,
+        false,
       );
     }
 
@@ -2353,8 +2401,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
       // #150: the consult-resume drain has no place to issue a typed halt —
       // flatten any sandbox-violation output to a recoverable-or-not error per
       // the policy (the main loop owns the typed halt).
-      const output = this.normalizeSandboxViolation(await toolRegistry.dispatch(call, signal));
-      const tr: ToolResultRecord = { call_id: call.id, output };
+      const repaired = await this.dispatchWithRepair(toolRegistry, call, signal);
+      const output = this.normalizeSandboxViolation(repaired.output);
+      const tr: ToolResultRecord = { call_id: repaired.call.id, output };
       await this.config.contextManager.appendToolResult(sessionState, tr);
     }
 
@@ -2378,6 +2427,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
         signal,
         undefined,
         sessionState,
+        false,
       );
     }
 
@@ -2542,23 +2592,40 @@ export class StandardHarness implements Harness, StrategyExecutor {
     toolRegistry: ToolRegistry,
     call: ToolCall,
     signal: AbortSignal | undefined,
-  ): Promise<ToolOutput> {
+  ): Promise<{ call: ToolCall; output: ToolOutput }> {
     let effectiveCall = call;
     let output = await toolRegistry.dispatch(effectiveCall, signal);
     const repair = this.config.toolCallRepair;
-    if (repair == null) return output;
+    if (repair == null) return { call: effectiveCall, output };
     let attemptsLeft = this.config.maxRepairAttempts ?? 1;
     while (attemptsLeft > 0) {
       if (!(output.kind === "error" && output.recoverable)) break;
       const schema = toolRegistry.schemas().find((s) => s.name === effectiveCall.name);
       const repaired = repair.repair(effectiveCall, output.message, schema);
-      if (repaired == null) break;
+      if (repaired == null) {
+        if (StandardHarness.isParamError(output.message)) {
+          output = {
+            kind: "error",
+            message: StandardHarness.enrichToolError(output.message, schema),
+            recoverable: true,
+          };
+        }
+        break;
+      }
       attemptsLeft -= 1;
       effectiveCall = repaired;
       output = await toolRegistry.dispatch(effectiveCall, signal);
       if (!(output.kind === "error" && output.recoverable)) break;
+      if (attemptsLeft === 0 && StandardHarness.isParamError(output.message)) {
+        const exhaustedSchema = toolRegistry.schemas().find((s) => s.name === effectiveCall.name);
+        output = {
+          kind: "error",
+          message: StandardHarness.enrichToolError(output.message, exhaustedSchema),
+          recoverable: true,
+        };
+      }
     }
-    return output;
+    return { call: effectiveCall, output };
   }
 
   /** {@inheritDoc StrategyExecutor.takeObservedWrites} */
@@ -3945,6 +4012,11 @@ export class StandardHarness implements Harness, StrategyExecutor {
           }
 
           const approvedResults: ToolResultRecord[] = [];
+          // Parallel to `approvedResults`: the effective calls that produced each
+          // appended result (post repair, when repair happened). The incoming
+          // model-request `calls` stays intact for BeforeTool/pending tails, but
+          // AfterTool/bookkeeping should see the Rust-equivalent effective call.
+          const approvedCalls: ToolCall[] = [];
           // SC-9: the `sessionState.messages` index of each appended tool result,
           // recorded 1:1 with `approvedResults`. The AfterTool middleware hook
           // uses these to re-render any result it rewrites in place (via
@@ -3988,6 +4060,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
               await this.config.contextManager.appendToolResult(sessionState, tr);
               resultMsgIndices.push(Math.max(0, sessionState.messages.length - 1));
               approvedResults.push(tr);
+              approvedCalls.push(call);
               continue;
             }
 
@@ -4000,11 +4073,15 @@ export class StandardHarness implements Harness, StrategyExecutor {
             });
             const toolStartedAt = Timestamp.now();
             const toolClock = Date.now();
-            // #126 (AC2): observe write/edit calls as they dispatch so the
-            // PlanExecute DAG executor can attach HARNESS-OBSERVED `files_touched`
-            // to a task's ledger entry — never model-self-reported.
-            this.observeWriteCall(call);
-            let output: ToolOutput = await this.dispatchWithRepair(toolRegistry, call, signal);
+            const repairedDispatch = await this.dispatchWithRepair(toolRegistry, call, signal);
+            const effectiveCall = repairedDispatch.call;
+            let output: ToolOutput = repairedDispatch.output;
+            // #126 (AC2): observe write/edit calls as they ACTUALLY dispatch so
+            // the PlanExecute DAG executor can attach HARNESS-OBSERVED
+            // `files_touched` from repaired/effective args — never
+            // model-self-reported. Mirrors Rust returning `(effective_call,
+            // output)` from `dispatch_with_repair`.
+            this.observeWriteCall(effectiveCall);
 
             // Tool-surfaced sandbox violation (#150): the HARNESS decides
             // halt-vs-recoverable per `sandboxViolationPolicy`, not the tool.
@@ -4096,7 +4173,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
             // so that, on resume, the human's answer is injected as the tool
             // RESULT for that pending call.
             if (output.kind === "awaiting_clarification") {
-              const pending = [call, ...calls.slice(i + 1)];
+              const pending = [effectiveCall, ...calls.slice(i + 1)];
               const request: HumanRequest = {
                 kind: "clarification",
                 question: output.question,
@@ -4151,7 +4228,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
                 this.config.observability.emitContext(span);
                 // No spanSeq increment: the pause returns immediately below.
               }
-              const pending = [call, ...calls.slice(i + 1)];
+              const pending = [effectiveCall, ...calls.slice(i + 1)];
               const ps: PausedState = {
                 session_id: sessionId,
                 task_id: task.id,
@@ -4184,7 +4261,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
             // result, then record a minimal success result so the loop
             // continues. (Bad params produce an `error` output, not a success,
             // and so no event is emitted.)
-            if (call.name === "send_message" && output.kind === "success") {
+            if (effectiveCall.name === "send_message" && output.kind === "success") {
               emit(onStream, { kind: "user_message", content: output.content, steered: false });
             }
 
@@ -4193,7 +4270,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
               return failure(
                 {
                   kind: "unrecoverable_tool_error",
-                  tool: call.name,
+                  tool: effectiveCall.name,
                   error: output.message,
                 },
                 sessionId,
@@ -4215,16 +4292,16 @@ export class StandardHarness implements Harness, StrategyExecutor {
             // assistant tool_use → tool result → corrective user message).
             let pendingCorrective: string | undefined;
             if (output.kind === "error" && output.recoverable) {
-              const existing = errorRuns.get(call.name);
+              const existing = errorRuns.get(effectiveCall.name);
               let run: ErrorRun;
-              if (existing !== undefined && structurallyEqualArgs(existing.args, call.input)) {
+              if (existing !== undefined && structurallyEqualArgs(existing.args, effectiveCall.input)) {
                 // Same tool, structurally-identical args → extend the run.
                 existing.count += 1;
                 run = existing;
               } else {
                 // First error, or the args changed → fresh run.
-                run = { args: call.input, count: 1, injected: false };
-                errorRuns.set(call.name, run);
+                run = { args: effectiveCall.input, count: 1, injected: false };
+                errorRuns.set(effectiveCall.name, run);
               }
               const count = run.count;
               const twoN = errorLoopN * 2;
@@ -4237,7 +4314,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
                 // AC4: emit the "broken" pair (stream + obs).
                 emit(onStream, {
                   kind: "tool_error_loop_broken",
-                  tool: call.name,
+                  tool: effectiveCall.name,
                   consecutive_errors: count,
                 });
                 if (this.config.observability) {
@@ -4252,7 +4329,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
                     base,
                     operation: {
                       kind: "tool_error_loop_broken",
-                      tool_name: call.name,
+                      tool_name: effectiveCall.name,
                       consecutive_errors: count,
                     },
                     tokens_before: 0,
@@ -4262,7 +4339,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
                   });
                 }
                 return failure(
-                  { kind: "tool_error_loop", tool: call.name, consecutive_errors: count },
+                  { kind: "tool_error_loop", tool: effectiveCall.name, consecutive_errors: count },
                   sessionId,
                   usage,
                   budgetUsed.turns,
@@ -4276,13 +4353,13 @@ export class StandardHarness implements Harness, StrategyExecutor {
               // re-inject between N and 2N).
               if (errorLoopN > 0 && count >= errorLoopN && !run.injected) {
                 run.injected = true;
-                const schema = toolRegistry.schemas().find((s) => s.name === call.name);
+                const schema = toolRegistry.schemas().find((s) => s.name === effectiveCall.name);
                 pendingCorrective = StandardHarness.enrichToolError(output.message, schema);
                 // AC4: emit the "detected/warning" pair (stream + obs) BEFORE the
                 // corrective message is appended.
                 emit(onStream, {
                   kind: "tool_error_loop_detected",
-                  tool: call.name,
+                  tool: effectiveCall.name,
                   consecutive_errors: count,
                 });
                 if (this.config.observability) {
@@ -4297,7 +4374,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
                     base,
                     operation: {
                       kind: "tool_error_loop_detected",
-                      tool_name: call.name,
+                      tool_name: effectiveCall.name,
                       consecutive_errors: count,
                     },
                     tokens_before: 0,
@@ -4309,7 +4386,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
               }
             } else {
               // AC1: ANY success for this tool resets its run.
-              errorRuns.delete(call.name);
+              errorRuns.delete(effectiveCall.name);
             }
 
             // Tool-call span (issue #12), child of the current turn. Fire-and-forget.
@@ -4336,7 +4413,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
               let argsContent: ToolCallContent | null = null;
               let resultContent: ToolResultContent | null = null;
               if (cc.enabled) {
-                argsContent = StandardHarness.captureToolCallArgs(call, cc.maxFieldLen);
+                argsContent = StandardHarness.captureToolCallArgs(effectiveCall, cc.maxFieldLen);
                 if (output.kind === "success") {
                   const [content, t] = truncateField(output.content, cc.maxFieldLen);
                   resultContent = { content, truncated: t };
@@ -4347,9 +4424,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
               }
               const toolSpan: ToolCallSpan = {
                 base: finishSpanBase(childBase, Timestamp.now(), status, Date.now() - toolClock),
-                tool_name: call.name,
-                call_id: call.id,
-                parameters_size_bytes: JSON.stringify(call.input).length,
+                tool_name: effectiveCall.name,
+                call_id: effectiveCall.id,
+                parameters_size_bytes: JSON.stringify(effectiveCall.input).length,
                 output_size_bytes: outputSizeBytes,
                 truncated,
                 sandbox_mode: "",
@@ -4361,7 +4438,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
               spanSeq += 1;
             }
 
-            const tr: ToolResultRecord = { call_id: call.id, output };
+            const tr: ToolResultRecord = { call_id: effectiveCall.id, output };
             // Q5: surface the result content on the coarse event.
             const resultContentForStream =
               output.kind === "success"
@@ -4371,7 +4448,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
                   : "";
             emit(onStream, {
               kind: "tool_result",
-              call_id: call.id,
+              call_id: effectiveCall.id,
               is_error: isError,
               content: resultContentForStream,
             });
@@ -4381,6 +4458,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
             // addresses the tool result itself.
             resultMsgIndices.push(Math.max(0, sessionState.messages.length - 1));
             approvedResults.push(tr);
+            approvedCalls.push(effectiveCall);
 
             // #137 (AC2): inject the ONE corrective user message at the N
             // threshold, AFTER this call's tool result is recorded — the same
@@ -4404,8 +4482,17 @@ export class StandardHarness implements Harness, StrategyExecutor {
             // Project the harness-loop results onto the model-facing shape the
             // rich hook mutates; keep the originals 1:1 so the fold-back addresses
             // each by index.
+            const streamView = (r: ToolResultRecord): [boolean, string] => [
+              r.output.kind === "error",
+              r.output.kind === "success"
+                ? r.output.content
+                : r.output.kind === "error"
+                  ? r.output.message
+                  : "",
+            ];
+            const preViews = approvedResults.map(streamView);
             const modelResults = approvedResults.map(toModelToolResult);
-            const d = await this.config.middleware.fireAfterTool(calls, modelResults);
+            const d = await this.config.middleware.fireAfterTool(approvedCalls, modelResults);
             switch (d.kind) {
               case "continue":
                 break;
@@ -4421,21 +4508,21 @@ export class StandardHarness implements Harness, StrategyExecutor {
                   // SC-9 / issue #103 Q5: emit a REVISED `tool_result` stream
                   // event so consumers correct the displayed result instead of
                   // double-counting it as a second call. Mirrors Rust
-                  // `StreamEvent::ToolResult { revised: true }`.
-                  const call = calls[i]!;
-                  const revisedContent =
-                    folded.output.kind === "success"
-                      ? folded.output.content
-                      : folded.output.kind === "error"
-                        ? folded.output.message
-                        : "";
-                  emit(onStream, {
-                    kind: "tool_result",
-                    call_id: call.id,
-                    is_error: folded.output.kind === "error",
-                    content: revisedContent,
-                    revised: true,
-                  });
+                  // `StreamEvent::ToolResult { revised: true }`, including the
+                  // pre/post stream-view comparison so unchanged results do NOT
+                  // get false correction events.
+                  const call = approvedCalls[i]!;
+                  const post = streamView(folded);
+                  const pre = preViews[i]!;
+                  if (post[0] !== pre[0] || post[1] !== pre[1]) {
+                    emit(onStream, {
+                      kind: "tool_result",
+                      call_id: call.id,
+                      is_error: post[0],
+                      content: post[1],
+                      revised: true,
+                    });
+                  }
                 }
                 break;
               case "halt":

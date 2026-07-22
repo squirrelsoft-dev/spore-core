@@ -94,6 +94,25 @@ describe("OllamaEmbeddingModel", () => {
     const err = await model.embedOne("x").catch((e) => e);
     expect(err).toBeInstanceOf(ProviderError);
   });
+
+  it("info uses Rust wire field model_id", () => {
+    const model = new OllamaEmbeddingModel("nomic-embed-text", { dimensions: 768 });
+    expect(model.info()).toEqual({ provider: "ollama", model_id: "nomic-embed-text", dimensions: 768 });
+  });
+
+  it("withTimeout aborts a never-responding fetch and maps to Timeout", async () => {
+    const fetch = async (_url: string, init: RequestInit): Promise<Response> =>
+      new Promise<Response>((_resolve, reject) => {
+        const sig = init.signal as AbortSignal;
+        sig.addEventListener("abort", () => reject(sig.reason), { once: true });
+      });
+    const model = new OllamaEmbeddingModel("nomic-embed-text", {
+      fetchImpl: fetch,
+      timeoutMs: 1,
+    });
+    const err = await model.embed(["x"]).catch((e) => e);
+    expect(err).toBeInstanceOf(Timeout);
+  });
 });
 
 describe("OpenAIEmbeddingModel", () => {
@@ -208,6 +227,31 @@ describe("OpenAIEmbeddingModel", () => {
     });
     await model.embed(["x"]);
     expect(slept).toBe(7000);
+  });
+
+  it("retry backoff sleep observes AbortSignal", async () => {
+    let i = 0;
+    const controller = new AbortController();
+    const fetch = async (): Promise<Response> => {
+      i += 1;
+      return new Response("{}", { status: 429 });
+    };
+    const model = new OpenAIEmbeddingModel("k", "text-embedding-3-small", {
+      fetchImpl: fetch,
+      maxRetries: 1,
+      sleep: async () => {
+        controller.abort(new Error("stop"));
+      },
+    });
+    const err = await model.embed(["x"], controller.signal).catch((e) => e);
+    expect(err).toBeInstanceOf(ProviderError);
+    expect((err as ProviderError).providerMessage).toContain("request aborted");
+    expect(i).toBe(1);
+  });
+
+  it("info uses Rust wire field model_id", () => {
+    const model = new OpenAIEmbeddingModel("k", "text-embedding-3-small");
+    expect(model.info()).toEqual({ provider: "openai", model_id: "text-embedding-3-small", dimensions: 1536 });
   });
 
   it("fromEnv rejects unset/empty env var", () => {

@@ -106,15 +106,31 @@ export class OllamaEmbeddingModel implements EmbeddingModel {
     const url = `${this.baseUrl}/api/embed`;
     const body: OllamaEmbedRequest = { model: this.modelId, input: inputs };
     let resp: Response;
+    const controller = new AbortController();
+    let timedOut = false;
+    const onAbort = (): void => controller.abort(signal?.reason);
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener("abort", onAbort, { once: true });
+      if (this.timeoutMs > 0) {
+        timer = setTimeout(() => {
+          timedOut = true;
+          controller.abort(new DOMException("embedding request timed out", "TimeoutError"));
+        }, this.timeoutMs);
+      }
       resp = await this.fetchImpl(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
-        signal,
+        signal: controller.signal,
       });
     } catch (e) {
+      if (timedOut) throw new Timeout();
       throw this.mapTransportError(e);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
     }
     if (!resp.ok) {
       const code = resp.status;
@@ -149,7 +165,7 @@ export class OllamaEmbeddingModel implements EmbeddingModel {
   }
 
   info(): EmbeddingInfo {
-    return { provider: "ollama", modelId: this.modelId, dimensions: this.dims };
+    return { provider: "ollama", model_id: this.modelId, dimensions: this.dims };
   }
 
   private mapTransportError(e: unknown): ModelError {
@@ -348,7 +364,7 @@ export class OpenAIEmbeddingModel implements EmbeddingModel {
   }
 
   info(): EmbeddingInfo {
-    return { provider: "openai", modelId: this.modelId, dimensions: this.dims };
+    return { provider: "openai", model_id: this.modelId, dimensions: this.dims };
   }
 }
 

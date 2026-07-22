@@ -14,6 +14,27 @@ import { extname } from "node:path";
 
 import type { Content } from "./schemas.js";
 
+export type ImageContentErrorKind =
+  | { kind: "unsupported_extension"; extension: string; expected: readonly string[] };
+
+/** Typed public image helper error (no plain package-boundary Error). */
+export class ImageContentError extends Error {
+  override readonly name = "ImageContentError";
+
+  constructor(readonly detail: ImageContentErrorKind) {
+    super(imageContentErrorMessage(detail));
+  }
+}
+
+export function imageContentErrorMessage(detail: ImageContentErrorKind): string {
+  switch (detail.kind) {
+    case "unsupported_extension":
+      return `unsupported image extension: ${detail.extension === "" ? '\"\"' : detail.extension} (expected ${detail.expected.join("/")})`;
+  }
+}
+
+const SUPPORTED_IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp"] as const;
+
 /**
  * The image media type for a file extension, or `null` if it is not a format
  * the vision adapters accept. Case-insensitive.
@@ -55,15 +76,17 @@ export function imageContent(mediaType: string, bytes: Uint8Array): Content {
  * Read an image file at `path` into a `Content` image block. Rejects if the
  * extension is unrecognized or the file cannot be read.
  */
-export async function loadImageContent(path: string): Promise<Content> {
+export async function loadImageContent(path: string, signal?: AbortSignal): Promise<Content> {
   const ext = extname(path);
   const mediaType = mediaTypeForExtension(ext.slice(1));
   if (mediaType == null) {
-    throw new Error(
-      `unsupported image extension: ${ext === "" ? '""' : ext} (expected png/jpg/jpeg/gif/webp)`,
-    );
+    throw new ImageContentError({
+      kind: "unsupported_extension",
+      extension: ext,
+      expected: SUPPORTED_IMAGE_EXTENSIONS,
+    });
   }
-  const bytes = await readFile(path);
+  const bytes = await readFile(path, { signal });
   return imageContent(mediaType, bytes);
 }
 

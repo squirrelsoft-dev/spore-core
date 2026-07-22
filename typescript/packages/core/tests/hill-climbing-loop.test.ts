@@ -562,7 +562,7 @@ describe("HillClimbing loop strategy (issue #60)", () => {
     }
   });
 
-  it("hill_climbing_runs_non_react_inner_per_iteration (#124): the inner PlanExecute plan turn fires once (#138 AC1 skips re-planning after)", async () => {
+  it("hill_climbing_runs_non_react_inner_per_iteration (#124): inner PlanExecute plans fresh per iteration", async () => {
     // #124: HillClimbing GENUINELY recurses into `inner`. With a non-ReAct inner
     // (PlanExecute[ReAct, ReAct]) the inner PlanExecute's WHOLE loop runs per
     // iteration, firing the plan phase — proving the recursion.
@@ -572,9 +572,9 @@ describe("HillClimbing loop strategy (issue #60)", () => {
     // #138 AC1: the durable task_list is project-scoped (a real in-memory store,
     // mirroring Rust's standard_config), so iteration 1 authors it and iteration 2
     // SKIPS re-planning (the list already exists). The plan phase therefore fires
-    // EXACTLY ONCE across the whole climb — which still proves the recursion (a
-    // ReAct proposer would fire it zero times). Iteration 2 also reconciles the
-    // now-Completed task, so it runs no execute turn either.
+    // once per hill-climbing iteration, proving the recursion while preserving
+    // Rust parity: hill-climbing iterations are fresh runs, not task-list
+    // continuations.
     const evaluator = new ScriptedMetricEvaluator([1.0, 2.0, 0.5], "maximize");
     const worker = new ScriptedRecordingAgent(AgentId.of("hc-inner"))
       .push(fr('{"tasks":["only"],"rationale":"r"}')) // iter1 plan
@@ -611,13 +611,12 @@ describe("HillClimbing loop strategy (issue #60)", () => {
     if (r.kind === "failure") {
       expect(r.reason.kind).toBe("stagnation_limit_reached");
     }
-    // #138 AC1: the inner PlanExecute fired its plan turn EXACTLY ONCE — the first
-    // iteration authored the durable task_list; later iterations skip re-planning.
-    // A hardcoded-ReAct proposer would record ZERO plan turns, so a single plan
-    // turn still proves the genuine recursion into PlanExecute.
+    // Rust parity: hill-climbing does NOT set continue_task_list, so each
+    // iteration plans fresh. A hardcoded-ReAct proposer would record ZERO plan
+    // turns, so these plan turns still prove genuine recursion into PlanExecute.
     const planTurns = worker.contexts.filter((ctx) =>
       ctxText(ctx).includes("step-by-step plan"),
     ).length;
-    expect(planTurns).toBe(1);
+    expect(planTurns).toBe(2);
   });
 });

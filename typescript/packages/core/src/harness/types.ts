@@ -25,6 +25,7 @@ import {
   hasCycle,
   pushStepLedger,
   renderStepLedger,
+  defaultTaskList,
   type StepLedgerEntry,
   type TaskList,
 } from "../tasklist/index.js";
@@ -1300,6 +1301,8 @@ export interface StrategyExecutor {
     planTask: Task,
     planSession: SessionState,
     budgetUsed: BudgetSnapshot,
+    onStream: StreamSink | undefined,
+    forcedOutputSchema: unknown | undefined,
     signal: AbortSignal | undefined,
   ): Promise<RunResult | undefined>;
 
@@ -1531,6 +1534,22 @@ export interface RunScratch {
    * consumed.
    */
   resumeSeed?: SessionState;
+  /**
+   * Continuation signal (#138 AC1): set by Ralph (cross-window continuation of
+   * one logical task) / the `Skip` resolution / an explicit
+   * {@link HarnessRunOptions.continue_task_list} so a `PlanExecute` inner resumes
+   * its durable task list INSTEAD of planning fresh. CONSUMED by the FIRST
+   * `PlanExecute` walk so it never leaks into a nested per-task PlanExecute
+   * (which must plan fresh). Mirrors Rust `cx.scratch.continue_task_list`.
+   */
+  continueTaskList?: boolean;
+  /**
+   * A FORCED output schema (the plan-empty repair re-ask, #139) that wins over
+   * the global `enforceOutputSchemas` gate and is consumed one-shot by the
+   * react leaf. `undefined` on every non-forced path. Mirrors Rust
+   * `cx.scratch.forced_output_schema`.
+   */
+  forcedOutputSchema?: unknown;
 }
 
 function newRunScratch(): RunScratch {
@@ -2215,7 +2234,14 @@ async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<Str
   // compact key-sorted JSON in the window, so they are identical across the four
   // language ports.
   let outputSchema: unknown | undefined;
-  if (executor.enforceOutputSchemas() && c.output !== undefined) {
+  // A FORCED schema (the plan-empty repair re-ask, #139) wins over the global
+  // enforce gate and is consumed one-shot; otherwise fall back to the normal
+  // `enforceOutputSchemas` + `c.output` resolution.
+  const forcedOutputSchema = cx.scratch.forcedOutputSchema;
+  cx.scratch.forcedOutputSchema = undefined;
+  if (forcedOutputSchema !== undefined) {
+    outputSchema = forcedOutputSchema;
+  } else if (executor.enforceOutputSchemas() && c.output !== undefined) {
     outputSchema = cx.registry.resolveSchema(c.output);
   }
   const outputSchemaMaxRetries = executor.outputSchemaMaxRetries();
@@ -2234,7 +2260,9 @@ async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<Str
   // `depth`; the leaf's stamp is set-once (innermost wins). Mirrors Rust
   // `wrap_node_sink(cx.stream.clone(), "react", agent_id)`.
   const onStream = wrapNodeSink(cx.stream, "react", c.agent.length > 0 ? c.agent : undefined);
-  cx.stream = undefined;
+  // NOTE: do NOT clear `cx.stream` — an enclosing combinator that wrapped it
+  // with its own kind needs it to persist for sibling/next children (mirrors
+  // Rust `wrap_node_sink(cx.stream.clone(), ..)` which clones, not takes).
   const result = await executor.reactWindow(
     task,
     maxIterations,
@@ -2399,6 +2427,52 @@ function fillEmptyWorkerAgent(ls: LoopStrategy, agent: AgentRef): LoopStrategy {
 }
 
 /**
+ * The reserved toolset handle that advertises NO tools (plan-empty re-ask).
+ * Mirrors Rust `NO_TOOLS_TOOLSET = "__none__"`.
+ */
+export const NO_TOOLS_TOOLSET = "__none__";
+
+/**
+ * Clone `ls` with its driving leaf's ReAct toolset re-pointed at
+ * {@link NO_TOOLS_TOOLSET}, so a plan re-ask run through it advertises NO tools
+ * and the planner is forced to answer in message content. Recurses into
+ * wrappers (the PLAN side of a nested `PlanExecute`). Mirrors Rust
+ * `plan_with_tools_suppressed`.
+ */
+export function planWithToolsSuppressed(ls: LoopStrategy): LoopStrategy {
+  switch (ls.kind) {
+    case "react":
+      return { ...ls, toolset: NO_TOOLS_TOOLSET };
+    case "plan_execute":
+      return { ...ls, plan: planWithToolsSuppressed(ls.plan) };
+    case "self_verifying":
+      return { ...ls, inner: planWithToolsSuppressed(ls.inner) };
+    case "ralph":
+      return { ...ls, inner: planWithToolsSuppressed(ls.inner) };
+    case "hill_climbing":
+      return { ...ls, inner: planWithToolsSuppressed(ls.inner) };
+  }
+}
+
+/**
+ * The JSON schema the plan-empty REPAIR forces on a re-ask (#139): the
+ * canonical `{ tasks: [string], rationale: string }` plan contract. Delivered
+ * as the OpenAI/vLLM `response_format` (or Ollama `format`) so the planner is
+ * guided-decoded into valid JSON instead of free prose. Mirrors Rust
+ * `plan_output_schema`.
+ */
+export function planOutputSchema(): unknown {
+  return {
+    type: "object",
+    properties: {
+      tasks: { type: "array", items: { type: "string" } },
+      rationale: { type: "string" },
+    },
+    required: ["tasks", "rationale"],
+  };
+}
+
+/**
  * Fold a child terminal's usage + turns into the cumulative `totalUsage` and
  * the shared `carried` budget snapshot (#124). Mirrors Rust `fold_usage`:
  * `waiting_for_human` / `consult` are non-terminal pauses and carry nothing;
@@ -2480,10 +2554,12 @@ async function runPlanExecuteConfig(
   // of `cx.stream` so the recursive children run with a suppressed sink; restore
   // it before returning.
   // G-A: wrap the parent sink so combinator-emitted events carry `node`
-  // attribution (kind "plan_execute"). Nested leaf events are suppressed by the
-  // design below; the combinator's own coarse events are stamped here.
-  const onStream = wrapNodeSink(cx.stream, "plan_execute");
-  cx.stream = undefined;
+  // attribution (kind "plan_execute"). Children inherit the WRAPPER as
+  // `cx.stream` and stream through it, each event gaining a `plan_execute` hop
+  // in its node path (mirrors Rust `cx.stream = wrap_node_sink(on_stream, ..)`).
+  // Restored to the saved parent on every exit.
+  const onStream = cx.stream;
+  cx.stream = wrapNodeSink(onStream, "plan_execute");
 
   // #131/#138: the phase-agnostic resume seed (the stalled worker conversation
   // carried from a resumed consult or budget pause). Taken BEFORE the plan phase
@@ -2493,14 +2569,28 @@ async function runPlanExecuteConfig(
   cx.scratch.resumeSeed = undefined;
 
   // #138 AC1 (skip re-planning): probe the DURABLE task_list BEFORE the plan
-  // phase. If a non-empty list already exists (e.g. a prior window authored it,
-  // #142 makes it survive Ralph's per-window session reset), the plan phase is
-  // REDUNDANT — go straight to reconcile + the ready-set walk. This is the core
-  // fix: a budget/consult re-entry no longer burns its grant re-planning a graph
-  // that is already durable. The plan artifact may be ABSENT in this case (AC1-a
-  // artifact-optional) — nothing downstream requires it once a task_list exists.
+  // phase. Skip the plan phase ONLY when this is an explicit CONTINUATION that
+  // still has UNFINISHED work to resume — never on the mere presence of a
+  // durable list. The durable task_list is keyed by the stable project namespace
+  // (#142), so it survives across independent re-entries that share a workspace:
+  // separate `run()` calls on one long-lived harness (a conversational host), and
+  // HillClimbing iterations (each a fresh neighbor candidate). Treating "a list
+  // exists" as "resume it" made those re-plan into nothing — a second
+  // `run()`/iteration found the prior, fully-`Completed` graph, walked to no
+  // ready task, and drained to a silent empty `Success`. Continuation is therefore
+  // SIGNALLED, not inferred: a `resumeSeed` (consult/budget/clarification/HITL
+  // resume) or an explicit `continueTaskList` flag set by Ralph (cross-window
+  // continuation of one logical task) / the `Skip` resolution / the run options.
+  // The signal is CONSUMED here so it never leaks into a nested per-task
+  // PlanExecute (which must plan fresh). Mirrors Rust `plan_execute.rs:415-426`.
   const preexisting = await executor.loadTaskList(sessionId);
-  const skipPlan = preexisting != null && preexisting.tasks.length > 0;
+  const isContinuation =
+    resumeSeedSession !== undefined || (cx.scratch.continueTaskList ?? false);
+  cx.scratch.continueTaskList = undefined;
+  const hasUnfinishedWork =
+    preexisting != null &&
+    preexisting.tasks.some((t) => t.status === "pending" || t.status === "in_progress");
+  const skipPlan = isContinuation && hasUnfinishedWork;
 
   let taskList: TaskList;
   let totalUsage: AggregateUsage;
@@ -2537,6 +2627,14 @@ async function runPlanExecuteConfig(
   } else {
     // ── AC3 / fresh-plan path: run the plan phase. ────────────────────────────
     //
+    // A fresh (non-continuation) run clears any STALE durable task list so a
+    // prior completed/abandoned plan in the same project namespace is NOT
+    // reused (model A: `run()` plans fresh by default). Mirrors Rust
+    // `plan_execute.rs` fresh-plan clearing.
+    if (preexisting != null) {
+      await executor.persistTaskList(sessionId, defaultTaskList());
+    }
+    //
     // #138 AC3 (plan-phase exhaustion): when a resume seed is present AND the
     // durable list has no `in_progress` task, the exhaustion happened in the PLAN
     // phase before authoring any task (AC3-b: the list is still empty). Seed the
@@ -2561,9 +2659,19 @@ async function runPlanExecuteConfig(
     // (the default) preserves the historical single-shot behaviour
     // byte-identically. Mirrors Rust `plan_empty_max_retries`.
     const planEmptyMaxRetries = executor.planEmptyMaxRetries();
+    // The re-ask runs with tools SUPPRESSED: a reasoning model offered the full
+    // toolset tends to derail into a tool call (or pure reasoning) instead of
+    // emitting the plan; with no tools it must answer in content. The first
+    // attempt keeps tools (it may research). Built ONLY when re-asks are enabled
+    // — at the default cap of `0` the loop is single-shot and this clone would
+    // be wasted (keeps the historical no-retry path byte-identical and
+    // allocation-free). Mirrors Rust `plan_with_tools_suppressed`.
+    const retryPlan =
+      planEmptyMaxRetries > 0 ? planWithToolsSuppressed(c.plan) : undefined;
     let discardedUsage: AggregateUsage = emptyAggregateUsage();
     let outcome!: { ok: true; artifact: PlanArtifact; usage: AggregateUsage; turns: number } | { ok: false; failure: RunResult };
     for (let attempt = 0; ; attempt += 1) {
+      const activePlan: LoopStrategy = attempt === 0 ? c.plan : (retryPlan ?? c.plan);
       const planSession =
         planResume && attempt === 0 && resumeSeedSession !== undefined
           ? resumeSeedSession
@@ -2586,13 +2694,20 @@ async function runPlanExecuteConfig(
         instruction: directive,
         session_id: sessionId,
         budget: { ...task.budget },
-        loop_strategy: c.plan,
+        loop_strategy: activePlan,
       };
+      // #139: the trusted first attempt runs UNCONSTRAINED; each repair re-ask
+      // FORCES the plan schema (→ `response_format`), so a model that answered
+      // in prose is now made to emit valid `{tasks, rationale}` JSON. Mirrors
+      // Rust `plan_output_schema`.
+      const forcedSchema = attempt > 0 ? planOutputSchema() : undefined;
       const planResult = await executor.runPlanSubtree(
-        c.plan,
+        activePlan,
         planTask,
         planSession,
         { ...budgetUsed },
+        cx.stream,
+        forcedSchema,
         cx.signal,
       );
 
@@ -2992,8 +3107,10 @@ async function runPlanExecuteConfig(
       if (pushStepLedger(ledger, entry)) ledgerElided = true;
 
       // Surface the completed step's final text to the caller's sink — the
-      // parent-visible step boundary.
-      if (onStream != null) onStream({ kind: "final_response", content: lastOutput });
+      // parent-visible step boundary. Emit through the WRAPPED `cx.stream` (not
+      // the saved parent `onStream`) so this combinator-surfaced step output is
+      // attributed to the `plan_execute` node (mirrors Rust `#stream`).
+      if (cx.stream != null) cx.stream({ kind: "final_response", content: lastOutput });
 
       // #125: charge this step's turns against the PlanExecute scope.
       const stepCharge = chargeCurrent(cx, Math.max(0, subResult.turns - carriedBefore));
@@ -3198,8 +3315,8 @@ async function runSelfVerifyingConfig(
   // Suppress the run's stream sink for the recursive child phases.
   // G-A: wrap the parent sink so combinator-emitted events carry `node`
   // attribution (kind "self_verifying").
-  const onStream = wrapNodeSink(cx.stream, "self_verifying");
-  cx.stream = undefined;
+  const onStream = cx.stream;
+  cx.stream = wrapNodeSink(onStream, "self_verifying");
 
   // Q1a: resolve the verifier from `evaluator`'s key (NO wire change).
   const verifier = cx.registry.resolveVerifier(c.evaluator);
@@ -3489,8 +3606,8 @@ async function runRalphConfig(c: RalphConfig, cx: ExecutionContext): Promise<Str
   }
   // G-A: wrap the parent sink so combinator-emitted events carry `node`
   // attribution (kind "ralph").
-  const onStream = wrapNodeSink(cx.stream, "ralph");
-  cx.stream = undefined;
+  const onStream = cx.stream;
+  cx.stream = wrapNodeSink(onStream, "ralph");
   // Ralph discards the incoming session state by design (each window is a fresh
   // start re-seeded from the filesystem checkpoint).
   cx.scratch.runSession = emptySessionState();
@@ -3525,6 +3642,14 @@ async function runRalphConfig(c: RalphConfig, cx: ExecutionContext): Promise<Str
     cx.scratch.runSession = sessionState;
     // FRESH per-window budget (the reset discards the turn budget).
     cx.scratch.runBudget = emptyBudgetSnapshot();
+    // Model (A): Ralph is the continuation loop — each window continues the ONE
+    // logical task across the per-window session reset. Signal it so a
+    // PlanExecute inner resumes its durable task list (window 0 / fresh-start
+    // has an empty list ⇒ the inner's "unfinished work" check still plans fresh;
+    // a window that finished its whole plan but is not yet "done" likewise has
+    // no unfinished work ⇒ re-plans for the remaining work instead of no-op
+    // draining). Mirrors Rust `ralph.rs:306`.
+    cx.scratch.continueTaskList = true;
     const windowOutcome = await runStrategy(innerForWindow, cx);
     // #125 rule 4/7: a window child's `budget_exhausted` reaches Ralph as a
     // `StrategyOutcome`, never auto-cascaded. Ralph's recovery semantics: a
@@ -3619,8 +3744,8 @@ async function runHillClimbingConfig(
   const taskId = task.id;
   // G-A: wrap the parent sink so combinator-emitted events carry `node`
   // attribution (kind "hill_climbing").
-  const onStream = wrapNodeSink(cx.stream, "hill_climbing");
-  cx.stream = undefined;
+  const onStream = cx.stream;
+  cx.stream = wrapNodeSink(onStream, "hill_climbing");
   const carried: BudgetSnapshot = { ...cx.scratch.runBudget };
   cx.scratch.runSession = emptySessionState();
   const direction = c.direction;
@@ -3749,6 +3874,13 @@ async function runHillClimbingConfig(
     await executor.appendUserMessage(iterState, task.instruction);
     cx.scratch.runSession = iterState;
     cx.scratch.runBudget = { ...carried };
+    // Model (A): each HillClimbing iteration generates a FRESH neighbor
+    // candidate — never a continuation of the prior iteration's plan. Clear the
+    // continue signal so a PlanExecute inner re-plans each iteration (the
+    // load-bearing requirement of hill climbing), and so an enclosing Ralph
+    // window's continue signal does not leak in. Mirrors Rust
+    // `hill_climbing.rs:422`.
+    cx.scratch.continueTaskList = false;
     const iterOutcome = await runStrategy(c.inner, cx);
     // #125 rule 4/7: a child's `budget_exhausted` reaches HillClimbing as a
     // `StrategyOutcome`, never auto-cascaded. Surface this node's own typed
@@ -5544,6 +5676,18 @@ export interface HarnessRunOptions {
   /** Optional starting session state (resumed history). */
   session_state?: SessionState;
   signal?: AbortSignal;
+  /**
+   * Opt in to CONTINUING the durable, project-scoped task list from a prior
+   * run rather than planning fresh (model A). Default `false` (omitted): a
+   * `PlanExecute` `run()` plans fresh and clears any stale list — the correct
+   * default for a conversational host issuing one independent `run()` per user
+   * turn. Set `true` only to deliberately resume an in-flight plan across
+   * `run()` calls; the in-process HITL / budget / consult resume paths and the
+   * Ralph window loop signal continuation on their own and do NOT need this.
+   * Has effect only when there is unfinished (`pending`/`in_progress`) work to
+   * resume. Mirrors Rust `HarnessRunOptions::continue_task_list`.
+   */
+  continue_task_list?: boolean;
 }
 
 // ============================================================================

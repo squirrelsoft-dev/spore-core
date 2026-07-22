@@ -14,6 +14,10 @@ import {
   HarnessBuilder,
   MockAgent,
   SessionId,
+  TaskId,
+  emptyBudgetSnapshot,
+  emptySessionState,
+  observability,
   StandardHarness,
   newTask,
   toolCallRepair,
@@ -22,6 +26,7 @@ import {
   type HarnessConfig,
   type HarnessStreamEvent,
   type LoopStrategy,
+  type PausedState,
   type Task,
   type TokenUsage,
   type ToolCall,
@@ -149,11 +154,18 @@ describe("G-C tool_result.revised (AfterTool continue_with_modification)", () =>
     tr.push({ kind: "success", content: "wrote x", truncated: false });
     const cfg = standardConfig(a);
     cfg.toolRegistry = tr;
-    const mw = new ScriptedMiddleware();
-    // The first tool result is a success; AfterTool rewrites it to a recoverable
-    // error (continue_with_modification).
-    mw.push("after_tool", { kind: "continue_with_modification" });
-    cfg.middleware = mw;
+    cfg.middleware = {
+      register() {},
+      async fireBeforeSession() { return { kind: "continue" }; },
+      async fireBeforeTurn() { return { kind: "continue" }; },
+      async fireBeforeTool() { return { kind: "continue" }; },
+      async fireAfterTool(_calls, results) {
+        results[0] = { tool_use_id: results[0]!.tool_use_id, is_error: true, content: "blocked" };
+        return { kind: "continue_with_modification" };
+      },
+      async fireBeforeCompletion() { return { kind: "continue" }; },
+      async fireAfterSession() {},
+    };
 
     const h = new StandardHarness(cfg);
     const events: HarnessStreamEvent[] = [];
@@ -169,6 +181,36 @@ describe("G-C tool_result.revised (AfterTool continue_with_modification)", () =>
     expect(toolResults.length).toBe(2);
     expect(toolResults[0]!.revised ?? false).toBe(false);
     expect(toolResults[1]!.revised).toBe(true);
+  });
+
+  it("does not emit a revised tool_result event for unchanged results", async () => {
+    const a = new MockAgent(AgentId.of("test"));
+    a.push({
+      kind: "tool_call_requested",
+      calls: [{ id: "c0", name: "read_file", input: { path: "x" } } as ToolCall],
+      usage: usage(),
+    } as TurnResult);
+    a.push({ kind: "final_response", content: "done", usage: usage() } as TurnResult);
+
+    const tr = new ScriptedToolRegistry();
+    tr.push({ kind: "success", content: "same", truncated: false });
+    const cfg = standardConfig(a);
+    cfg.toolRegistry = tr;
+    const mw = new ScriptedMiddleware();
+    mw.push("after_tool", { kind: "continue_with_modification" });
+    cfg.middleware = mw;
+
+    const h = new StandardHarness(cfg);
+    const events: HarnessStreamEvent[] = [];
+    const r = await h.run({ task: react(5), on_stream: (e) => events.push(e) });
+    expect(r.kind).toBe("success");
+
+    const toolResults = events.filter((e) => e.kind === "tool_result") as Extract<
+      HarnessStreamEvent,
+      { kind: "tool_result" }
+    >[];
+    expect(toolResults).toHaveLength(1);
+    expect(toolResults[0]!.revised ?? false).toBe(false);
   });
 });
 
@@ -269,6 +311,124 @@ describe("G-E tool-call repair", () => {
     expect(r.kind).toBe("success");
     expect(reg.dispatched.length).toBe(2);
     // The second dispatch carried the coerced boolean.
+    expect((reg.dispatched[1]!.input as { flag: unknown }).flag).toBe(true);
+  });
+
+  it("records downstream observability from the effective repaired call", async () => {
+    const a = new MockAgent(AgentId.of("test"));
+    a.push({
+      kind: "tool_call_requested",
+      calls: [{ id: "c0", name: "t", input: { flag: "true" } } as ToolCall],
+      usage: usage(),
+    } as TurnResult);
+    a.push({ kind: "final_response", content: "done", usage: usage() } as TurnResult);
+
+    const reg = new RecordingRegistry();
+    reg.pushOutput({ kind: "error", message: "invalid parameters: flag must be boolean", recoverable: true });
+    reg.pushOutput({ kind: "success", content: "ok", truncated: false });
+    reg.withSchema({
+      name: "t",
+      description: "",
+      input_schema: { type: "object", properties: { flag: { type: "boolean" } } },
+    });
+    const obs = new observability.InMemoryObservabilityProvider();
+    const afterToolCalls: ToolCall[][] = [];
+    const cfg = standardConfig(a);
+    cfg.toolRegistry = reg;
+    cfg.toolCallRepair = new StandardToolCallRepair();
+    cfg.maxRepairAttempts = 1;
+    cfg.observability = obs;
+    cfg.contentCapture = { enabled: true, maxFieldLen: 1024 };
+    cfg.middleware = {
+      register() {},
+      async fireBeforeSession() { return { kind: "continue" }; },
+      async fireBeforeTurn() { return { kind: "continue" }; },
+      async fireBeforeTool() { return { kind: "continue" }; },
+      async fireAfterTool(calls) {
+        afterToolCalls.push(calls);
+        return { kind: "continue" };
+      },
+      async fireBeforeCompletion() { return { kind: "continue" }; },
+      async fireAfterSession() {},
+    };
+
+    const h = new StandardHarness(cfg);
+    const r = await h.run({ task: react(5) });
+    expect(r.kind).toBe("success");
+    const trace = await obs.getTrace(SessionId.of("s1"));
+    const toolSpan = trace.find((s) => "tool_name" in s && s.tool_name === "t") as
+      | observability.ToolCallSpan
+      | undefined;
+    expect(toolSpan?.arguments?.arguments).toEqual({ flag: true });
+    expect(afterToolCalls[0]![0]!.input).toEqual({ flag: true });
+  });
+
+  it("enriches final recoverable parameter errors when repair gives up", async () => {
+    const a = new MockAgent(AgentId.of("test"));
+    a.push({
+      kind: "tool_call_requested",
+      calls: [{ id: "c0", name: "t", input: { flag: "not-a-bool" } } as ToolCall],
+      usage: usage(),
+    } as TurnResult);
+    a.push({ kind: "final_response", content: "done", usage: usage() } as TurnResult);
+
+    const reg = new RecordingRegistry();
+    reg.pushOutput({ kind: "error", message: "invalid parameters: flag must be boolean", recoverable: true });
+    reg.withSchema({
+      name: "t",
+      description: "",
+      input_schema: { type: "object", properties: { flag: { type: "boolean" } } },
+    });
+    const cfg = standardConfig(a);
+    cfg.toolRegistry = reg;
+    cfg.toolCallRepair = { repair: () => null };
+    cfg.maxRepairAttempts = 1;
+
+    const h = new StandardHarness(cfg);
+    const r = await h.run({ task: react(5) });
+    expect(r.kind).toBe("success");
+    if (r.kind !== "success") throw new Error("unreachable");
+    const toolMessages = r.session_state!.messages.filter(
+      (m) => m.role === "tool" && m.content.type === "text",
+    );
+    expect((toolMessages[0]!.content as { text: string }).text).toContain(
+      "Expected parameter schema",
+    );
+  });
+
+  it("applies repair when resume() drains a pending approved call", async () => {
+    const a = new MockAgent(AgentId.of("test"));
+    a.push({ kind: "final_response", content: "done", usage: usage() } as TurnResult);
+
+    const reg = new RecordingRegistry();
+    reg.pushOutput({ kind: "error", message: "invalid parameters: flag must be boolean", recoverable: true });
+    reg.pushOutput({ kind: "success", content: "ok", truncated: false });
+    reg.withSchema({
+      name: "t",
+      description: "",
+      input_schema: { type: "object", properties: { flag: { type: "boolean" } } },
+    });
+    const cfg = standardConfig(a);
+    cfg.toolRegistry = reg;
+    cfg.toolCallRepair = new StandardToolCallRepair();
+    cfg.maxRepairAttempts = 1;
+    const h = new StandardHarness(cfg);
+    const state: PausedState = {
+      session_id: SessionId.of("s1"),
+      task_id: TaskId.of("t1"),
+      turn_number: 1,
+      session_state: emptySessionState(),
+      pending_tool_calls: [{ id: "c0", name: "t", input: { flag: "true" } } as ToolCall],
+      approved_results: [],
+      human_request: { kind: "tool_approval", calls: [], risk_level: "low" },
+      task: react(5),
+      budget_used: emptyBudgetSnapshot(),
+      child_state: null,
+      toolset: "",
+    };
+
+    const r = await h.resume(state, { kind: "allow" });
+    expect(r.kind).toBe("success");
     expect((reg.dispatched[1]!.input as { flag: unknown }).flag).toBe(true);
   });
 

@@ -14,6 +14,7 @@ import {
   backendError,
   dimensionMismatch,
   MetadataFilter,
+  VectorStoreErrorException,
   type VectorHit,
   type VectorRecord,
   type VectorStore,
@@ -31,7 +32,7 @@ export class InMemoryVectorStore implements VectorStore {
   async add(records: readonly VectorRecord[]): Promise<void> {
     for (const record of records) {
       if (record.vector.length !== this.dimensions) {
-        throw dimensionMismatch(this.dimensions, record.vector.length);
+        throw new VectorStoreErrorException(dimensionMismatch(this.dimensions, record.vector.length));
       }
       // Upsert by id.
       const existing = this.rows.findIndex((r) => r.id === record.id);

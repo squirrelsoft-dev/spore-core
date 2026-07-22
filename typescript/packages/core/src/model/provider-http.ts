@@ -56,11 +56,25 @@ export function keyFromEnv(envVar: string): string {
 export type RequestBuilder = (signal: AbortSignal) => Promise<Response>;
 
 /** Sleep hook — tests override to skip waits. Defaults to `setTimeout`. */
-export type SleepFn = (ms: number) => Promise<void>;
+export type SleepFn = (ms: number, signal?: AbortSignal) => Promise<void>;
 
-const defaultSleep: SleepFn = (ms) =>
-  new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
+const defaultSleep: SleepFn = (ms, signal) =>
+  new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new ProviderError(0, `request aborted: ${abortMessage(signal.reason)}`));
+      return;
+    }
+    const cleanup = (): void => signal?.removeEventListener("abort", onAbort);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      cleanup();
+      reject(new ProviderError(0, `request aborted: ${abortMessage(signal?.reason)}`));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 
 /**
@@ -86,7 +100,7 @@ export async function sendWithRetry(
     } catch (e) {
       // Timeout: retry while budget remains, else surface Timeout.
       if (isTimeoutError(e) && attempt < maxRetries) {
-        await sleep(backoffDelayMs(attempt));
+        await sleepWithAbort(sleep, backoffDelayMs(attempt), signal);
         attempt += 1;
         continue;
       }
@@ -106,12 +120,28 @@ export async function sendWithRetry(
       } catch {
         /* ignore */
       }
-      await sleep(delayMs);
+      await sleepWithAbort(sleep, delayMs, signal);
       attempt += 1;
       continue;
     }
     throw await mapError(resp);
   }
+}
+
+async function sleepWithAbort(
+  sleep: SleepFn,
+  ms: number,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  if (signal?.aborted) throw new ProviderError(0, `request aborted: ${abortMessage(signal.reason)}`);
+  await sleep(ms, signal);
+  if (signal?.aborted) throw new ProviderError(0, `request aborted: ${abortMessage(signal.reason)}`);
+}
+
+function abortMessage(reason: unknown): string {
+  if (reason instanceof Error) return reason.message;
+  if (typeof reason === "string") return reason;
+  return "aborted";
 }
 
 /** Fetch with a timeout via `AbortController`, composing with an optional user signal. */
