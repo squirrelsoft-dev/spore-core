@@ -5158,10 +5158,16 @@ func (h *StandardHarness) runReActInner(
 	if task.Budget.MaxTurns != nil && *task.Budget.MaxTurns < effectiveTurnCap {
 		effectiveTurnCap = *task.Budget.MaxTurns
 	}
+	// Narration refund (#81): a send_message-ONLY turn is pure narration and
+	// must not count against the productive-turn budget. The turn span still
+	// uses the incremented budget.Turns (ids stay unique); only the budget GATE
+	// discounts it. Bounded by effectiveTurnCap so narration alone cannot loop
+	// forever (the window runs at most ~2x budget). Mirrors the Rust reference.
+	var narrationRefund uint32
 
 	for {
 		// Layer-1 budget gates before the turn.
-		if budget.Turns >= effectiveTurnCap {
+		if budget.Turns >= saturatingAddU32(effectiveTurnCap, narrationRefund) {
 			return RunResult{
 				Kind:      RunFailure,
 				Reason:    HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns},
@@ -5327,6 +5333,21 @@ func (h *StandardHarness) runReActInner(
 		turnClock := time.Now()
 		result := h.runStreamingTurn(ctx, agent, c, onStream)
 		budget.Turns++
+		// Refund a send_message-ONLY turn (pure narration, #81): it advanced no
+		// task work, so it must not count against the productive-turn budget.
+		// Bounded by effectiveTurnCap so narration alone cannot loop forever.
+		if result.Kind == TurnToolCallRequested && len(result.Calls) > 0 && narrationRefund < effectiveTurnCap {
+			allSendMsg := true
+			for _, c := range result.Calls {
+				if c.Name != sendMessageToolName {
+					allSendMsg = false
+					break
+				}
+			}
+			if allSendMsg {
+				narrationRefund++
+			}
+		}
 		// Emit a turn span for every model call (issue #12). Fire-and-forget;
 		// it never affects control flow. The span id is retained as the
 		// parent for any tool-call spans dispatched this turn. EmitMiddleware/
@@ -7163,9 +7184,10 @@ var _ MiddlewareChain = (*ScriptedMiddleware)(nil)
 
 // MockAgent is a test Agent that yields queued TurnResults.
 type MockAgent struct {
-	id      AgentID
-	mu      sync.Mutex
-	results []TurnResult
+	id        AgentID
+	mu        sync.Mutex
+	results   []TurnResult
+	CallCount atomic.Int64
 }
 
 // NewMockAgent constructs a MockAgent.
@@ -7181,6 +7203,7 @@ func (m *MockAgent) Push(r TurnResult) *MockAgent {
 
 // Turn returns the next queued TurnResult, or an EmptyResponse error.
 func (m *MockAgent) Turn(context.Context, Context) TurnResult {
+	m.CallCount.Add(1)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if len(m.results) == 0 {
