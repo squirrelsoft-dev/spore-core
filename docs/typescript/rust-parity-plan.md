@@ -455,31 +455,51 @@ mocked model + sandbox so no real provider is contacted.
 
 ### 5.2.1 Cancellation (AbortSignal)
 
-- **C1 — Mid-turn abort surfaces as a typed agent error.** Abort the
-  `HarnessRunOptions.signal` while a model call is in flight. Rust: the in-flight
-  future is dropped; the surfaced error is an `AgentError` → `HaltReason::AgentError`
-  (`rust/.../harness/types.rs:1436-1438`). TS: `model.call(request, signal)`
-  rejects with `ProviderError(0, "request aborted: …")`
-  (`typescript/.../model/{anthropic,openai,ollama}.ts` AbortError mapping),
-  which the react loop routes to `agent_error` halt
-  (`typescript/.../harness/standard.ts` agent-error path). **Assertion:** the run
-  returns `RunResult.failure{reason:{kind:"agent_error"}}` and `turns` reflects
-  the turn that was aborted; no further turns run; the stream emitted `turn_start`
-  for the aborted turn but no `turn_end`.
+**Rust has no `AbortSignal` equivalent.** External cancellation in Rust is
+*dropping the `run` future*: the caller stops polling and `tokio` cancels the
+in-flight `await` points (the model HTTP request, the subprocess). No
+`RunResult` is produced — the future is simply not awaited to completion.
+`HaltReason::AgentError` (`rust/.../harness/types.rs:1432`) fires only when the
+*model returns* a `TurnResult::Error` (`rust/.../harness/react.rs:1972-1984`),
+NOT on external cancel. TypeScript cannot drop a `Promise`, so it threads
+`AbortSignal` through every async boundary (CONVENTIONS.md) — the observable
+parity target is therefore "aborting stops further turns and reaps in-flight
+work," with the TS-specific terminal being a typed failure.
+
+- **C1 — Mid-turn abort stops the loop and reaps in-flight work.** Abort
+  `HarnessRunOptions.signal` while a model call is in flight. TS:
+  `model.call(request, signal)` rejects with `ProviderError(0, "request aborted: …")`
+  (`typescript/.../model/{anthropic,openai,ollama}.ts` AbortError mapping;
+  `ProviderError extends ModelError` — `model/errors.ts:45`),
+  `ModelAgent.turn` catches `err instanceof ModelError` and returns
+  `TurnResult::Error` (`typescript/.../agent/model-agent.ts:167-172`), and the
+  react loop routes that to `HaltReason::AgentError` → `RunResult.failure`
+  (mirroring Rust's `TurnResult::Error`→`AgentError` routing at
+  `rust/.../harness/react.rs:1972-1984`). **Assertion:** the run returns
+  `RunResult.failure{reason:{kind:"agent_error"}}`; `turns` reflects the aborted
+  turn; no further turns run; the stream emitted `turn_start` for the aborted
+  turn but no `turn_end`. (This TS terminal is the idiomatic equivalent of
+  Rust's dropped future — Rust itself produces no result here.)
 - **C2 — Abort between turns stops the loop.** Abort the signal after a turn
   completes but before the next model call. **Assertion:** the loop does not
   start the next turn; the partial `usage`/`turns` are reported on the failure.
-- **C3 — Abort propagates to tool dispatch.** Abort during a long-running tool
-  (exec). TS: the tool's `execute(call, sandbox, ctx, signal)` threads the
-  signal to `sbExecuteCommand` (`typescript/.../tools/src/exec.ts:117`); the
-  sandbox's `AbortController` aborts the child (`workspace-sandbox.ts:421-451`).
+  (Rust equivalent: the caller drops the future at the turn boundary.)
+- **C3 — Abort propagates to tool dispatch and reaps the child.** Abort during
+  a long-running tool (exec). Rust: dropping the run future drops the
+  `execute_command_streaming` future, which drops the tokio `Child` (killed on
+  drop). TS: the tool's `execute(call, sandbox, ctx, signal)` threads the signal
+  to `sbExecuteCommand` (`typescript/.../tools/src/exec.ts:117`); the sandbox's
+  `AbortController` aborts the child (`workspace-sandbox.ts:421-451`).
   **Assertion:** the exec returns a recoverable `error` (timed_out/aborted) and
-  the child is reaped (no orphan) — see 5.2.4.
-- **C4 — Abort is non-destructive to session state.** After C1, resuming with
-  `HarnessRunOptions.session_state` (the carried `session_state` on the
-  failure) continues losslessly: the aborted turn's partial assistant message
-  is NOT double-recorded. **Assertion:** a resume run's transcript equals a
-  single uninterrupted run's transcript for the same model responses.
+  the child is reaped (no orphan) — see 5.2.4 CL1.
+- **C4 — Abort is non-destructive to session state (TS contract).** In TS the
+  abort fires inside `await model.call(...)` BEFORE the assistant message is
+  appended (the append happens after `classifyResponse`). **Assertion:** after
+  C1, resuming with the carried `session_state` continues losslessly — the
+  aborted turn produced no assistant message, so nothing is double-recorded; a
+  resume run's transcript equals a single uninterrupted run's transcript for
+  the same model responses. (Rust has no resume-after-drop path; this is a
+  TS-specific contract pinned by test.)
 
 ### 5.2.2 Timeout
 
@@ -550,35 +570,80 @@ mocked model + sandbox so no real provider is contacted.
   streamed exec under a read-only-wrapped sandbox still reaps on abort. **Assertion:**
   a streamed exec under `ReadOnlySandbox` emits `tool_progress` then reaps on
   abort.
-- **CL3 — Run-finalization cleanup.** On every terminal `RunResult` (success,
-  failure, escalate, consult, waiting_for_human), the harness emits the closing
-  `turn_end` for the in-flight turn (when applicable) and flushes observability
-  spans; no `turn_start` is left unbalanced. **Assertion:** for each terminal,
-  `turn_start`/`turn_end` counts balance (modulo an aborted in-flight turn per
-  C1) and the observability outbox JSONL has one line per emitted span.
-- **CL4 — Storage cleanup on failure.** A failed run does not leave a
-  half-written active-run slot: `complete_active_run` is called on the terminal
-  path. Rust `rust/.../storage.rs:529`; TS `typescript/.../storage/providers.ts`.
-  **Assertion:** after a `failure`/`escalate`, `loadActiveRun` reflects
-  `completed` (or the slot is cleared per the configured decision).
+- **CL3 — Run-finalization stream balance (modulo aborted turns).** On every
+  terminal `RunResult` that the loop produces (success, failure from a
+  non-abort cause, escalate, consult, waiting_for_human), the harness emits the
+  closing `turn_end` for the in-flight turn when the turn completed normally.
+  **Assertion:** for those terminals, `turn_start`/`turn_end` counts balance;
+  for an aborted in-flight turn (C1) `turn_start` is emitted and `turn_end` is
+  NOT — matching Rust, where a dropped future emits no closing event.
+  Observability spans are fire-and-forget (`rust/.../harness/react.rs:611`);
+  no assertion is made about span flush on the abort/drop path (Rust makes none
+  either).
+- **CL4 — `complete_active_run` is a standalone storage helper (NOT harness-
+  auto-called).** Rust evidence: `complete_active_run` is defined in
+  `rust/.../storage.rs:529` and exported from `lib.rs:185`, but is NOT called
+  from any harness terminal path (`grep complete_active_run rust/.../harness/*`
+  → 0 hits outside `storage.rs`). The harness terminal path calls
+  `auto_persist_terminal` (`rust/.../harness/mod.rs:1768`), which persists the
+  session, NOT `complete_active_run`. **Assertion (helper contract only):**
+  `completeActiveRun` writes the `ActiveRun` slot to `completed` status and
+  returns the prior slot; an empty/non-existent slot is handled per its
+  documented contract. No assertion is made that the harness invokes it
+  automatically — because it does not. (Callers compose it explicitly.)
 
 ### 5.2.5 Async / concurrency
 
-- **A1 — Sequential tool dispatch within a turn.** Tools that mutate shared
-  RunStore state (`task_list`, `set_plan`, `todo_write`) dispatch sequentially
-  (not `Promise.all`), preserving the durable blob's consistency. Rust: these
-  tools are NOT `read_only` → sequential dispatch. TS: `typescript/.../harness/standard.ts`
-  tool-dispatch loop. **Assertion:** two `task_list` calls in one turn are
-  applied in order and the persisted blob reflects the second call.
-- **A2 — Concurrent runs are isolated by session.** Two `harness.run()` calls
-  with different `SessionId`s on the same harness instance do not share
-  `budget_used`/`session_state`. **Assertion:** parallel runs produce
-  independent `usage`/`turns` and independent transcripts.
-- **A3 — No shared mutable global state.** Provider HTTP clients, the
-  `StandardMemoryProvider`'s `Map`s, and the `InMemoryVectorStore` (G-L) are
-  not mutated across runs in a way that leaks. **Assertion:** a run that stores
-  a memory/vector does not appear in a second run's query (scoped by
-  session/project).
+- **A1 — The react loop dispatches tools sequentially (one `.await` per call).**
+  Rust react loop: `for (i, call) in calls.iter().enumerate() { … .dispatch_with_repair(…).await … }`
+  (`rust/.../harness/react.rs:1217-1283`) — a single sequential loop, NOT
+  `join_all`. TS react loop mirrors this: `for (const call of …) { … await
+  toolRegistry.dispatch(call, signal) … }` (`typescript/.../harness/standard.ts:2061-2065,2143-2147,2155-2159`).
+  Both registries ALSO expose a `dispatch_all`/`dispatchAll` that partitions
+  read-only tools to run concurrently (`rust/.../tool_registry.rs:389,617`;
+  `typescript/.../tool-registry/standard.ts:150-194` via `Promise.all` for the
+  `read_only && !destructive && !open_world` prefix) — but the react loop does
+  NOT use it; it dispatches one call at a time. **Assertions:** (a) two
+  `task_list`/`set_plan`/`todo_write` calls in one turn are applied in order and
+  the persisted blob reflects the second call (sequential dispatch preserves
+  durable-blob consistency); (b) `dispatchAll` partitions read-only tools
+  concurrently and the rest sequentially, returning results in input order
+  (parity with `rust/.../tool_registry.rs` `dispatch_all_preserves_input_order`
+  test) — tested at the registry level, separate from the react loop.
+- **A2 — Supported concurrency boundary (one harness instance = sequential).**
+  Rust `StandardHarness::run(&self, …)` takes `&self` and the trait is
+  `Send + Sync` (`rust/.../harness/types.rs:1861`), but the struct carries a
+  shared `observed_writes: std::sync::Mutex<Vec<String>>` accumulator for the
+  *currently-running* execute step, whose comment states "Steps run
+  SEQUENTIALLY (v1 ready-set is sequential), so a single shared accumulator
+  cleared per step is sufficient and deterministic"
+  (`rust/.../harness/mod.rs:1208-1219`). There is NO Rust evidence that
+  concurrent `run()` calls on ONE harness instance are supported or isolated —
+  the shared accumulator would interleave. TS mirrors this: `StandardHarness`
+  holds `private observedWrites: string[] = []` (`typescript/.../harness/standard.ts:599`)
+  with no synchronization. **Supported boundary (documented + tested):** a
+  single harness instance is used for SEQUENTIAL runs; concurrent runs require
+  SEPARATE harness instances. **Assertions:** (a) two sequential `run()` calls
+  on one instance with different `SessionId`s produce independent `usage`/`turns`
+  and transcripts (per-run local `session_state`/`budget_used` in `run_inner`);
+  (b) two runs on SEPARATE harness instances are fully isolated. No assertion
+  is made about concurrent calls on a single shared instance — that is
+  unsupported and left undefined, matching Rust.
+- **A3 — `InMemoryVectorStore` is shared by design; per-instance isolation +
+  shared-instance concurrency semantics.** The Rust reference `InMemoryVectorStore`
+  holds `rows: Mutex<Vec<VectorRecord>>` shared across all callers of the
+  instance (`rust/.../vector_store.rs:300-345`) — it is NOT session/project
+  scoped. Scoping is the CALLER's responsibility via `MetadataFilter`
+  (`.eq("session_id", …)` / `.eq("project_id", …)`); the store itself has no
+  session/project notion. **Assertions:** (a) per-instance isolation — two
+  separate `InMemoryVectorStore` instances do not observe each other's
+  `add`/`delete`; (b) shared-instance concurrency — concurrent `add` then
+  `search` on ONE shared instance are serialized by the mutex and a `search`
+  sees all prior `add`s (higher = more similar, sorted desc, truncated to
+  `top_k`); (c) scoping is opt-in via `MetadataFilter` — a `search` with a
+  filter excludes non-matching records as part of the search, not as a
+  post-truncation drop. No assertion is made that the store auto-scopes by
+  session/project — because it does not.
 - **A4 — Streaming sink is synchronous & inline (no isolation).** `StreamSink`
   is called inline from the run loop (`rust/.../harness/mod.rs:1384` `s(event)`
   with no `catch_unwind`; `StreamSink = Arc<dyn Fn(StreamEvent) + Send + Sync>`).
@@ -589,13 +654,23 @@ mocked model + sandbox so no real provider is contacted.
   sink is the contract; the test pins that a throwing sink is NOT silently
   swallowed (the run rejects).
 - **A5 — Combinator child runs do not reentrantly mutate parent state.** A
-  PlanExecute/SelfVerifying/HillClimbing/Ralph child harness built from a
-  config clone does not mutate the parent's `session_state` or `budget_used`.
+  PlanExecute/SelfVerifying/HillClimbing/Ralph child harness is built from a
+  config clone and runs with a CLONED `budget_used` (`rust/.../harness/plan_execute.rs:379`
+  `let budget_used = cx.scratch.run_budget.clone()`) and cloned `session_id`/
+  `plan_session`, so the child cannot alias the parent's mutable scratch. TS
+  builds child harnesses from a shallow-cloned config and passes `budgetUsed` by
+  value (struct copy) per run (`typescript/.../harness/standard.ts:995,1115`).
   **Assertion:** after a combinator run, the parent's `budget_used` reflects
-  only the folded child `usage`, not aliasing.
-- **A6 — `AbortSignal` is never retained beyond the call.** The signal is
-  passed down, not stored on long-lived config. **Assertion:** an aborted signal
-  from run N does not affect run N+1 on the same harness instance.
+  only the explicitly folded child `usage`, not aliasing; the child's writes to
+  its own `session_state` do not appear in the parent's transcript except via
+  the documented threading (e.g. plan→execute read-files block).
+- **A6 — `AbortSignal` is never retained beyond the call (TS contract).** The
+  signal is passed DOWN through `run()` → `agent.turn` → `model.call`/
+  `tool.execute` and not stored on long-lived config or the harness instance.
+  (Rust has no `AbortSignal`; this is the TS idiomatic equivalent of
+  future-drop cancellation, and the non-retention invariant keeps run N's abort
+  from affecting run N+1.) **Assertion:** an aborted signal from run N does not
+  cause run N+1 on the same instance to abort or short-circuit.
 
 ## 6. Compatibility constraints
 
@@ -673,4 +748,4 @@ in the final matrix with the captain's rationale.
 
 ---
 
-needs-decision: revised plan ready for captain approval at docs/typescript/rust-parity-plan.md; captain scope decision incorporated (§9); §5.2 lifecycle/concurrency scenarios added; no implementation started
+needs-decision: revised plan (r2) ready for captain approval at docs/typescript/rust-parity-plan.md; captain scope decision incorporated (§9); §5.2 lifecycle/concurrency scenarios rechecked against Rust (CL4/A3/A2 corrected, C1/C2/CL3/A1 reframed to cited Rust behavior); no implementation started
