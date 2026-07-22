@@ -199,8 +199,10 @@ import {
   type ToolOutput,
   type ToolRegistry,
   type ToolResultRecord,
+  type SteeringSource,
 } from "./types.js";
 import { ExecutionRegistry } from "./execution-registry.js";
+import type { ToolCallRepair } from "../tool-call-repair/standard.js";
 
 /**
  * A configured memory source for the live loop (issue #163 / #160 / SC-26
@@ -502,6 +504,47 @@ export interface HarnessConfig {
    * it to {@link surfaceToHuman}.
    */
   escalationMode?: EscalationMode;
+  /**
+   * Mid-run steering source (pi-style): a callback drained at each turn
+   * boundary that returns user messages queued since the last turn. The loop
+   * injects each BEFORE the next model call (after the previous turn's tool
+   * calls fully executed), records it on the session via the ContextManager
+   * seam, and emits a `user_message` stream event with `steered: true`. Optional;
+   * absent (the default) preserves byte-identical pre-steering behavior. Mirrors
+   * Rust `HarnessConfig::steering_source`.
+   */
+  steeringSource?: SteeringSource;
+  /**
+   * Optional tool-call repair seam: when configured, a tool call that fails
+   * parameter validation is coerced (via {@link ToolCallRepair.coerceToolArgs})
+   * and re-dispatched up to {@link maxRepairAttempts} times before surfacing the
+   * `invalid_parameters` error. Optional; absent (the default) preserves
+   * byte-identical single-shot behavior. Mirrors Rust
+   * `HarnessConfig::tool_call_repair` / `max_repair_attempts`.
+   */
+  toolCallRepair?: ToolCallRepair;
+  /**
+   * Repair attempt budget for {@link toolCallRepair}. Defaults to `1`. Ignored
+   * when {@link toolCallRepair} is absent.
+   */
+  maxRepairAttempts?: number;
+  /**
+   * Behavioral tool-call nudge (opt-in). When `true`, if a turn ends having
+   * called ZERO tools (and the model produced a final response without acting),
+   * the loop injects a corrective nudge user message and forces another turn,
+   * capped at `MAX_TOOL_CALL_NUDGES = 2` per window. Optional; absent / `false`
+   * (the default) preserves byte-identical behavior. Mirrors Rust
+   * `HarnessConfig::tool_call_nudge`.
+   */
+  toolCallNudge?: boolean;
+  /**
+   * Plan-empty re-ask budget (issue #70). When the plan phase captures an EMPTY
+   * plan, re-ask the planner up to this many more times (tools suppressed + a
+   * `/no_think` nudge demanding the plan as content) before halting with
+   * `empty_plan`. `0` (the default) preserves single-shot behavior
+   * byte-identically. Mirrors Rust `HarnessConfig::plan_empty_max_retries`.
+   */
+  planEmptyMaxRetries?: number;
   /**
    * MIGRATION GATE (issue #139) — NOT a permanent feature flag. When `true`, a
    * {@link ReactConfig} leaf carrying an `output` schema has that schema
@@ -1915,6 +1958,11 @@ export class StandardHarness implements Harness, StrategyExecutor {
     return this.config.outputSchemaMaxRetries ?? DEFAULT_OUTPUT_SCHEMA_MAX_RETRIES;
   }
 
+  /** {@inheritDoc StrategyExecutor.planEmptyMaxRetries} */
+  planEmptyMaxRetries(): number {
+    return this.config.planEmptyMaxRetries ?? 0;
+  }
+
   async resume(
     state: PausedState,
     response: HumanResponse,
@@ -2473,6 +2521,37 @@ export class StandardHarness implements Harness, StrategyExecutor {
       message: `sandbox: ${output.violation.kind}`,
       recoverable: !this.sandboxViolationHalts(output.violation),
     };
+  }
+
+  /**
+   * Dispatch a tool call, applying the configured {@link ToolCallRepair} on a
+   * RECOVERABLE error up to {@link HarnessConfig.maxRepairAttempts} times
+   * (mirrors Rust `dispatch_with_repair`). Returns the final `ToolOutput`. When
+   * no repair is configured (the default) this is a single dispatch,
+   * byte-identical to the pre-repair path. The repaired call is re-dispatched;
+   * the coarse `tool_call` stream event already emitted the original args.
+   */
+  private async dispatchWithRepair(
+    toolRegistry: ToolRegistry,
+    call: ToolCall,
+    signal: AbortSignal | undefined,
+  ): Promise<ToolOutput> {
+    let effectiveCall = call;
+    let output = await toolRegistry.dispatch(effectiveCall, signal);
+    const repair = this.config.toolCallRepair;
+    if (repair == null) return output;
+    let attemptsLeft = this.config.maxRepairAttempts ?? 1;
+    while (attemptsLeft > 0) {
+      if (!(output.kind === "error" && output.recoverable)) break;
+      const schema = toolRegistry.schemas().find((s) => s.name === effectiveCall.name);
+      const repaired = repair.repair(effectiveCall, output.message, schema);
+      if (repaired == null) break;
+      attemptsLeft -= 1;
+      effectiveCall = repaired;
+      output = await toolRegistry.dispatch(effectiveCall, signal);
+      if (!(output.kind === "error" && output.recoverable)) break;
+    }
+    return output;
   }
 
   /** {@inheritDoc StrategyExecutor.takeObservedWrites} */
@@ -3120,6 +3199,20 @@ export class StandardHarness implements Harness, StrategyExecutor {
     const taskMaxTurns = task.budget.max_turns ?? undefined;
     const effectiveTurnCap =
       taskMaxTurns != null ? Math.min(taskMaxTurns, maxIterations) : maxIterations;
+    // Send_message-ONLY turns are pure narration (#81) and must not consume the
+    // productive-turn budget. Each refunds one turn of the cap in the gate
+    // below, keeping `budgetUsed.turns` monotonic (span ids stay unique) while
+    // the budget gate discounts narration. Capped at `effectiveTurnCap` so a
+    // pure-narration loop still terminates — the window runs at most ~2× budget.
+    // Mirrors Rust `narration_refund`.
+    let narrationRefund = 0;
+    // Behavioral tool-call nudge (opt-in via `HarnessConfig.toolCallNudge`):
+    // track tools actually called this window + nudges used, so a model that
+    // keeps answering without acting can be nudged up to `MAX_TOOL_CALL_NUDGES`.
+    // Mirrors Rust `tools_called_this_window` / `tool_call_nudges_used`.
+    const MAX_TOOL_CALL_NUDGES = 2;
+    let toolsCalledThisWindow = 0;
+    let toolCallNudgesUsed = 0;
 
     // Seed the task instruction as the initial user message of this run.
     // The compaction adapter intentionally mirrors `session.messages` and
@@ -3149,8 +3242,25 @@ export class StandardHarness implements Harness, StrategyExecutor {
 
     // Outer loop
     for (;;) {
-      // Layer-1 budget gates before the turn.
-      if (budgetUsed.turns >= effectiveTurnCap) {
+      // Mid-run steering (pi-style, `HarnessConfig.steeringSource`): drain any
+      // user messages queued since the last turn boundary and inject them
+      // BEFORE the next model call — after the previous turn's tool calls fully
+      // executed, so steering redirects the next turn without ever cancelling
+      // in-flight work. Each is recorded on the session via the ContextManager
+      // seam (it persists with the transcript) and emitted as a `user_message`
+      // stream event with `steered: true` so UIs render what was injected.
+      // Mirrors Rust `react.rs` turn-boundary steering drain.
+      if (this.config.steeringSource) {
+        for (const text of this.config.steeringSource()) {
+          await this.config.contextManager.appendUserMessage(sessionState, text);
+          emit(onStream, { kind: "user_message", content: text, steered: true });
+        }
+      }
+      // Layer-1 budget gates before the turn. The turn cap is inflated by
+      // `narrationRefund` so send_message-only narration turns (which advanced
+      // no task work) don't consume the productive-turn budget — bounded by
+      // `effectiveTurnCap` so a pure-narration loop still terminates (~2× cap).
+      if (budgetUsed.turns >= effectiveTurnCap + narrationRefund) {
         return failure(
           { kind: "budget_exceeded", limit_type: "turns" },
           sessionId,
@@ -3159,7 +3269,12 @@ export class StandardHarness implements Harness, StrategyExecutor {
           sessionState,
         );
       }
-      const overrun = budgetExceeded(task.budget, budgetUsed, startedAt);
+      const overrun = budgetExceeded(
+        task.budget,
+        budgetUsed,
+        startedAt,
+        effectiveTurnCap + narrationRefund,
+      );
       if (overrun != null) {
         return failure(
           { kind: "budget_exceeded", limit_type: overrun },
@@ -3332,6 +3447,20 @@ export class StandardHarness implements Harness, StrategyExecutor {
         : await agent.turn(context, signal);
       budgetUsed.turns += 1;
 
+      // Track tools called this window (behavioral tool-call nudge signal) and
+      // refund send_message-ONLY turns (pure narration, #81). Mirrors Rust
+      // `tools_called_this_window` + `narration_refund`.
+      if (result.kind === "tool_call_requested") {
+        toolsCalledThisWindow += result.calls.length;
+        if (
+          result.calls.length > 0 &&
+          narrationRefund < effectiveTurnCap &&
+          result.calls.every((c) => c.name === "send_message")
+        ) {
+          narrationRefund += 1;
+        }
+      }
+
       // Emit a turn span for every model call (issue #12). Fire-and-forget; it
       // never affects control flow. The span base is retained as the parent for
       // any tool-call spans dispatched this turn.
@@ -3452,6 +3581,37 @@ export class StandardHarness implements Harness, StrategyExecutor {
               );
               continue;
             }
+          }
+
+          // Behavioral tool-call nudge (opt-in via `HarnessConfig.toolCallNudge`).
+          // Keys on ACTION: a terminal answer was produced having called ZERO
+          // tools while tools were advertised — the model "reported findings"
+          // without ever reading anything. Record that answer, nudge it to
+          // actually use a tool before reporting, and force another turn. Skips
+          // schema-constrained turns (e.g. plan-JSON) via `outputSchema` guard,
+          // and bounded per window (`MAX_TOOL_CALL_NUDGES`) so a model that
+          // refuses to act can't loop. Off (default) → byte-identical. Mirrors
+          // Rust `tool_call_nudge` behavioral nudge.
+          if (
+            this.config.toolCallNudge === true &&
+            toolsAdvertised &&
+            toolsCalledThisWindow === 0 &&
+            outputSchema === undefined &&
+            toolCallNudgesUsed < MAX_TOOL_CALL_NUDGES
+          ) {
+            toolCallNudgesUsed += 1;
+            const assistant: Message = {
+              role: "assistant",
+              content: { type: "text", text: result.content },
+            };
+            await this.config.contextManager.appendAssistantMessage?.(sessionState, assistant);
+            const nudge =
+              "You have not called any tool yet, so you have not actually inspected anything — " +
+              "your answer would be guessed, not grounded. Use the available tools " +
+              "(list_dir, read_file, grep, …) to gather the real data NOW, then " +
+              "report only what the tools returned.";
+            await this.config.contextManager.appendUserMessage(sessionState, nudge);
+            continue;
           }
 
           // Middleware: BeforeCompletion (rich chain, issue #11).
@@ -3824,7 +3984,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
             // PlanExecute DAG executor can attach HARNESS-OBSERVED `files_touched`
             // to a task's ledger entry — never model-self-reported.
             this.observeWriteCall(call);
-            let output: ToolOutput = await toolRegistry.dispatch(call, signal);
+            let output: ToolOutput = await this.dispatchWithRepair(toolRegistry, call, signal);
 
             // Tool-surfaced sandbox violation (#150): the HARNESS decides
             // halt-vs-recoverable per `sandboxViolationPolicy`, not the tool.
@@ -4005,7 +4165,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
             // continues. (Bad params produce an `error` output, not a success,
             // and so no event is emitted.)
             if (call.name === "send_message" && output.kind === "success") {
-              emit(onStream, { kind: "user_message", content: output.content });
+              emit(onStream, { kind: "user_message", content: output.content, steered: false });
             }
 
             // Layer-2: unrecoverable tool error halts immediately.
@@ -4238,6 +4398,24 @@ export class StandardHarness implements Harness, StrategyExecutor {
                   if (idx !== undefined) {
                     await this.config.contextManager.replaceToolResult?.(sessionState, idx, folded);
                   }
+                  // SC-9 / issue #103 Q5: emit a REVISED `tool_result` stream
+                  // event so consumers correct the displayed result instead of
+                  // double-counting it as a second call. Mirrors Rust
+                  // `StreamEvent::ToolResult { revised: true }`.
+                  const call = calls[i]!;
+                  const revisedContent =
+                    folded.output.kind === "success"
+                      ? folded.output.content
+                      : folded.output.kind === "error"
+                        ? folded.output.message
+                        : "";
+                  emit(onStream, {
+                    kind: "tool_result",
+                    call_id: call.id,
+                    is_error: folded.output.kind === "error",
+                    content: revisedContent,
+                    revised: true,
+                  });
                 }
                 break;
               case "halt":
@@ -4560,6 +4738,16 @@ export class HarnessBuilder {
   private _enforceOutputSchemas = false;
   /** Extra output-schema validation retry turns `N` (issue #139). Defaults to `2`. */
   private _outputSchemaMaxRetries = DEFAULT_OUTPUT_SCHEMA_MAX_RETRIES;
+  /** Mid-run steering source (pi-style). Absent by default. */
+  private _steeringSource?: SteeringSource;
+  /** Tool-call repair seam. Absent by default. */
+  private _toolCallRepair?: ToolCallRepair;
+  /** Repair attempt budget. Defaults to `1`. */
+  private _maxRepairAttempts = 1;
+  /** Behavioral tool-call nudge. Off by default. */
+  private _toolCallNudge = false;
+  /** Plan-empty re-ask budget. Defaults to `0` (single-shot). */
+  private _planEmptyMaxRetries = 0;
 
   constructor(
     private readonly agent: Agent,
@@ -5105,6 +5293,53 @@ export class HarnessBuilder {
     return this;
   }
 
+  /**
+   * Set the mid-run steering source (pi-style): a callback drained at each
+   * turn boundary returning user messages to inject before the next model call.
+   * See {@link HarnessConfig.steeringSource}. Mirrors Rust
+   * `HarnessBuilder::steering_source`.
+   */
+  steeringSource(source: SteeringSource): this {
+    this._steeringSource = source;
+    return this;
+  }
+
+  /**
+   * Set the tool-call repair seam applied to recoverable dispatch errors.
+   * See {@link HarnessConfig.toolCallRepair}. Mirrors Rust
+   * `HarnessBuilder::tool_call_repair`.
+   */
+  toolCallRepair(repair: ToolCallRepair): this {
+    this._toolCallRepair = repair;
+    return this;
+  }
+
+  /** Set the repair attempt budget (default `1`). Ignored when no repair is set. */
+  maxRepairAttempts(n: number): this {
+    this._maxRepairAttempts = n;
+    return this;
+  }
+
+  /**
+   * Turn ON the behavioral tool-call nudge (off by default). See
+   * {@link HarnessConfig.toolCallNudge}. Mirrors Rust
+   * `HarnessBuilder::tool_call_nudge`.
+   */
+  toolCallNudge(on: boolean): this {
+    this._toolCallNudge = on;
+    return this;
+  }
+
+  /**
+   * Set the plan-empty re-ask budget (default `0` = single-shot). See
+   * {@link HarnessConfig.planEmptyMaxRetries}. Mirrors Rust
+   * `HarnessBuilder::plan_empty_max_retries`.
+   */
+  planEmptyMaxRetries(n: number): this {
+    this._planEmptyMaxRetries = n;
+    return this;
+  }
+
   /** Assemble the {@link HarnessConfig} without wrapping it in a harness. */
   buildConfig(): HarnessConfig {
     // Fold catalogue tools accumulated via `.tool()` / `.tools()` into a
@@ -5209,6 +5444,12 @@ export class HarnessBuilder {
       escalationMode: this._escalationMode,
       enforceOutputSchemas: this._enforceOutputSchemas,
       outputSchemaMaxRetries: this._outputSchemaMaxRetries,
+      // Only attach when set so the default config stays byte-for-byte unchanged.
+      steeringSource: this._steeringSource,
+      toolCallRepair: this._toolCallRepair,
+      maxRepairAttempts: this._maxRepairAttempts,
+      toolCallNudge: this._toolCallNudge,
+      planEmptyMaxRetries: this._planEmptyMaxRetries,
     };
   }
 
@@ -5306,8 +5547,14 @@ function budgetExceeded(
   budget: BudgetLimits,
   used: BudgetSnapshot,
   startedAt: number,
+  turnCapOverride?: number,
 ): BudgetLimitType | null {
-  if (budget.max_turns != null && used.turns >= budget.max_turns) return "turns";
+  // The turn cap may be inflated by narration refunds (send_message-only turns
+  // don't consume the productive budget). When an override is given it replaces
+  // `budget.max_turns` as the turn gate (mirrors Rust `budget_exceeded`'s
+  // `effective_turn_cap + narration_refund` argument).
+  const turnCap = turnCapOverride ?? budget.max_turns;
+  if (turnCap != null && used.turns >= turnCap) return "turns";
   if (budget.max_input_tokens != null && used.input_tokens > budget.max_input_tokens) {
     return "input_tokens";
   }

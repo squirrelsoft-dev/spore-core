@@ -94,7 +94,7 @@ describe("send_message loop wiring (#81)", () => {
     expect(r.kind).toBe("success");
     const userMessages = events.filter((e) => e.kind === "user_message");
     expect(userMessages.length).toBe(1);
-    expect(userMessages[0]).toEqual({ kind: "user_message", content: "hello human" });
+    expect(userMessages[0]).toEqual({ kind: "user_message", content: "hello human", steered: false });
   });
 
   it("a send_message that errors emits no user_message event", async () => {

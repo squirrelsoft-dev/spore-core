@@ -46,3 +46,6 @@ export * as verifier from "./verifier/index.js";
 export * as hooks from "./hooks/index.js";
 export * as storage from "./storage/index.js";
 export * as outputSchema from "./output-schema/index.js";
+export * as embedding from "./embedding/index.js";
+export * as vectorStore from "./vector-store/index.js";
+export * as toolCallRepair from "./tool-call-repair/index.js";

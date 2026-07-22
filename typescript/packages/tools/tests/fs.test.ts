@@ -16,6 +16,7 @@ import {
 import { describe, expect, it } from "vitest";
 
 import {
+  CreateDirTool,
   DeleteFileTool,
   ListDirTool,
   MoveFileTool,
@@ -154,6 +155,25 @@ describe("filesystem tools", () => {
     expect(r.kind).toBe("error");
     if (r.kind !== "error") throw new Error("unreachable");
     expect(r.recoverable).toBe(true);
+  });
+
+  it("create_dir makes missing parents (mkdir -p) and is idempotent", async () => {
+    const dir = await tmp();
+    const target = join(dir, "a", "b", "c");
+    const sb = new AllowAllSandbox();
+    const r = await new CreateDirTool().execute(
+      call("create_dir", { path: target }),
+      sb,
+      ctx,
+    );
+    expect(r.kind).toBe("success");
+    // Re-running on an existing dir is idempotent (no error).
+    const r2 = await new CreateDirTool().execute(
+      call("create_dir", { path: target }),
+      sb,
+      ctx,
+    );
+    expect(r2.kind).toBe("success");
   });
 
   it("move_file renames", async () => {

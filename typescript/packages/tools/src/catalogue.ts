@@ -63,11 +63,19 @@ type StandardTool = toolRegistry.StandardTool;
 
 import { EditFileTool } from "./edit.js";
 import { BashCommandTool } from "./exec.js";
-import { ListDirTool, ReadFileTool, WriteFileTool } from "./fs.js";
+import {
+  CreateDirTool,
+  DeleteFileTool,
+  ListDirTool,
+  MoveFileTool,
+  ReadFileTool,
+  WriteFileTool,
+} from "./fs.js";
 import { SendMessageTool } from "./message.js";
 import { FindFilesTool, GrepFilesTool, GrepTool } from "./search.js";
 import { MemoryTool } from "./memory.js";
 import { TaskListTool } from "./tasklist.js";
+import { SetPlanTool } from "./set-plan.js";
 import { TodoWriteTool } from "./todo.js";
 import {
   AbortTool,
@@ -106,6 +114,30 @@ export const StandardTools = {
     return {
       implementation: new EditFileTool(),
       schema: EditFileTool.schema(),
+    };
+  },
+
+  /** `create_dir` — NEW; mkdir -p (creates missing parents). */
+  createDir(): StandardTool {
+    return {
+      implementation: new CreateDirTool(),
+      schema: CreateDirTool.schema(),
+    };
+  },
+
+  /** `move_file` — EXISTING #5 impl (move/rename). */
+  moveFile(): StandardTool {
+    return {
+      implementation: new MoveFileTool(),
+      schema: MoveFileTool.schema(),
+    };
+  },
+
+  /** `delete_file` — EXISTING #5 impl (delete a file). */
+  deleteFile(): StandardTool {
+    return {
+      implementation: new DeleteFileTool(),
+      schema: DeleteFileTool.schema(),
     };
   },
 
@@ -203,6 +235,14 @@ export const StandardTools = {
     };
   },
 
+  /** `set_plan` — NEW; atomic plan authoring into the durable `task_list` store. */
+  setPlan(): StandardTool {
+    return {
+      implementation: new SetPlanTool(),
+      schema: SetPlanTool.schema(),
+    };
+  },
+
   /** `memory` — NEW #82; scope-aware episodic memory read/write via MemoryStore. */
   memory(): StandardTool {
     return { implementation: new MemoryTool(), schema: MemoryTool.schema() };
@@ -267,6 +307,9 @@ export const StandardTools = {
       this.readFile(),
       this.writeFile(),
       this.editFile(),
+      this.createDir(),
+      this.moveFile(),
+      this.deleteFile(),
       this.listDir(),
       this.grepFiles(),
       this.grep(),
@@ -277,6 +320,7 @@ export const StandardTools = {
       this.webSearch(),
       this.todoWrite(),
       this.taskList(),
+      this.setPlan(),
       this.memory(),
     ];
   },

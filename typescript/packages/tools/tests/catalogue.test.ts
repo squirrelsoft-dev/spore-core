@@ -678,6 +678,12 @@ describe("StandardTools presets", () => {
     expect(n).toContain("edit_file");
     expect(n).toContain("grep");
     expect(n).not.toContain("abort");
+    // Parity with Rust StandardTools::coding_set: create_dir / move_file /
+    // delete_file / set_plan are catalogue members.
+    expect(n).toContain("create_dir");
+    expect(n).toContain("move_file");
+    expect(n).toContain("delete_file");
+    expect(n).toContain("set_plan");
   });
 
   it("webSearchWithEndpoint yields a tool named web_search", () => {

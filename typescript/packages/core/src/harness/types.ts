@@ -1465,6 +1465,15 @@ export interface StrategyExecutor {
    * {@link runReactConfig} to thread into the window. Default `2`.
    */
   outputSchemaMaxRetries(): number;
+
+  /**
+   * The plan-empty re-ask budget `N` (issue #70). When the plan phase captures
+   * an EMPTY plan, re-ask the planner up to `N` more times (tools suppressed +
+   * a `/no_think` nudge demanding the plan as content) before halting with
+   * `empty_plan`. `0` (the default) preserves single-shot behavior. Mirrors
+   * Rust `StrategyExecutor::plan_empty_max_retries`.
+   */
+  planEmptyMaxRetries(): number;
 }
 
 /**
@@ -2536,93 +2545,138 @@ async function runPlanExecuteConfig(
     // the plan sub-strategy's OWN declared budget (e.g. a ReAct `PerLoop{4}`);
     // the global `max_turns` is only the outer backstop.
     const directive = executor.planDirective(task.instruction);
-    const planSession =
-      planResume && resumeSeedSession !== undefined
-        ? resumeSeedSession
-        : structuredClone(baseSession);
-    if (planResume) resumeSeedSession = undefined;
-    await executor.seedUserMessage(planSession, directive);
-    const planTask: Task = {
-      id: task.id,
-      instruction: directive,
-      session_id: sessionId,
-      budget: { ...task.budget },
-      loop_strategy: c.plan,
-    };
-    const planResult = await executor.runPlanSubtree(
-      c.plan,
-      planTask,
-      planSession,
-      { ...budgetUsed },
-      cx.signal,
-    );
+    // Plan-empty re-ask loop (issue #70): a reasoning model can route its plan
+    // into the reasoning channel, leaving the message CONTENT empty so capture
+    // yields no tasks. Rather than halting on the FIRST empty plan, re-ask up to
+    // `planEmptyMaxRetries` more times — nudging the planner to emit the plan as
+    // message content — before falling through to `empty_plan`. A cap of `0`
+    // (the default) preserves the historical single-shot behaviour
+    // byte-identically. Mirrors Rust `plan_empty_max_retries`.
+    const planEmptyMaxRetries = executor.planEmptyMaxRetries();
+    let discardedUsage: AggregateUsage = emptyAggregateUsage();
+    let outcome!: { ok: true; artifact: PlanArtifact; usage: AggregateUsage; turns: number } | { ok: false; failure: RunResult };
+    for (let attempt = 0; ; attempt += 1) {
+      const planSession =
+        planResume && attempt === 0 && resumeSeedSession !== undefined
+          ? resumeSeedSession
+          : structuredClone(baseSession);
+      if (planResume && attempt === 0) resumeSeedSession = undefined;
+      await executor.seedUserMessage(planSession, directive);
+      if (attempt > 0) {
+        // Corrective nudge: demand the plan as message content (a soft
+        // `/no_think` hint reasoning models honor). Mirrors Rust's re-ask nudge.
+        const nudge =
+          "Your previous response produced no usable plan (no JSON object, and no " +
+          "tasks were authored). Output the plan NOW as a single JSON object in your " +
+          'MESSAGE CONTENT: {"tasks": [<ordered step strings>], "rationale": ' +
+          "<string>}. Do NOT put the plan only in your reasoning, and do NOT call any " +
+          "tools. /no_think";
+        await executor.seedUserMessage(planSession, nudge);
+      }
+      const planTask: Task = {
+        id: task.id,
+        instruction: directive,
+        session_id: sessionId,
+        budget: { ...task.budget },
+        loop_strategy: c.plan,
+      };
+      const planResult = await executor.runPlanSubtree(
+        c.plan,
+        planTask,
+        planSession,
+        { ...budgetUsed },
+        cx.signal,
+      );
 
-    let planOutput: string;
-    let planUsage: AggregateUsage;
-    let planTurns: number;
-    if (planResult == null) {
-      cx.stream = onStream;
-      const result: RunResult = {
-        kind: "failure",
-        reason: {
-          kind: "plan_phase_failed",
-          error: {
-            kind: "planning_turn_failed",
-            message: "plan sub-strategy produced no terminal",
+      let planOutput: string;
+      let planUsage: AggregateUsage;
+      let planTurns: number;
+      if (planResult == null) {
+        cx.stream = onStream;
+        const result: RunResult = {
+          kind: "failure",
+          reason: {
+            kind: "plan_phase_failed",
+            error: {
+              kind: "planning_turn_failed",
+              message: "plan sub-strategy produced no terminal",
+            },
           },
-        },
-        session_id: sessionId,
-        usage: emptyAggregateUsage(),
-        turns: budgetUsed.turns,
-        session_state: emptySessionState(),
-      };
-      return finishCombinator(cx, executor, task, result);
-    } else if (planResult.kind === "success") {
-      planOutput = planResult.output;
-      planUsage = planResult.usage;
-      planTurns = planResult.turns;
-    } else {
-      // A non-success plan terminal (budget / agent error / pause) propagates
-      // verbatim — the run never reaches execute.
-      cx.stream = onStream;
-      return finishCombinator(cx, executor, task, planResult);
-    }
+          session_id: sessionId,
+          usage: emptyAggregateUsage(),
+          turns: budgetUsed.turns,
+          session_state: emptySessionState(),
+        };
+        return finishCombinator(cx, executor, task, result);
+      } else if (planResult.kind === "success") {
+        planOutput = planResult.output;
+        planUsage = planResult.usage;
+        planTurns = planResult.turns;
+      } else {
+        // A non-success plan terminal (budget / agent error / pause) propagates
+        // verbatim — the run never reaches execute.
+        cx.stream = onStream;
+        return finishCombinator(cx, executor, task, planResult);
+      }
 
-    // Capture + persist the artifact from the plan child's output (R3/R4/R11) —
-    // the harness-side machinery, no model turn.
-    const outcome = await executor.capturePlanArtifact(
-      sessionId,
-      planOutput,
-      planUsage,
-      planTurns,
-      cx.signal,
-    );
-    if (!outcome.ok) {
-      cx.stream = onStream;
-      return finishCombinator(cx, executor, task, outcome.failure);
-    }
+      // Capture + persist the artifact from the plan child's output (R3/R4/R11).
+      outcome = await executor.capturePlanArtifact(
+        sessionId,
+        planOutput,
+        planUsage,
+        planTurns,
+        cx.signal,
+      );
+      if (!outcome.ok) {
+        cx.stream = onStream;
+        return finishCombinator(cx, executor, task, outcome.failure);
+      }
 
-    // #126 decision C: the runnable task list comes from the persisted
-    // `task_list` tool store (the ONE authoring path — it can carry real
-    // blockers). Fall back to the linear plan-artifact bridge only when nothing
-    // was authored via the tool (back-compat with the #59/#124 plan-only path and
-    // its replay fixtures).
-    const persisted = await executor.loadTaskList(sessionId);
-    taskList =
-      persisted != null && persisted.tasks.length > 0
-        ? persisted
-        : planArtifactToTaskList(outcome.artifact);
-    if (taskList.tasks.length === 0) {
-      cx.stream = onStream;
-      const result: RunResult = {
-        kind: "failure",
-        reason: { kind: "empty_plan" },
-        session_id: sessionId,
-        usage: outcome.usage,
-        turns: outcome.turns,
+      // #126 decision C: the runnable task list comes from the persisted
+      // `task_list` tool store (the ONE authoring path). Fall back to the linear
+      // plan-artifact bridge only when nothing was authored via the tool.
+      const persisted = await executor.loadTaskList(sessionId);
+      taskList =
+        persisted != null && persisted.tasks.length > 0
+          ? persisted
+          : planArtifactToTaskList(outcome.artifact);
+      if (taskList.tasks.length > 0) break;
+
+      // Empty plan: re-ask while attempts remain, else halt with `empty_plan`
+      // (folding every attempt's usage so the carried budget counts them).
+      if (attempt >= planEmptyMaxRetries) {
+        cx.stream = onStream;
+        const finalUsage: AggregateUsage = {
+          input_tokens: outcome.usage.input_tokens + discardedUsage.input_tokens,
+          output_tokens: outcome.usage.output_tokens + discardedUsage.output_tokens,
+          cache_read_tokens:
+            (outcome.usage.cache_read_tokens ?? 0) + (discardedUsage.cache_read_tokens ?? 0),
+          cache_write_tokens:
+            (outcome.usage.cache_write_tokens ?? 0) + (discardedUsage.cache_write_tokens ?? 0),
+          cost_usd: (outcome.usage.cost_usd ?? 0) + (discardedUsage.cost_usd ?? 0),
+        };
+        const result: RunResult = {
+          kind: "failure",
+          reason: { kind: "empty_plan" },
+          session_id: sessionId,
+          usage: finalUsage,
+          turns: outcome.turns,
+        };
+        return finishCombinator(cx, executor, task, result);
+      }
+      // Fold this discarded attempt's usage and re-ask.
+      discardedUsage = {
+        input_tokens: discardedUsage.input_tokens + outcome.usage.input_tokens,
+        output_tokens: discardedUsage.output_tokens + outcome.usage.output_tokens,
+        cache_read_tokens:
+          (discardedUsage.cache_read_tokens ?? 0) + (outcome.usage.cache_read_tokens ?? 0),
+        cache_write_tokens:
+          (discardedUsage.cache_write_tokens ?? 0) + (outcome.usage.cache_write_tokens ?? 0),
+        cost_usd: (discardedUsage.cost_usd ?? 0) + (outcome.usage.cost_usd ?? 0),
       };
-      return finishCombinator(cx, executor, task, result);
     }
+    // `outcome` is the successful capture from the breaking iteration; `taskList`
+    // is non-empty. The post-loop cycle check + persist + carry proceed below.
 
     // #126 AC5: re-check the WHOLE graph for cycles at execute entry (defense in
     // depth — `add_task` already rejects cycles, but the persisted store could be
@@ -4055,6 +4109,15 @@ export type HarnessStreamEvent =
       is_error: boolean;
       /** The tool result content (issue #103, Q5). */
       content?: string;
+      /**
+       * `true` when this event REPLACES a `tool_result` already emitted for the
+       * same `call_id` because an AfterTool middleware rewrote the result in
+       * place (`continue_with_modification`, issue #11 / SC-9). The model side is
+       * patched via `ContextManager.replaceToolResult`; this is the symmetric
+       * stream-side signal so consumers correct the displayed result instead of
+       * double-counting it as a second call. Mirrors Rust `StreamEvent::ToolResult.revised`.
+       */
+      revised?: boolean;
     }
   | { kind: "final_response"; content: string }
   | { kind: "budget_warning"; limit_type: BudgetLimitType }
@@ -4065,7 +4128,13 @@ export type HarnessStreamEvent =
    * rendering it prominently is the architect's UI concern. A minimal success
    * tool result is still recorded in history so the loop continues.
    */
-  | { kind: "user_message"; content: string }
+  | { kind: "user_message"; content: string; /**
+   * `true` when this is a USER-authored steering message injected at a turn
+   * boundary (rendered as user input), `false` for the agent's `send_message`
+   * narration (rendered as agent output). Mirrors Rust
+   * `StreamEvent::UserMessage.steered`.
+   */
+  steered?: boolean }
   // ── Delta-level streaming (issue #103) ──────────────────────────────────
   /** Streamed text fragment (model `content_block_delta`). */
   | { kind: "text_delta"; content: string }
@@ -4267,12 +4336,27 @@ export const HarnessSignalSchema = z.discriminatedUnion("kind", [
     mode: z.enum(["always_ask", "auto_edit", "plan", "safe_auto"]),
   }),
   z.object({ kind: z.literal("abort"), reason: z.string() }),
+  z.object({ kind: z.literal("plan_recorded") }),
 ]);
 export type HarnessSignal =
   | { kind: "enter_plan_mode"; context: string }
   | { kind: "exit_plan_mode"; plan: PlanArtifact }
   | { kind: "switch_mode"; mode: Mode }
-  | { kind: "abort"; reason: string };
+  | { kind: "abort"; reason: string }
+  /**
+   * The planner recorded its plan via `set_plan` and is done planning — END the
+   * PlanExecute plan phase (the plan-phase analogue of `plan_completed`) so the
+   * DAG walk proceeds to EXECUTE. Carries no artifact: the runnable plan is
+   * already in the durable `task_list` store the plan phase reads. Unlike
+   * `abort`, it is CONSUMED inside PlanExecute and never ends the whole run.
+   *
+   * Forward-compatible seam: mirrors Rust `HarnessSignal::PlanRecorded`. The
+   * `set_plan` tool itself returns success (it does NOT escalate this signal);
+   * the plan phase handles an `escalate { plan_recorded }` RunResult for
+   * future loop recognition, while today the plan is captured via the durable
+   * `task_list` store fallback (SC-28).
+   */
+  | { kind: "plan_recorded" };
 
 /**
  * Tool dispatch output. Full type lives in issue #4/#5; this covers loop routing.
@@ -4969,6 +5053,13 @@ export interface ConsultHandlerEntry {
 
 /** Per-kind consult handlers (issue #114), keyed by {@link ConsultRequest.kind}. */
 export type ConsultHandlerMap = Map<string, ConsultHandlerEntry>;
+
+/**
+ * Mid-run steering source (pi-style): a callback drained at each turn boundary
+ * that returns user messages queued since the last turn. Mirrors Rust
+ * `SteeringSource = Arc<dyn Fn() -> Vec<String> + Send + Sync>`.
+ */
+export type SteeringSource = () => string[];
 
 // ============================================================================
 // PausedState / ChildPausedState
