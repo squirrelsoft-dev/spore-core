@@ -251,7 +251,17 @@ type ModelParams struct {
 	// Providers without level support ignore it.
 	ReasoningEffort *ReasoningEffort `json:"reasoning_effort,omitempty"`
 	TopP            *float32         `json:"top_p"`
-	StopSequences   []string         `json:"stop_sequences"`
+	// TopK / MinP / PresencePenalty / RepetitionPenalty are extended sampling
+	// controls. vLLM / local OpenAI-compatible servers accept top_k/min_p/
+	// repetition_penalty as request fields; presence_penalty is standard OpenAI.
+	// nil (the default) keeps serialized params byte-identical (omitempty drops
+	// them from the wire, mirroring Rust's skip_serializing_if = "Option::is_none").
+	// Providers without support (Anthropic / Ollama) ignore them.
+	TopK              *uint32  `json:"top_k,omitempty"`
+	MinP              *float32 `json:"min_p,omitempty"`
+	PresencePenalty   *float32 `json:"presence_penalty,omitempty"`
+	RepetitionPenalty *float32 `json:"repetition_penalty,omitempty"`
+	StopSequences     []string `json:"stop_sequences"`
 	// StructuredToolCalls is an opt-in hint for providers that support
 	// constrained decoding (Ollama via the `format` JSON-schema parameter).
 	// When true AND the request has tools, the provider forces tool calls to be
