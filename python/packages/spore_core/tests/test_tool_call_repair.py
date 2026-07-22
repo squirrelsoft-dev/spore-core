@@ -145,6 +145,23 @@ def test_detect_prose_response_empty() -> None:
     assert detect_prose_tool_call_failure("   ", True) is None
 
 
+def test_runtime_prose_detector_catches_extended_inspect_phrase() -> None:
+    # The runtime escalation path imports ``detect_prose_response`` from
+    # ``prompt_tool_call``, which delegates to the unified
+    # ``tool_call_repair`` detector (the extended phrase table). An extended
+    # phrase like "I'll inspect ..." that Rust escalates must ALSO be caught
+    # here — proving the two paths share one phrase table.
+    from spore_core.prompt_tool_call import detect_prose_response as runtime_detect
+
+    assert runtime_detect("I'll inspect the directory first", True) is not None
+    assert runtime_detect("let me inspect the output", True) is not None
+    # The shared table is the SAME object.
+    from spore_core.prompt_tool_call import ACTION_PHRASES as runtime_phrases
+    from spore_core.tool_call_repair import ACTION_PHRASES as repair_phrases
+
+    assert runtime_phrases is repair_phrases
+
+
 # ---------------------------------------------------------------------------
 # StandardToolCallRepair
 # ---------------------------------------------------------------------------

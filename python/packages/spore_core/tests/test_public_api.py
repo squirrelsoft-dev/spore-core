@@ -87,3 +87,10 @@ def test_step_ledger_round_trip() -> None:
     rendered = sc.render_step_ledger(ledger, elided=True)
     assert rendered is not None
     assert sc.STEP_LEDGER_ELISION_MARKER in rendered
+
+
+def test_prompt_assembly_custom_condition_alias_reexport() -> None:
+    # Rust publicly exports CustomCondition; Python keeps CustomPredicate as the
+    # original name and aliases/re-exports CustomCondition for root API parity.
+    assert hasattr(sc, "CustomCondition")
+    assert sc.CustomCondition is sc.CustomPredicate

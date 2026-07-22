@@ -260,3 +260,58 @@ async def test_harness_tool_search_advertises_only_core_before_search() -> None:
     assert isinstance(r, RunResultSuccess)
     # First turn advertises ONLY core + tool_search (deferred tools hidden).
     assert set(seen_tools[0]) == {"read_file", "tool_search"}, seen_tools[0]
+
+
+async def test_harness_tool_search_leaves_custom_registry_unchanged() -> None:
+    """Rust returns the injected custom ``tool_registry`` unchanged when no
+    catalogue registry exists; ``tool_search`` only wraps catalogue-backed
+    registries. A custom registry therefore advertises its full schema list and
+    does NOT grow a synthetic ``tool_search`` schema."""
+    from typing import Any
+
+    from spore_core import (
+        AllowAllSandbox,
+        AlwaysContinuePolicy,
+        HarnessBuilder,
+        HarnessRunOptions,
+        NoopContextManager,
+        ReactConfig,
+        RunResultSuccess,
+        SessionId,
+        Task,
+    )
+    from spore_core.agent import FinalResponse
+    from spore_core.model import TokenUsage
+
+    seen_tools: list[list[str]] = []
+
+    class _RecAgent:
+        async def turn(self, context: Any) -> Any:
+            seen_tools.append([t.name for t in context.tools])
+            return FinalResponse(content="done", usage=TokenUsage())
+
+        def id(self) -> Any:
+            from spore_core import AgentId
+
+            return AgentId("rec")
+
+    custom = _MockLoopReg(_catalogue())
+    h = (
+        HarnessBuilder(
+            agent=_RecAgent(),
+            tool_registry=custom,
+            sandbox=AllowAllSandbox(),
+            context_manager=NoopContextManager(),
+            termination_policy=AlwaysContinuePolicy(),
+        )
+        .tool_search(ToolSearchConfig.new(["read_file"]).with_description_budget(1000))
+        .build()
+    )
+
+    r = await h.run(
+        HarnessRunOptions(Task.new("do", SessionId("s-custom"), ReactConfig.per_loop(3)))
+    )
+
+    assert isinstance(r, RunResultSuccess)
+    assert set(seen_tools[0]) == {s.name for s in _catalogue()}
+    assert "tool_search" not in seen_tools[0]

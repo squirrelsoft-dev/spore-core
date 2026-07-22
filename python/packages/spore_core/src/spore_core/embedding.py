@@ -22,7 +22,6 @@ import httpx
 
 from .model import (
     ProviderError,
-    RateLimited,
     TimeoutError as ModelTimeoutError,
     Transport,
 )
@@ -318,8 +317,15 @@ class OpenAIEmbeddingModel:
             retry_after = _parse_retry_after(resp.headers.get("retry-after"))
             text = resp.text
             await resp.aclose()
-            if status == 429:
-                raise RateLimited(retry_after=retry_after)
+            # Rust maps terminal non-success embedding responses through
+            # ``provider_http::error_parts`` into ``ModelError::ProviderError``,
+            # including terminal 429s after retry exhaustion — it does NOT raise
+            # a retryable/rate-limit type. Keep retry behavior BEFORE exhaustion
+            # (above), but classify the terminal 429 as a ``ProviderError`` with
+            # the unwrapped envelope message so consumers classify it identically
+            # across languages. ``retry_after`` is unused on the terminal path
+            # (mirrors Rust).
+            _ = retry_after
             raise ProviderError(code=status, message=_openai_error_message(text))
 
     async def embed(self, inputs: list[str]) -> list[list[float]]:

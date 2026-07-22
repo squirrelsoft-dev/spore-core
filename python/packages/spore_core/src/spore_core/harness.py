@@ -1133,6 +1133,17 @@ class RunScratch:
     # ``ContinueWithBudget`` arm (#138 budget). ``None`` on a fresh run / after the
     # seed is consumed. Mirrors Rust's ``RunScratch::resume_seed``.
     resume_seed: SessionState | None = None
+    # ``True`` while the current ReAct window is an EXECUTE step of a PlanExecute
+    # walk (set by ``_run_plan_execute_config`` before dispatching the execute
+    # leaf, consumed by the react loop). Drives the structural ``tool_call_nudge``
+    # (an execute turn that called zero tools while tools were advertised). Runtime-only.
+    in_execute_step: bool = False
+    # Forced output schema for a plan-empty REPAIR re-ask (#139): when set
+    # (by ``run_plan_subtree`` on a retry), the plan leaf VALIDATES its terminal
+    # against this schema instead of the leaf's own declared ``output``. Mirrors
+    # Rust's ``forced_output_schema`` threaded through ``drive_strategy_with_resume_seed``.
+    # Consumed (cleared) by ``_run_react_config``. Runtime-only.
+    forced_output_schema: dict[str, Any] | None = None
 
 
 @dataclass
@@ -1394,6 +1405,7 @@ class StrategyExecutor(Protocol):
         output_schema: dict[str, Any] | None = None,
         output_schema_max_retries: int = 0,
         system_prompt: str | None = None,
+        in_execute_step: bool = False,
     ) -> RunResult:
         """Run ONE bounded ReAct turn-loop window (the leaf primitive) on the
         resolved worker ``agent`` (#124). Issue 2: ``toolset`` is the leaf's
@@ -1530,13 +1542,17 @@ class StrategyExecutor(Protocol):
         plan_task: Task,
         plan_session: SessionState,
         budget_used: BudgetSnapshot,
+        forced_output_schema: dict[str, Any] | None = None,
     ) -> RunResult | None:
         """Dispatch the plan sub-strategy ``plan`` for ``plan_task`` over
         ``plan_session``, returning its terminal :class:`RunResult` (#124).
         Genuinely recursive — the child's ``run`` drives its whole loop. Routes the
         configured ``planner_agent`` (R5/R6) by running the child against an
         agent-swapped child harness when one is set; otherwise the default agent
-        runs the plan turns. ``None`` ⇒ the child produced no terminal."""
+        runs the plan turns. ``None`` ⇒ the child produced no terminal.
+        ``forced_output_schema`` (a plan-empty REPAIR re-ask, #139) forces the
+        plan leaf to validate its terminal against this schema instead of its own
+        declared ``output``; ``None`` ⇒ the leaf's own schema (byte-identical)."""
         ...
 
     async def capture_plan_artifact(
@@ -1617,6 +1633,13 @@ class StrategyExecutor(Protocol):
         """The number of EXTRA terminal-validation retry turns ``N`` granted under
         output-schema enforcement (issue #139; total attempts = ``1 + N``). Read
         by :func:`_run_react_config` to thread into the window. Default ``2``."""
+        ...
+
+    def plan_empty_max_retries(self) -> int:
+        """The plan-empty re-ask cap (mirrors Rust's
+        ``HarnessConfig::plan_empty_max_retries``): when ``> 0``, an empty plan is
+        re-asked up to this many more times before halting with ``EmptyPlan``.
+        ``0`` (default) preserves the historical single-shot behavior."""
         ...
 
 
@@ -1994,6 +2017,14 @@ async def _run_react_config(self: ReactConfig, cx: ExecutionContext) -> Strategy
         resolved = cx.registry.resolve_schema(self.output)
         if isinstance(resolved, dict):
             output_schema = resolved
+    # Plan-empty REPAIR re-ask (#139): a forced schema (threaded via the scratch
+    # by ``run_plan_subtree``) OVERRIDES the leaf's own declared ``output`` so a
+    # re-ask is guided-decoded into valid ``{tasks, rationale}`` JSON. Consumed
+    # (cleared) here so it never leaks past this leaf. Mirrors Rust's
+    # ``forced_output_schema`` threaded through ``drive_strategy_with_resume_seed``.
+    if cx.scratch.forced_output_schema is not None:
+        output_schema = cx.scratch.forced_output_schema
+        cx.scratch.forced_output_schema = None
     output_schema_max_retries = executor.output_schema_max_retries()
     if output_schema is not None:
         # AC1: append the resolved schema to the leaf's directive/system context
@@ -2019,6 +2050,11 @@ async def _run_react_config(self: ReactConfig, cx: ExecutionContext) -> Strategy
     # empty (mirrors Rust's `(!self.agent.0.is_empty()).then(...)`).
     on_stream = wrap_node_sink(cx.stream, "react", self.agent or None)
     cx.stream = None
+    # Consume the EXECUTE-step marker for THIS leaf (mirrors Rust's
+    # ``std::mem::take(&mut cx.scratch.in_execute_step)``) so a sibling leaf in a
+    # nested execute strategy cannot inherit it accidentally.
+    in_execute_step = cx.scratch.in_execute_step
+    cx.scratch.in_execute_step = False
     result = await executor.react_window(
         task,
         max_iterations,
@@ -2038,6 +2074,9 @@ async def _run_react_config(self: ReactConfig, cx: ExecutionContext) -> Strategy
         # (``None`` ⇒ the window keeps using the global prompt). Mirrors
         # ``self.toolset``.
         self.system_prompt,
+        # Mark EXECUTE-phase windows so the structural ``tool_call_nudge`` can
+        # fire (mirrors Rust's ``cx.scratch.in_execute_step``).
+        in_execute_step,
     )
     await executor.finalize(result)
 
@@ -2255,84 +2294,155 @@ async def _run_plan_execute_config(
             or all(t.status != TaskStatus.IN_PROGRESS for t in preexisting.tasks)
         )
         directive = executor.plan_directive(task.instruction)
+        # The resume seed (if any) is consumed ONCE here; the re-ask loop below
+        # re-plans from this same base session each attempt.
         if plan_resume and resume_seed_session is not None:
-            plan_session = resume_seed_session
+            plan_base = resume_seed_session
             resume_seed_session = None
         else:
-            plan_session = base_session.model_copy(deep=True)
-        await executor.seed_user_message(plan_session, directive)
-        plan_task = Task(
-            id=task.id,
-            instruction=directive,
-            session_id=session_id,
-            budget=task.budget.model_copy(deep=True),
-            loop_strategy=self.plan,
-        )
-        plan_result = await executor.run_plan_subtree(
-            self.plan, plan_task, plan_session, budget_used.model_copy(deep=True)
-        )
-        if isinstance(plan_result, RunResultSuccess):
-            plan_output, plan_usage, plan_turns = (
-                plan_result.output,
-                plan_result.usage,
-                plan_result.turns,
+            plan_base = base_session.model_copy(deep=True)
+
+        # Plan-empty re-ask loop. A reasoning model can route its plan into the
+        # reasoning channel, leaving the message CONTENT empty so the strict +
+        # prose capture yields no tasks. Rather than halting on the FIRST empty
+        # plan, re-ask up to ``plan_empty_max_retries`` more times — nudging the
+        # planner to emit the plan as message content — before falling through to
+        # ``EmptyPlan``. A cap of ``0`` (the default) preserves the historical
+        # single-shot behaviour byte-for-byte: the loop runs once and the
+        # ``attempt >= max`` guard fires immediately on an empty plan, with zero
+        # discarded usage to fold. Mirrors Rust's plan_execute.rs.
+        plan_empty_max = executor.plan_empty_max_retries()
+        # The re-ask runs with tools SUPPRESSED: a reasoning model offered the
+        # full toolset tends to derail into a tool call (or pure reasoning)
+        # instead of emitting the plan; with no tools it must answer in content.
+        # The first attempt keeps tools (it may research). Built ONLY when re-asks
+        # are enabled — at the default cap of ``0`` the loop is single-shot and
+        # this clone would be wasted (keeps the historical no-retry path
+        # byte-identical and allocation-free).
+        retry_plan = plan_with_tools_suppressed(self.plan) if plan_empty_max > 0 else None
+        # Usage from discarded (empty) attempts, folded into whichever artifact
+        # terminates the loop so the carried budget counts them.
+        discarded_usage = AggregateUsage()
+        attempt = 0
+        while True:
+            active_plan = self.plan if attempt == 0 else (retry_plan or self.plan)
+            # Per-attempt plan session: the seeded directive, plus — on a retry —
+            # a corrective nudge demanding the plan as content.
+            plan_session = plan_base.model_copy(deep=True)
+            await executor.seed_user_message(plan_session, directive)
+            if attempt > 0:
+                # The trailing ``/no_think`` is a soft thinking-suppression hint:
+                # reasoning models that honor it stop routing the plan into the
+                # reasoning channel and emit it as content; models that don't
+                # simply ignore the token.
+                nudge = (
+                    "Your previous response produced no usable plan "
+                    "(no JSON object, and no tasks were authored). Output the "
+                    "plan NOW as a single JSON object in your MESSAGE CONTENT: "
+                    '{"tasks": [<ordered step strings>], "rationale": '
+                    "<string>}. Do NOT put the plan only in your reasoning, and "
+                    "do NOT call any tools. /no_think"
+                )
+                await executor.seed_user_message(plan_session, nudge)
+            plan_task = Task(
+                id=task.id,
+                instruction=directive,
+                session_id=session_id,
+                budget=task.budget.model_copy(deep=True),
+                loop_strategy=active_plan,
             )
-        elif plan_result is None:
-            cx.stream = on_stream
-            result = RunResultFailure(
-                reason=HaltReasonPlanPhaseFailed(
-                    error=PlanPhaseErrorPayload(
-                        kind="planning_turn_failed",
-                        message="plan sub-strategy produced no terminal",
+            # #139: the trusted first attempt runs UNCONSTRAINED; each repair
+            # re-ask FORCES the plan schema (→ ``response_format``), so a model
+            # that answered in prose is now made to emit valid
+            # ``{tasks, rationale}`` JSON.
+            forced_schema = plan_output_schema() if attempt > 0 else None
+            plan_result = await executor.run_plan_subtree(
+                active_plan,
+                plan_task,
+                plan_session,
+                budget_used.model_copy(deep=True),
+                forced_schema,
+            )
+            if isinstance(plan_result, RunResultSuccess):
+                plan_output, plan_usage, plan_turns = (
+                    plan_result.output,
+                    plan_result.usage,
+                    plan_result.turns,
+                )
+            elif plan_result is None:
+                cx.stream = on_stream
+                result = RunResultFailure(
+                    reason=HaltReasonPlanPhaseFailed(
+                        error=PlanPhaseErrorPayload(
+                            kind="planning_turn_failed",
+                            message="plan sub-strategy produced no terminal",
+                        ),
                     ),
-                ),
-                session_id=session_id,
-                usage=AggregateUsage(),
-                turns=budget_used.turns,
-                session_state=SessionState(),
-            )
-            return await cx._finish(executor, task, result)
-        else:
-            # A non-success plan terminal (budget / agent error / pause)
-            # propagates verbatim — the run never reaches execute.
-            cx.stream = on_stream
-            return await cx._finish(executor, task, plan_result)
+                    session_id=session_id,
+                    usage=AggregateUsage(),
+                    turns=budget_used.turns,
+                    session_state=SessionState(),
+                )
+                return await cx._finish(executor, task, result)
+            else:
+                # A non-success plan terminal (budget / agent error / pause)
+                # propagates verbatim — the run never reaches execute.
+                cx.stream = on_stream
+                return await cx._finish(executor, task, plan_result)
 
-        # Capture + persist the artifact from the plan child's output (R3/R4/R11) —
-        # the harness-side machinery, no model turn.
-        outcome = await executor.capture_plan_artifact(
-            session_id, plan_output, plan_usage, plan_turns
-        )
-        if not isinstance(outcome, _PlanPhaseOutcome):
-            cx.stream = on_stream
-            return await cx._finish(executor, task, outcome)
-
-        # #126 decision C: the runnable task list comes from the persisted
-        # ``task_list`` tool store (the ONE authoring path — it can carry real
-        # blockers). Fall back to the linear plan-artifact bridge only when nothing
-        # was authored via the tool (back-compat with the #59/#124 plan-only path
-        # and its replay fixtures).
-        persisted = await executor.load_task_list(session_id)
-        if isinstance(persisted, TaskList) and persisted.tasks:
-            task_list = persisted
-        else:
-            # The fallback intentionally uses the deprecated linear bridge
-            # (decision C keeps it working for the plan-only back-compat path);
-            # silence its DeprecationWarning here (mirrors Rust's
-            # ``#[allow(deprecated)]``).
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                task_list = plan_artifact_to_task_list(outcome.artifact)
-        if not task_list.tasks:
-            cx.stream = on_stream
-            result = RunResultFailure(
-                reason=HaltReasonEmptyPlan(),
-                session_id=session_id,
-                usage=outcome.usage,
-                turns=outcome.turns,
-                session_state=SessionState(),
+            # Capture + persist the artifact from the plan child's output
+            # (R3/R4/R11) — the harness-side machinery, no model turn.
+            outcome = await executor.capture_plan_artifact(
+                session_id, plan_output, plan_usage, plan_turns
             )
-            return await cx._finish(executor, task, result)
+            if not isinstance(outcome, _PlanPhaseOutcome):
+                cx.stream = on_stream
+                return await cx._finish(executor, task, outcome)
+
+            # #126 decision C: the runnable task list comes from the persisted
+            # ``task_list`` tool store (the ONE authoring path — it can carry
+            # real blockers). Fall back to the linear plan-artifact bridge only
+            # when nothing was authored via the tool (back-compat with the
+            # #59/#124 plan-only path and its replay fixtures).
+            persisted = await executor.load_task_list(session_id)
+            if isinstance(persisted, TaskList) and persisted.tasks:
+                task_list = persisted
+            else:
+                # The fallback intentionally uses the deprecated linear bridge
+                # (decision C keeps it working for the plan-only back-compat
+                # path); silence its DeprecationWarning here (mirrors Rust's
+                # ``#[allow(deprecated)]``).
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    task_list = plan_artifact_to_task_list(outcome.artifact)
+
+            if task_list.tasks:
+                # A retry produced a usable plan: fold usage from discarded
+                # empty attempts into the successful artifact so carried budget
+                # and final accounting include every model turn, matching Rust.
+                outcome.usage.input_tokens += discarded_usage.input_tokens
+                outcome.usage.output_tokens += discarded_usage.output_tokens
+                break
+
+            # Empty plan: re-ask while attempts remain, else halt with
+            # ``EmptyPlan`` (reporting every attempt's usage).
+            if attempt >= plan_empty_max:
+                cx.stream = on_stream
+                final_usage = outcome.usage.model_copy(deep=True)
+                final_usage.input_tokens += discarded_usage.input_tokens
+                final_usage.output_tokens += discarded_usage.output_tokens
+                result = RunResultFailure(
+                    reason=HaltReasonEmptyPlan(),
+                    session_id=session_id,
+                    usage=final_usage,
+                    turns=outcome.turns,
+                    session_state=SessionState(),
+                )
+                return await cx._finish(executor, task, result)
+            # Fold this attempt's usage and re-ask.
+            discarded_usage.input_tokens += outcome.usage.input_tokens
+            discarded_usage.output_tokens += outcome.usage.output_tokens
+            attempt += 1
 
         # #126 AC5: re-check the WHOLE graph for cycles at execute entry (defense in
         # depth — ``add_task`` already rejects cycles, but the persisted store
@@ -2498,10 +2608,18 @@ async def _run_plan_execute_config(
         cx.scratch.task = step_task
         cx.scratch.run_session = step_session
         cx.scratch.run_budget = carried.model_copy(deep=True)
+        # Mark this as an EXECUTE step so the react loop's structural
+        # ``tool_call_nudge`` can fire (an execute turn that called zero tools
+        # while tools were advertised). Mirrors Rust's
+        # ``cx.scratch.in_execute_step = more_tasks_pending;`` (taken/restored
+        # after the step). Runtime-only.
+        _prev_in_execute_step = cx.scratch.in_execute_step
+        cx.scratch.in_execute_step = True
         # #125: absolute turn count BEFORE this step, so the success path charges
         # only the DELTA against the PlanExecute scope.
         carried_before = carried.turns
         step_outcome = await run_strategy(self.execute, cx)
+        cx.scratch.in_execute_step = _prev_in_execute_step
 
         # ── BudgetExhausted (#125 rule 4/7) — resolve THIS scope. ────────────
         if isinstance(step_outcome, StrategyOutcomeBudgetExhausted):
@@ -3463,6 +3581,47 @@ def _worker_agent_key_of(ls: LoopStrategy) -> str:
     if isinstance(ls, HillClimbingConfig):
         return _worker_agent_key_of(ls.inner)
     raise AssertionError(f"unknown loop strategy: {ls!r}")  # pragma: no cover
+
+
+# The sentinel toolset handle that advertises NO tools (mirrors Rust's
+# ``NO_TOOLS_TOOLSET``). A plan re-ask run through it advertises no tools so a
+# reasoning model must answer in content instead of derailing into a tool call.
+NO_TOOLS_TOOLSET = "__none__"
+
+
+def plan_with_tools_suppressed(ls: LoopStrategy) -> LoopStrategy:
+    """Clone ``ls`` with the worker leaf's toolset set to
+    :data:`NO_TOOLS_TOOLSET` (mirrors Rust's ``plan_with_tools_suppressed``).
+    Descends the worker child chain so a nested plan combinator suppresses the
+    innermost leaf. Used by the plan-empty REPAIR re-ask so the planner emits the
+    plan as message content instead of calling a tool."""
+    cloned = ls.model_copy(deep=True)
+    if isinstance(cloned, ReactConfig):
+        cloned.toolset = NO_TOOLS_TOOLSET
+    elif isinstance(cloned, PlanExecuteConfig):
+        cloned.plan = plan_with_tools_suppressed(cloned.plan)
+    elif isinstance(cloned, SelfVerifyingConfig):
+        cloned.inner = plan_with_tools_suppressed(cloned.inner)
+    elif isinstance(cloned, RalphConfig):
+        cloned.inner = plan_with_tools_suppressed(cloned.inner)
+    elif isinstance(cloned, HillClimbingConfig):
+        cloned.inner = plan_with_tools_suppressed(cloned.inner)
+    return cloned
+
+
+def plan_output_schema() -> dict[str, Any]:
+    """The JSON schema the plan-empty REPAIR forces on a re-ask (#139): the
+    canonical ``{ tasks: [string], rationale: string }`` plan contract. Mirrors
+    Rust's ``plan_output_schema``. Delivered as the forced output schema so the
+    planner is guided-decoded into valid JSON instead of free prose."""
+    return {
+        "type": "object",
+        "properties": {
+            "tasks": {"type": "array", "items": {"type": "string"}},
+            "rationale": {"type": "string"},
+        },
+        "required": ["tasks", "rationale"],
+    }
 
 
 def _worker_toolset_of(ls: LoopStrategy) -> ToolsetRef:
@@ -6111,6 +6270,8 @@ class HarnessConfig:
         tool_call_repair: Any | None = None,
         max_repair_attempts: int = 1,
         tool_search: Any | None = None,
+        tool_call_nudge: bool = False,
+        plan_empty_max_retries: int = 0,
     ) -> None:
         # #124: the legacy single-collaborator fields (``agent`` / ``verifier`` /
         # ``planner_agent`` / ``evaluator_agent`` / ``metric_evaluator``) are GONE
@@ -6406,6 +6567,17 @@ class HarnessConfig:
         # :class:`~spore_core.tool_registry.ToolSearchRegistry` so only a small,
         # description-bounded ACTIVE set is advertised. ``None`` disables it.
         self.tool_search = tool_search
+        # Behavioral tool-call nudge (mirrors Rust's
+        # ``HarnessConfig::tool_call_nudge``): when ``True``, an EXECUTE-phase
+        # turn that called zero tools while tools were advertised is nudged to
+        # actually use a tool before reporting. Off (default) → byte-identical.
+        self.tool_call_nudge: bool = tool_call_nudge
+        # Plan-empty re-ask cap (mirrors Rust's
+        # ``HarnessConfig::plan_empty_max_retries``): when ``> 0``, an empty plan
+        # is re-asked up to this many more times (tools suppressed + forced plan
+        # schema) before halting with ``EmptyPlan``. ``0`` (default) preserves the
+        # historical single-shot behavior byte-for-byte.
+        self.plan_empty_max_retries: int = plan_empty_max_retries
 
     def with_sandbox(self, sandbox: SandboxProvider) -> HarnessConfig:
         """A full copy of this config with only ``sandbox`` swapped (#124). Every
@@ -6455,6 +6627,8 @@ class HarnessConfig:
             tool_call_repair=self.tool_call_repair,
             max_repair_attempts=self.max_repair_attempts,
             tool_search=self.tool_search,
+            tool_call_nudge=self.tool_call_nudge,
+            plan_empty_max_retries=self.plan_empty_max_retries,
         )
 
 
@@ -6618,6 +6792,10 @@ class HarnessBuilder:
         self._max_repair_attempts: int = 1
         # Deferred-tool pattern (None disables).
         self._tool_search: Any | None = None
+        # Behavioral tool-call nudge (off by default).
+        self._tool_call_nudge: bool = False
+        # Plan-empty re-ask cap (0 = single-shot, byte-identical).
+        self._plan_empty_max_retries: int = 0
         # Per-kind consult handlers (issue #114). Empty by default — consults
         # degrade gracefully (R6). Populated via :meth:`consult_handler`.
         self._consult_handlers: dict[str, ConsultHandlerEntry] = {}
@@ -7086,6 +7264,25 @@ class HarnessBuilder:
         self._tool_search = config
         return self
 
+    def tool_call_nudge(self, enabled: bool = True) -> HarnessBuilder:
+        """Enable the behavioral tool-call nudge (mirrors Rust's
+        ``HarnessBuilder::tool_call_nudge``): an EXECUTE-phase turn that called
+        zero tools while tools were advertised is nudged to actually use a tool
+        before reporting. Off (default) → byte-identical.
+        """
+        self._tool_call_nudge = enabled
+        return self
+
+    def plan_empty_max_retries(self, retries: int) -> HarnessBuilder:
+        """Set the plan-empty re-ask cap (mirrors Rust's
+        ``HarnessBuilder::plan_empty_max_retries``): when ``> 0``, an empty plan
+        is re-asked up to this many more times (tools suppressed + forced plan
+        schema) before halting with ``EmptyPlan``. ``0`` (default) preserves the
+        historical single-shot behavior byte-for-byte.
+        """
+        self._plan_empty_max_retries = retries
+        return self
+
     def drain_tools_into_registry(self) -> StandardToolRegistry:
         """Drain the accumulated catalogue tools into a populated
         :class:`StandardToolRegistry`, registering each with last-wins upsert
@@ -7372,6 +7569,8 @@ class HarnessBuilder:
             tool_call_repair=self._tool_call_repair,
             max_repair_attempts=self._max_repair_attempts,
             tool_search=self._tool_search,
+            tool_call_nudge=self._tool_call_nudge,
+            plan_empty_max_retries=self._plan_empty_max_retries,
         )
 
     def build(self) -> StandardHarness:
@@ -7716,6 +7915,12 @@ class StandardHarness:
         ``self._config.output_schema_max_retries``."""
         return self._config.output_schema_max_retries
 
+    def plan_empty_max_retries(self) -> int:
+        """The plan-empty re-ask cap (mirrors Rust's
+        ``HarnessConfig::plan_empty_max_retries``, :class:`StrategyExecutor`
+        accessor): returns ``self._config.plan_empty_max_retries``."""
+        return self._config.plan_empty_max_retries
+
     def storage(self) -> StorageProvider:
         """The injected :class:`StorageProvider` (issue #73). Defaults to an
         all-no-op provider when ``.storage(...)`` was never set."""
@@ -7770,6 +7975,12 @@ class StandardHarness:
 
             progress = _bridge
 
+        # Reserved handle: advertise NO tools (plan-empty re-ask). Intercepted
+        # before the catalogue lookup so it never falls through to the full
+        # registry. Dispatch is unreachable — the model is offered nothing.
+        if toolset == NO_TOOLS_TOOLSET:
+            return EmptyToolRegistry()
+
         # Strict per-node scoping: a non-empty handle with its own catalogue.
         if toolset:
             scoped = self._config.toolset_catalogues.get(toolset)
@@ -7787,7 +7998,13 @@ class StandardHarness:
         # Fallback: empty handle (back-compat) or unregistered non-empty handle.
         catalogue = self._config.catalogue_registry
         if catalogue is None:
-            return self._maybe_tool_search(self._config.tool_registry)
+            # No catalogue tools were added via ``.tool()`` / ``.tools()``: return
+            # the injected ``tool_registry`` seam UNCHANGED — do NOT wrap it with
+            # ``ToolSearchRegistry``. Mirrors Rust's ``effective_tool_registry``
+            # (``None => self.config.tool_registry.clone()``): a caller that
+            # supplies a custom harness-loop ``tool_registry`` and also configures
+            # ``tool_search`` sees the custom registry advertised unchanged.
+            return self._config.tool_registry
         return self._maybe_tool_search(
             RealToolRegistry(
                 catalogue,
@@ -8658,6 +8875,7 @@ class StandardHarness:
         output_schema: dict[str, Any] | None = None,
         output_schema_max_retries: int = 0,
         system_prompt: str | None = None,
+        in_execute_step: bool = False,
     ) -> RunResult:
         """:class:`StrategyExecutor` primitive: one bounded ReAct turn-loop window
         on the resolved worker ``agent`` (delegates to :meth:`_run_react_inner`).
@@ -8666,7 +8884,9 @@ class StandardHarness:
         ``agent``. Issue #139: ``output_schema`` / ``output_schema_max_retries``
         drive terminal-output validation + retry (``None`` ⇒ no enforcement).
         SC-10 (#161): ``system_prompt`` is the leaf's per-node prompt override,
-        threaded down alongside ``toolset`` (``None`` ⇒ global prompt)."""
+        threaded down alongside ``toolset`` (``None`` ⇒ global prompt).
+        ``in_execute_step`` marks an EXECUTE-phase window so the structural
+        ``tool_call_nudge`` can fire (mirrors Rust's ``cx.scratch.in_execute_step``)."""
         return await self._run_react_inner(
             task,
             max_iterations,
@@ -8678,6 +8898,7 @@ class StandardHarness:
             output_schema,
             output_schema_max_retries,
             system_prompt,
+            in_execute_step,
         )
 
     def resolve_agent_ref(self, ref: str, session_id: SessionId) -> Agent | RunResultFailure:
@@ -8771,6 +8992,7 @@ class StandardHarness:
         plan_task: Task,
         plan_session: SessionState,
         budget_used: BudgetSnapshot,
+        forced_output_schema: dict[str, Any] | None = None,
     ) -> RunResult | None:
         """:class:`StrategyExecutor` primitive: dispatch the plan sub-strategy
         ``plan`` for ``plan_task`` over ``plan_session`` (#124).
@@ -8779,12 +9001,16 @@ class StandardHarness:
         ``ReactConfig.agent`` is authoritative and resolved by the recursing leaf
         itself. The child's ``run`` drives the WHOLE plan loop (genuine recursion).
         Returns the child's verbatim terminal, or ``None`` when it produced no
-        terminal."""
+        terminal. ``forced_output_schema`` (a plan-empty REPAIR re-ask, #139)
+        overrides the plan leaf's own ``output`` schema so a re-ask is
+        guided-decoded into valid ``{tasks, rationale}`` JSON; ``None`` ⇒ the
+        leaf's own schema (byte-identical)."""
         cx = ExecutionContext(registry=self._config.registry)
         cx.executor = self
         cx.scratch.run_session = plan_session
         cx.scratch.run_budget = budget_used
         cx.scratch.task = plan_task
+        cx.scratch.forced_output_schema = forced_output_schema
         await run_strategy(plan, cx)
         return cx.scratch.terminal_override
 
@@ -10138,6 +10364,7 @@ class StandardHarness:
         # this window, so the leaf sees ONLY its own prompt (the per-leaf prompt
         # half of SC-10; the toolset half is the ``toolset`` arg above).
         system_prompt: str | None = None,
+        in_execute_step: bool = False,
     ) -> RunResult:
         session_id = task.session_id
         # Resolve the effective tool registry once per turn-loop window (all
@@ -10167,6 +10394,13 @@ class StandardHarness:
         # reset). ``N`` is ``error_loop_threshold``; the hard stop is at ``2 * N``.
         error_loop_n = self._config.error_loop_threshold
         error_runs: dict[str, ErrorRun] = {}
+        # Per-window cap for the behavioral tool-call nudge (mirrors Rust's
+        # ``MAX_TOOL_CALL_NUDGES``) so a model that keeps answering without
+        # acting can't loop forever, plus a count of tools actually called this
+        # window — the signal is "execute turn finished having called ZERO tools".
+        MAX_TOOL_CALL_NUDGES = 2
+        tool_call_nudges_used = 0
+        tools_called_this_window = 0
         # Output-schema enforcement state (issue #139), loop-local to this window.
         # ``output_schema_retries_used`` counts the EXTRA retry turns spent on
         # validation feedback; the budget for them is ``output_schema_max_retries``
@@ -10373,6 +10607,7 @@ class StandardHarness:
                 stop_reason, tool_calls_requested = StopReason.TOOL_USE, len(result.calls)
             else:
                 stop_reason, tool_calls_requested = StopReason.END_TURN, 0
+            tools_called_this_window += tool_calls_requested
             turn_base = SpanBase.new_root(
                 new_span_id(f"{session_id}-turn-{budget_used.turns}"),
                 session_id,
@@ -10477,6 +10712,45 @@ class StandardHarness:
                     nudge = (
                         "You described an action but did not call a tool. Use the "
                         "provided tool-call format to actually invoke the tool."
+                    )
+                    await config.context_manager.append_user_message(session_state, nudge)
+                    continue
+
+                # Behavioral tool-call nudge (opt-in via ``tool_call_nudge``).
+                # This does NOT inspect the response text for phrases — it keys
+                # on ACTION: an EXECUTE-phase task window finished (a terminal
+                # answer) having called ZERO tools while tools were advertised,
+                # i.e. the model "reported findings" without ever reading
+                # anything. Record that answer, nudge it to actually use a tool
+                # before reporting, and force another turn. Scoped to execute
+                # steps so the legitimately tool-free plan-JSON turn is
+                # untouched, skips schema-constrained turns, and bounded per
+                # window so a model that refuses to act can't loop. Off
+                # (default) → byte-identical. Mirrors Rust's react.rs.
+                if (
+                    config.tool_call_nudge
+                    and in_execute_step
+                    and tools_advertised
+                    and tools_called_this_window == 0
+                    and output_schema is None
+                    and tool_call_nudges_used < MAX_TOOL_CALL_NUDGES
+                ):
+                    tool_call_nudges_used += 1
+                    appender = getattr(config.context_manager, "append_assistant_message", None)
+                    if appender is not None:
+                        await appender(
+                            session_state,
+                            Message(
+                                role=Role.ASSISTANT,
+                                content=TextContent(text=result.content),
+                            ),
+                        )
+                    nudge = (
+                        "You have not called any tool yet, so you have not "
+                        "actually inspected anything — your answer would be "
+                        "guessed, not grounded. Use the available tools "
+                        "(list_dir, read_file, grep, …) to gather the real "
+                        "data NOW, then report only what the tools returned."
                     )
                     await config.context_manager.append_user_message(session_state, nudge)
                     continue

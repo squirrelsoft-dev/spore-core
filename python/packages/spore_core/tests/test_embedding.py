@@ -20,7 +20,7 @@ from spore_core import (
     VectorStoreError,
     cosine_similarity,
 )
-from spore_core.model import ProviderError, RateLimited
+from spore_core.model import ProviderError
 
 
 # ---------------------------------------------------------------------------
@@ -158,13 +158,18 @@ async def test_openai_embed_sorts_by_index() -> None:
 
 
 @respx.mock
-async def test_openai_embed_429_is_rate_limited() -> None:
+async def test_openai_embed_terminal_429_is_provider_error() -> None:
+    # Mirrors Rust: a terminal 429 (after retry exhaustion) is classified as a
+    # ``ProviderError(code=429)`` — NOT a retryable/rate-limit type — so
+    # consumers classify it identically across languages. Retry behavior BEFORE
+    # exhaustion is unchanged (tested via max_retries > 0 elsewhere).
     respx.post("https://api.openai.com/v1/embeddings").mock(
         return_value=httpx.Response(429, headers={"retry-after": "2"}, text="slow down")
     )
     model = OpenAIEmbeddingModel("sk-test", "text-embedding-3-small").with_max_retries(0)
-    with pytest.raises(RateLimited):
+    with pytest.raises(ProviderError) as exc_info:
         await model.embed(["a"])
+    assert exc_info.value.code == 429
 
 
 @respx.mock

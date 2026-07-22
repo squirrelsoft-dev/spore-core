@@ -11,6 +11,7 @@ The plan phase (#70) is reused unchanged; here we drive the FULL two-phase
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from spore_core import (
     AgentId,
@@ -41,6 +42,12 @@ from spore_core import (
     StorageProvider,
     Task,
     TokenUsage,
+    ToolCall,
+    ToolCallRequested,
+    ToolOutput,
+    ToolOutputSuccess,
+    ToolSchema,
+    TurnResult,
 )
 from spore_core.hooks import (
     FunctionHook,
@@ -76,6 +83,8 @@ def _config(agent: MockAgent, **overrides: object) -> HarnessConfig:
         hooks=overrides.get("hooks"),
         planner_agent=overrides.get("planner_agent"),
         storage=overrides.get("storage", StorageProvider.single(InMemoryStorageProvider())),
+        tool_call_nudge=overrides.get("tool_call_nudge", False),
+        plan_empty_max_retries=overrides.get("plan_empty_max_retries", 0),
     )
 
 
@@ -98,6 +107,51 @@ def _task(*, max_turns: int | None = None) -> Task:
 
 def _usage(in_t: int = 1, out_t: int = 1) -> TokenUsage:
     return TokenUsage(input_tokens=in_t, output_tokens=out_t)
+
+
+class _RecordingAgent:
+    def __init__(self, agent_id: str = "rec") -> None:
+        self._id = AgentId(agent_id)
+        self._results: list[TurnResult] = []
+        self.call_count = 0
+        self.tools_seen: list[list[str]] = []
+
+    def push(self, result: TurnResult) -> _RecordingAgent:
+        self._results.append(result)
+        return self
+
+    async def turn(self, context: Any) -> TurnResult:
+        self.call_count += 1
+        self.tools_seen.append([t.name for t in context.tools])
+        if not self._results:
+            raise AssertionError("recording agent ran out of scripted turns")
+        return self._results.pop(0)
+
+    def id(self) -> AgentId:
+        return self._id
+
+
+class _SchemaToolRegistry:
+    def __init__(self, name: str = "inspect") -> None:
+        self.name = name
+        self.call_count = 0
+
+    async def dispatch(self, call: ToolCall) -> ToolOutput:
+        self.call_count += 1
+        return ToolOutputSuccess.success(f"ran {call.name}")
+
+    def is_always_halt(self, tool_name: str) -> bool:
+        _ = tool_name
+        return False
+
+    def schemas(self) -> list[ToolSchema]:
+        return [
+            ToolSchema(
+                name=self.name,
+                description="inspect project state",
+                input_schema={"type": "object", "properties": {}},
+            )
+        ]
 
 
 # A two-task plan + the two step responses, in agent-queue order.
@@ -171,7 +225,7 @@ async def test_all_tasks_completed_in_run_store() -> None:
 async def test_empty_plan_fails_with_empty_plan() -> None:
     a = _agent()
     a.push(FinalResponse(content='{"tasks":[],"rationale":"nothing"}', usage=_usage()))
-    h = StandardHarness(_config(a))
+    h = StandardHarness(_config(a, plan_empty_max_retries=0))
     task = _task()
     state = SessionState()
     r = await h.run(HarnessRunOptions(task, session_state=state))
@@ -182,6 +236,70 @@ async def test_empty_plan_fails_with_empty_plan() -> None:
     # No task list persisted for an empty plan.
     assert await _stored_task_list(h, task.session_id) is None
     assert TASK_LIST_EXTRAS_KEY not in state.extras
+
+
+async def test_plan_empty_max_retries_reasks_with_tools_suppressed() -> None:
+    a = _RecordingAgent()
+    # First plan attempt is empty. The configured re-ask forces the canonical
+    # plan schema and suppresses tools, then succeeds and executes the one task.
+    a.push(FinalResponse(content='{"tasks":[],"rationale":"hidden"}', usage=_usage(1, 2)))
+    a.push(FinalResponse(content='{"tasks":["retry task"],"rationale":"r"}', usage=_usage(3, 4)))
+    a.push(FinalResponse(content="done after retry", usage=_usage(5, 6)))
+    reg = _SchemaToolRegistry("inspect")
+    h = StandardHarness(_config(a, tool_registry=reg, plan_empty_max_retries=1))
+
+    r = await h.run(HarnessRunOptions(_task()))
+
+    assert isinstance(r, RunResultSuccess)
+    assert r.output == "done after retry"
+    assert a.call_count == 3
+    # Plan attempt 0 kept tools; retry attempt used the reserved no-tools
+    # toolset; execute attempt restored the normal registry.
+    assert a.tools_seen == [["inspect"], [], ["inspect"]]
+    # Usage from the discarded empty attempt is folded into the terminal run.
+    assert r.usage.input_tokens == 1 + 3 + 5
+    assert r.usage.output_tokens == 2 + 4 + 6
+
+
+async def test_tool_call_nudge_default_off_accepts_tool_free_execute_final() -> None:
+    a = _RecordingAgent()
+    a.push(FinalResponse(content='{"tasks":["inspect repo"],"rationale":"r"}', usage=_usage()))
+    a.push(FinalResponse(content="guessed without tools", usage=_usage()))
+    reg = _SchemaToolRegistry("inspect")
+    h = StandardHarness(_config(a, tool_registry=reg))
+
+    r = await h.run(HarnessRunOptions(_task()))
+
+    assert isinstance(r, RunResultSuccess)
+    assert r.output == "guessed without tools"
+    assert a.call_count == 2
+    assert reg.call_count == 0
+
+
+async def test_tool_call_nudge_enabled_reasks_tool_free_execute_final() -> None:
+    a = _RecordingAgent()
+    a.push(FinalResponse(content='{"tasks":["inspect repo"],"rationale":"r"}', usage=_usage()))
+    # First execute turn returns a terminal answer without having called tools:
+    # with ``tool_call_nudge`` enabled this is recorded + nudged instead of
+    # accepted. The next execute turn calls the tool, so the final answer is
+    # grounded and no further structural nudge fires.
+    a.push(FinalResponse(content="guessed without tools", usage=_usage()))
+    a.push(
+        ToolCallRequested(
+            calls=[ToolCall(id="c1", name="inspect", input={})],
+            usage=_usage(),
+        )
+    )
+    a.push(FinalResponse(content="grounded", usage=_usage()))
+    reg = _SchemaToolRegistry("inspect")
+    h = StandardHarness(_config(a, tool_registry=reg, tool_call_nudge=True))
+
+    r = await h.run(HarnessRunOptions(_task()))
+
+    assert isinstance(r, RunResultSuccess)
+    assert r.output == "grounded"
+    assert a.call_count == 4
+    assert reg.call_count == 1
 
 
 # ---------------------------------------------------------------------------
