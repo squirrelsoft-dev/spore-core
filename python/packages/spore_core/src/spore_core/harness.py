@@ -1991,8 +1991,11 @@ async def _run_react_config(self: ReactConfig, cx: ExecutionContext) -> Strategy
     # nested leaf does not).
     cx.push_budget(self.budget, self.behavior, "react")
     # The leaf takes the run's stream sink for the window. Combinators that
-    # recurse per-phase suppress it (they take it before recursing).
-    on_stream = cx.stream
+    # recurse per-phase suppress it (they take it before recursing). Wrap it so
+    # every event this leaf emits is attributed to THIS node (kind ``react`` +
+    # the resolved agent handle). ``agent_id`` is ``None`` when the handle is
+    # empty (mirrors Rust's `(!self.agent.0.is_empty()).then(...)`).
+    on_stream = wrap_node_sink(cx.stream, "react", self.agent or None)
     cx.stream = None
     result = await executor.react_window(
         task,
@@ -2156,10 +2159,12 @@ async def _run_plan_execute_config(
     base_session = cx.scratch.run_session
     cx.scratch.run_session = SessionState()
     budget_used = cx.scratch.run_budget.model_copy(deep=True)
-    # PlanExecute suppresses the run's stream sink for its phases; restore it
-    # before returning so the parent-visible step boundaries are re-emitted.
+    # #stream: children inherit ``cx.stream`` and stream through it, wrapped so
+    # every event is attributed to ``plan_execute`` (mirrors Rust's
+    # ``wrap_node_sink``). The saved parent ``on_stream`` is restored on every
+    # exit so the parent-visible step boundaries are re-emitted un-attributed.
     on_stream = cx.stream
-    cx.stream = None
+    cx.stream = wrap_node_sink(on_stream, "plan_execute", None)
 
     # #131/#138: the phase-agnostic resume seed (the stalled worker conversation
     # carried from a resumed consult or budget pause). Taken BEFORE the plan phase
@@ -2782,9 +2787,10 @@ async def _run_self_verifying_config(
     session_state = cx.scratch.resume_seed or cx.scratch.run_session
     cx.scratch.resume_seed = None
     carried = cx.scratch.run_budget.model_copy(deep=True)
-    # Suppress the run's stream sink for the recursive child phases.
+    # #stream: children stream through the wrapped sink so every event is
+    # attributed to ``self_verifying`` (mirrors Rust's ``wrap_node_sink``).
     on_stream = cx.stream
-    cx.stream = None
+    cx.stream = wrap_node_sink(on_stream, "self_verifying", None)
 
     # Q1a: resolve the verifier from ``evaluator``'s key (NO wire change).
     verifier = cx.registry.resolve_verifier(self.evaluator)
@@ -3058,7 +3064,7 @@ async def _run_ralph_config(self: RalphConfig, cx: ExecutionContext) -> Strategy
         return executor
     task = cx._current_task()
     on_stream = cx.stream
-    cx.stream = None
+    cx.stream = wrap_node_sink(on_stream, "ralph", None)
     cx.scratch.run_session = SessionState()
     max_resets = max(executor.ralph_max_resets(), 1)
 
@@ -3176,7 +3182,7 @@ async def _run_hill_climbing_config(
     session_id = task.session_id
     task_id = task.id
     on_stream = cx.stream
-    cx.stream = None
+    cx.stream = wrap_node_sink(on_stream, "hill_climbing", None)
     carried = cx.scratch.run_budget.model_copy(deep=True)
     cx.scratch.run_session = SessionState()
     direction = self.direction
@@ -3526,17 +3532,60 @@ class BlockKind(str, Enum):
     TOOL_USE = "tool_use"
 
 
-class StreamTurnStart(_Model):
+class NodeAttr(_Model):
+    """Attribution stamped onto every :class:`HarnessStreamEvent` as it flows
+    up through the node-wrapping sinks (mirrors Rust's ``NodeAttr``).
+
+    Lets a multi-agent UI route a frame to the node that produced it.
+    ``agent_id`` is ``None`` for combinator frames; ``path`` is the root→leaf
+    node-kind path (outermost first). Serialized byte-identically to Rust:
+    ``agent_id`` and ``path`` are omitted when empty/``None``.
+    """
+
+    kind: str
+    agent_id: str | None = None
+    depth: int = 0
+    path: list[str] = Field(default_factory=list)
+
+
+class _StreamEvent(_Model):
+    """Base for every harness stream event. Carries the optional ``node``
+    attribution (``None`` for an un-attributed/single-leaf run). Mirrors Rust's
+    ``#[serde(default, skip_serializing_if = "Option::is_none")]`` on ``node``:
+    when ``node`` is ``None`` it is OMITTED from serialized output so an
+    un-attributed event serializes byte-identically to before this field
+    existed."""
+
+    node: NodeAttr | None = None
+
+    def model_dump(self, **kwargs: object) -> dict[str, object]:  # type: ignore[override]
+        out = super().model_dump(**kwargs)
+        if self.node is None and "node" in out:
+            out.pop("node", None)
+        return out
+
+    def model_dump_json(self, **kwargs: object) -> str:  # type: ignore[override]
+        exclude: set[str] = set(kwargs.pop("exclude", set()))  # type: ignore[arg-type]
+        if self.node is None:
+            exclude.add("node")
+        return super().model_dump_json(exclude=exclude, **kwargs)  # type: ignore[arg-type]
+
+
+class StreamTurnStart(_StreamEvent):
     kind: Literal["turn_start"] = "turn_start"
     turn: int
 
 
-class StreamTurnEnd(_Model):
+class StreamTurnEnd(_StreamEvent):
     kind: Literal["turn_end"] = "turn_end"
     turn: int
+    # This turn's token usage, so a live consumer can update PER-TURN. Defaults
+    # to zero so pre-existing serialized events back-compat (matches Rust's
+    # ``#[serde(default)]``).
+    usage: TokenUsage = Field(default_factory=TokenUsage)
 
 
-class StreamToolCall(_Model):
+class StreamToolCall(_StreamEvent):
     kind: Literal["tool_call"] = "tool_call"
     call_id: str
     name: str
@@ -3545,33 +3594,59 @@ class StreamToolCall(_Model):
     args: dict[str, Any] = Field(default_factory=dict)
 
 
-class StreamToolResult(_Model):
+class StreamToolResult(_StreamEvent):
     kind: Literal["tool_result"] = "tool_result"
     call_id: str
     is_error: bool
     # The tool result content (issue #103, Q5). Defaults to ``""`` so pre-#103
     # serialized events round-trip (back-compat).
     content: str = ""
+    # ``True`` when this event REPLACES a ``ToolResult`` already emitted for the
+    # same ``call_id`` because an ``AfterTool`` middleware rewrote the result
+    # in place (``ContinueWithModification``, issue #11 / SC-9). Defaults to
+    # ``False`` for back-compat. Mirrors Rust's ``revised`` field.
+    revised: bool = False
 
 
-class StreamFinalResponse(_Model):
+class StreamFinalResponse(_StreamEvent):
     kind: Literal["final_response"] = "final_response"
     content: str
 
 
-class StreamBudgetWarning(_Model):
+class StreamBudgetWarning(_StreamEvent):
     kind: Literal["budget_warning"] = "budget_warning"
     limit_type: BudgetLimitTypeT
 
 
-class StreamUserMessage(_Model):
+class StreamUserMessage(_StreamEvent):
     """Out-of-band, prominent message to the user (issue #81). Emitted by the
     loop when the ``send_message`` tool runs, INSTEAD of collapsing the content
-    into a normal tool result. The harness only emits the event — rendering it
-    prominently is the architect's UI concern."""
+    into a normal tool result — OR when a queued steering message is injected
+    into the run (:func:`StandardHarness` ``steering_source``). The harness only
+    emits the event — rendering it prominently is the architect's UI concern."""
 
     kind: Literal["user_message"] = "user_message"
     content: str
+    # ``True`` when this is a USER-authored steering message injected at a turn
+    # boundary; ``False`` when emitted by the ``send_message`` tool. Defaults to
+    # ``False`` for back-compat. Mirrors Rust's ``steered`` field.
+    steered: bool = False
+
+
+class StreamToolProgress(_StreamEvent):
+    """Live output from a RUNNING tool (pi-style bash streaming): emitted at
+    most every ~100ms while a command runs, between the tool's
+    :class:`StreamToolCall` and its :class:`StreamToolResult`. ``preview`` is a
+    sanitized TAIL SNAPSHOT of the output so far — each event REPLACES the
+    previous preview (never append); the final full output still arrives on the
+    :class:`StreamToolResult`. Purely informational: never persisted to the
+    session and absent from the model conversation. Mirrors Rust's
+    ``StreamEvent::ToolProgress``."""
+
+    kind: Literal["tool_progress"] = "tool_progress"
+    call_id: str
+    name: str
+    preview: str = ""
 
 
 # ── Delta-level streaming (issue #103) ──────────────────────────────────────
@@ -3602,21 +3677,21 @@ class StreamUserMessage(_Model):
 # a stream that somehow omitted the start frame.
 
 
-class StreamTextDelta(_Model):
+class StreamTextDelta(_StreamEvent):
     """Streamed text fragment (``model`` ``ContentBlockDelta``)."""
 
     kind: Literal["text_delta"] = "text_delta"
     content: str
 
 
-class StreamReasoningDelta(_Model):
+class StreamReasoningDelta(_StreamEvent):
     """Streamed reasoning/thinking fragment (``model`` ``ThinkingDelta``). Q4."""
 
     kind: Literal["reasoning_delta"] = "reasoning_delta"
     content: str
 
 
-class StreamToolArgsDelta(_Model):
+class StreamToolArgsDelta(_StreamEvent):
     """Streamed tool-argument JSON fragment (``model`` ``ToolUseDelta``),
     correlated to a ``call_id`` via the open-block index."""
 
@@ -3625,7 +3700,7 @@ class StreamToolArgsDelta(_Model):
     partial_json: str
 
 
-class StreamBlockStart(_Model):
+class StreamBlockStart(_StreamEvent):
     """A content block opened (Q2). Emitted the first time a delta for an index
     is seen."""
 
@@ -3634,14 +3709,14 @@ class StreamBlockStart(_Model):
     block: BlockKind
 
 
-class StreamBlockStop(_Model):
+class StreamBlockStop(_StreamEvent):
     """A content block closed (``model`` ``ContentBlockStop``). Q2."""
 
     kind: Literal["block_stop"] = "block_stop"
     index: int
 
 
-class StreamToolCallStart(_Model):
+class StreamToolCallStart(_StreamEvent):
     """A tool-use block opened (issue #103). Emitted so consumers can correlate
     the subsequent :class:`StreamToolArgsDelta` fragments and the final coarse
     :class:`StreamToolCall` by ``call_id``. The ``name`` and ``call_id`` are the
@@ -3654,7 +3729,7 @@ class StreamToolCallStart(_Model):
     name: str
 
 
-class StreamToolErrorLoopDetected(_Model):
+class StreamToolErrorLoopDetected(_StreamEvent):
     """The consecutive-recoverable-tool-error breaker DETECTED a loop (issue
     #137): ``tool`` hit ``error_loop_threshold`` (``N``) consecutive
     identical-argument recoverable errors and ONE corrective message was
@@ -3667,7 +3742,7 @@ class StreamToolErrorLoopDetected(_Model):
     consecutive_errors: int
 
 
-class StreamToolErrorLoopBroken(_Model):
+class StreamToolErrorLoopBroken(_StreamEvent):
     """The consecutive-recoverable-tool-error breaker TRIPPED (issue #137):
     ``tool`` reached ``2 * error_loop_threshold`` (``2 * N``) consecutive
     identical-argument recoverable errors and the loop STOPPED to resolve the
@@ -3679,7 +3754,7 @@ class StreamToolErrorLoopBroken(_Model):
     consecutive_errors: int
 
 
-class StreamOutputSchemaRetry(_Model):
+class StreamOutputSchemaRetry(_StreamEvent):
     """Output-schema enforcement (issue #139) fed a validation error back and
     RETRIED: the terminal ``FinalResponse`` failed validation against the leaf's
     ``output`` schema and a retry turn was granted (within budget). A warning —
@@ -3692,7 +3767,7 @@ class StreamOutputSchemaRetry(_Model):
     error: str
 
 
-class StreamOutputSchemaViolation(_Model):
+class StreamOutputSchemaViolation(_StreamEvent):
     """Output-schema enforcement (issue #139) EXHAUSTED its retries: the terminal
     still failed validation after ``output_schema_max_retries`` extra turns (with
     budget remaining), so the run terminates with
@@ -3713,6 +3788,7 @@ HarnessStreamEvent = Annotated[
     | StreamFinalResponse
     | StreamBudgetWarning
     | StreamUserMessage
+    | StreamToolProgress
     | StreamTextDelta
     | StreamReasoningDelta
     | StreamToolArgsDelta
@@ -3727,6 +3803,32 @@ HarnessStreamEvent = Annotated[
 ]
 
 StreamSink = Callable[[HarnessStreamEvent], None]
+
+
+def wrap_node_sink(
+    parent: StreamSink | None, kind: str, agent_id: str | None = None
+) -> StreamSink | None:
+    """Wrap a parent sink so every event passing through is stamped for ONE
+    node (mirrors Rust's ``wrap_node_sink``).
+
+    The leaf installs the innermost wrapper (it sets ``kind``/``agent_id``/seeds
+    the ``path``); each enclosing combinator's wrapper PREPENDS its kind to
+    ``path`` and bumps ``depth``. Stamping is set-once for ``kind``/
+    ``agent_id`` (the innermost leaf wins) so the event reports who actually
+    spoke, with the full nesting in ``path``. Returns ``None`` when there is no
+    parent sink (no-op, baseline path)."""
+    if parent is None:
+        return None
+
+    def _wrapped(ev: HarnessStreamEvent) -> None:
+        if ev.node is None:
+            ev.node = NodeAttr(kind=kind, agent_id=agent_id, depth=0, path=[kind])
+        else:
+            ev.node.path.insert(0, kind)
+            ev.node.depth += 1
+        parent(ev)
+
+    return _wrapped
 
 
 class TurnStreamState:
@@ -8028,16 +8130,40 @@ class StandardHarness:
             for call in pending:
                 # Drain path: flatten a tool-surfaced sandbox violation per the
                 # policy — no place to issue a typed halt here (#150).
+                self._emit(
+                    on_stream, StreamToolCall(call_id=call.id, name=call.name, args=call.input)
+                )
                 output = self._normalize_sandbox_violation(await tool_registry.dispatch(call))
                 tr = HarnessToolResult(call_id=call.id, output=output)
+                is_err = isinstance(output, ToolOutputError)
+                self._emit(
+                    on_stream,
+                    StreamToolResult(
+                        call_id=call.id,
+                        is_error=is_err,
+                        content=self._tool_output_text(output),
+                    ),
+                )
                 await self._config.context_manager.append_tool_result(session_state, tr)
 
         elif isinstance(response, HumanResponseAllowWithModification):
             for call in response.calls:
                 # Drain path: flatten a tool-surfaced sandbox violation per the
                 # policy — no place to issue a typed halt here (#150).
+                self._emit(
+                    on_stream, StreamToolCall(call_id=call.id, name=call.name, args=call.input)
+                )
                 output = self._normalize_sandbox_violation(await tool_registry.dispatch(call))
                 tr = HarnessToolResult(call_id=call.id, output=output)
+                is_err = isinstance(output, ToolOutputError)
+                self._emit(
+                    on_stream,
+                    StreamToolResult(
+                        call_id=call.id,
+                        is_error=is_err,
+                        content=self._tool_output_text(output),
+                    ),
+                )
                 await self._config.context_manager.append_tool_result(session_state, tr)
 
         # SC-BUG-1: an Allow / Deny / Answer / Reject resume that surfaced from
@@ -9889,7 +10015,12 @@ class StandardHarness:
             span_seq += 1
             current_turn_base = turn_base
 
-            self._emit(on_stream, StreamTurnEnd(turn=budget_used.turns))
+            # Per-turn token usage on TurnEnd (mirrors Rust's `TurnEnd.usage`).
+            if isinstance(result, TurnError):
+                turn_usage = result.usage if result.usage is not None else TokenUsage()
+            else:
+                turn_usage = result.usage
+            self._emit(on_stream, StreamTurnEnd(turn=budget_used.turns, usage=turn_usage))
 
             # ---- FinalResponse --------------------------------------
             if isinstance(result, FinalResponse):
@@ -10237,6 +10368,11 @@ class StandardHarness:
                 # place (via ``ContextManager.replace_tool_result``). Captured at
                 # append time so it survives the #137 corrective-message interleaving.
                 result_msg_indices: list[int] = []
+                # SC-9: pre-rewrite stream view (is_error, content) per result,
+                # captured so the AfterTool ``ContinueWithModification`` path can
+                # re-emit a ``revised=True`` ``StreamToolResult`` ONLY for results
+                # the chain actually changed (mirrors Rust's `pre_views`).
+                pre_views: list[tuple[bool, str]] = []
                 for i, call in enumerate(calls):
                     # Sandbox validation. The pre-dispatch ``validate`` seam
                     # honours the SAME policy as tool-surfaced violations
@@ -10271,6 +10407,7 @@ class StandardHarness:
                         await config.context_manager.append_tool_result(session_state, tr)
                         result_msg_indices.append(max(len(session_state.messages) - 1, 0))
                         approved_results.append(tr)
+                        pre_views.append((True, f"sandbox: {violation.kind}"))
                         continue
 
                     self._emit(
@@ -10660,14 +10797,16 @@ class StandardHarness:
                         span_seq += 1
 
                     tr = HarnessToolResult(call_id=call.id, output=output)
+                    result_content = self._tool_output_text(output)
                     self._emit(
                         on_stream,
                         StreamToolResult(
                             call_id=call.id,
                             is_error=is_error,
-                            content=self._tool_output_text(output),
+                            content=result_content,
                         ),
                     )
+                    pre_views.append((is_error, result_content))
                     await config.context_manager.append_tool_result(session_state, tr)
                     # SC-9: record this result's message index BEFORE the #137
                     # corrective user message may be appended, so the index points
@@ -10705,6 +10844,25 @@ class StandardHarness:
                         if replacer is not None:
                             for res, idx in zip(approved_results, result_msg_indices, strict=False):
                                 await replacer(session_state, idx, res)
+                        # Symmetric stream-side correction (mirrors Rust): the model
+                        # side was patched above, but the ``StreamToolResult`` already
+                        # on the stream still shows the stale content. Re-emit with
+                        # ``revised=True`` ONLY for results the chain actually changed,
+                        # so consumers correct in place rather than double-count by
+                        # ``call_id``.
+                        for res, pre in zip(approved_results, pre_views, strict=False):
+                            new_is_error = isinstance(res.output, ToolOutputError)
+                            new_content = self._tool_output_text(res.output)
+                            if (new_is_error, new_content) != pre:
+                                self._emit(
+                                    on_stream,
+                                    StreamToolResult(
+                                        call_id=res.call_id,
+                                        is_error=new_is_error,
+                                        content=new_content,
+                                        revised=True,
+                                    ),
+                                )
                     elif isinstance(decision, MiddlewareHalt):
                         return self._fail(
                             HaltReasonMiddlewareHalt(hook="after_tool", reason=decision.reason),

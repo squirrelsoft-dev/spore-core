@@ -372,4 +372,11 @@ async def test_fixture_replay_matches_golden_event_order() -> None:
         f"event count mismatch:\n got: {delta_events}\n exp: {expected}"
     )
     for got, exp in zip(delta_events, expected, strict=True):
-        assert got == exp, f"event mismatch: {got} != {exp}"
+        # #stream: this golden asserts delta ORDERING/content (#103), not node
+        # attribution — strip the (now-present) ``node`` so the SHARED
+        # cross-language fixture stays byte-identical. Attribution has its own
+        # test (test_harness_stream_events). Mirrors Rust's `*got_norm.node_mut()
+        # = None;` normalization.
+        got_norm = got.model_copy(deep=True)
+        got_norm.node = None
+        assert got_norm == exp, f"event mismatch: {got_norm} != {exp}"
