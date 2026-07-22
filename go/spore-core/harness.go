@@ -3381,6 +3381,10 @@ type HarnessConfig struct {
 	// violation). Read it via effectiveOutputSchemaMaxRetries.
 	OutputSchemaMaxRetries *uint32
 
+	// PlanEmptyMaxRetries is the N empty-plan re-asks before HaltEmptyPlan
+	// (nil/default 0 preserves immediate empty_plan).
+	PlanEmptyMaxRetries *uint32
+
 	// MaxResets is the outer-loop context-window reset cap for the Ralph loop
 	// strategy (issue #58, B3): the maximum number of context windows the
 	// multi-context-window continuation loop runs before halting with
@@ -3680,6 +3684,12 @@ func (c HarnessConfig) WithChunkProvider(provider any) HarnessConfig {
 	return c
 }
 
+// WithPlanEmptyMaxRetries sets the number of empty-plan re-asks before HaltEmptyPlan.
+func (c HarnessConfig) WithPlanEmptyMaxRetries(retries uint32) HarnessConfig {
+	c.PlanEmptyMaxRetries = &retries
+	return c
+}
+
 // WithRegistry replaces the whole ExecutionRegistry (issue #120) and returns the
 // updated config (value-receiver fluent style). The registry resolves a task's
 // serializable strategy handles and StrategyRef.Custom keys at run entry.
@@ -3826,6 +3836,13 @@ func (c HarnessConfig) effectiveOutputSchemaMaxRetries() uint32 {
 		return 2
 	}
 	return *c.OutputSchemaMaxRetries
+}
+
+func (c HarnessConfig) effectivePlanEmptyMaxRetries() uint32 {
+	if c.PlanEmptyMaxRetries == nil {
+		return 0
+	}
+	return *c.PlanEmptyMaxRetries
 }
 
 // durableNamespace returns the key axis for DURABLE artifacts (#142): the pinned

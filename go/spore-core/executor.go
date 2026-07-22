@@ -190,6 +190,9 @@ type StrategyExecutor interface {
 	// 1 + N). Read by ReactConfig.Run to thread into the window. Default 2.
 	OutputSchemaMaxRetries() uint32
 
+	// PlanEmptyMaxRetries is the number of empty-plan re-asks before HaltEmptyPlan.
+	PlanEmptyMaxRetries() uint32
+
 	// HillEvaluate runs one HillClimbing metric evaluation on the resolved
 	// evaluator over a fresh SessionState (#124). On success ok is true and
 	// (value, dur) carry the result; on failure ok is false and (errStatus,

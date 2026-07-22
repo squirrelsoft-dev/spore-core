@@ -1004,6 +1004,9 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 		// list is still empty). Seed the PLAN session from the carried conversation
 		// so the planner CONTINUES on it instead of starting fresh — and consume the
 		// seed here so the execute-phase re-attach below does not also fire.
+		planEmptyRetries := executor.PlanEmptyMaxRetries()
+		var planEmptyAttempts uint32
+	retryPlan:
 		planResume := resumeSeedSession != nil && !preexistingHasInProgress(preexisting)
 		directive := executor.PlanDirective(task.Instruction)
 		var planSession SessionState
@@ -1075,6 +1078,19 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 			taskList = PlanArtifactToTaskList(outcome.Artifact)
 		}
 		if len(taskList.Tasks) == 0 {
+			if planEmptyAttempts < planEmptyRetries {
+				planEmptyAttempts++
+				retryContent := planResult.Output
+				if retryContent == "" {
+					retryContent = `{"tasks":[]}`
+				}
+				baseSession = planResult.SessionState
+				executor.SeedUserMessage(ctx, &baseSession, retryContent)
+				budget.Turns = outcome.Turns
+				budget.InputTokens += uint64(outcome.Usage.InputTokens)
+				budget.OutputTokens += uint64(outcome.Usage.OutputTokens)
+				goto retryPlan
+			}
 			result := RunResult{
 				Kind:      RunFailure,
 				Reason:    HaltReason{Kind: HaltEmptyPlan},
