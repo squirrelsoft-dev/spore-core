@@ -802,6 +802,16 @@ from .prompt_tool_call import (
     inject_tool_prompt,
     parse_prose_response,
 )
+from .tool_call_repair import (
+    MalformedJson,
+    ProseResponse,
+    StandardToolCallRepair,
+    ToolCallFailure,
+    ToolCallRepair,
+    UnknownTool,
+    coerce_tool_args,
+    detect_prose_response as detect_prose_tool_call_failure,
+)
 
 __all__ = [
     "ALL_EVENTS",
@@ -1552,4 +1562,13 @@ __all__ = [
     "detect_prose_response",
     "inject_tool_prompt",
     "parse_prose_response",
+    # Tool-call repair (#parity)
+    "MalformedJson",
+    "ProseResponse",
+    "StandardToolCallRepair",
+    "ToolCallFailure",
+    "ToolCallRepair",
+    "UnknownTool",
+    "coerce_tool_args",
+    "detect_prose_tool_call_failure",
 ]

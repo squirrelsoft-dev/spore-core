@@ -5999,6 +5999,8 @@ class HarnessConfig:
         registry: ExecutionRegistry | None = None,
         escalation_mode: EscalationMode | None = None,
         steering_source: Callable[[], list[str]] | None = None,
+        tool_call_repair: Any | None = None,
+        max_repair_attempts: int = 1,
     ) -> None:
         # #124: the legacy single-collaborator fields (``agent`` / ``verifier`` /
         # ``planner_agent`` / ``evaluator_agent`` / ``metric_evaluator``) are GONE
@@ -6282,6 +6284,13 @@ class HarnessConfig:
         # and emitted as a ``StreamUserMessage(steered=True)``. ``None`` (default)
         # disables steering. Mirrors Rust's ``HarnessConfig::steering_source``.
         self.steering_source: Callable[[], list[str]] | None = steering_source
+        # Tool-call repair (mirrors Rust's ``HarnessConfig::tool_call_repair``):
+        # an optional :class:`~spore_core.tool_call_repair.ToolCallRepair`
+        # applied on a recoverable dispatch error. ``None`` (default) disables
+        # repair — behaviour is byte-identical to pre-repair. ``max_repair_attempts``
+        # bounds re-dispatch (default ``1``).
+        self.tool_call_repair = tool_call_repair
+        self.max_repair_attempts: int = max_repair_attempts
 
     def with_sandbox(self, sandbox: SandboxProvider) -> HarnessConfig:
         """A full copy of this config with only ``sandbox`` swapped (#124). Every
@@ -6328,6 +6337,8 @@ class HarnessConfig:
             registry=self.registry,
             escalation_mode=self.escalation_mode,
             steering_source=self.steering_source,
+            tool_call_repair=self.tool_call_repair,
+            max_repair_attempts=self.max_repair_attempts,
         )
 
 
@@ -6486,6 +6497,9 @@ class HarnessBuilder:
         self._prompt_tool_call_flag: PromptToolCallFlag | None = None
         # Mid-run steering callback (pi-style). ``None`` disables steering.
         self._steering_source: Callable[[], list[str]] | None = None
+        # Tool-call repair (None disables; default 1 attempt).
+        self._tool_call_repair: Any | None = None
+        self._max_repair_attempts: int = 1
         # Per-kind consult handlers (issue #114). Empty by default — consults
         # degrade gracefully (R6). Populated via :meth:`consult_handler`.
         self._consult_handlers: dict[str, ConsultHandlerEntry] = {}
@@ -6936,6 +6950,15 @@ class HarnessBuilder:
         self._steering_source = source
         return self
 
+    def tool_call_repair(self, repair: Any, max_repair_attempts: int = 1) -> HarnessBuilder:
+        """Wire a :class:`~spore_core.tool_call_repair.ToolCallRepair` strategy
+        applied on a recoverable dispatch error (coerce weak-model tool args and
+        re-dispatch). ``max_repair_attempts`` bounds re-dispatch (default ``1``).
+        Mirrors Rust's ``HarnessBuilder::tool_call_repair``."""
+        self._tool_call_repair = repair
+        self._max_repair_attempts = max_repair_attempts
+        return self
+
     def drain_tools_into_registry(self) -> StandardToolRegistry:
         """Drain the accumulated catalogue tools into a populated
         :class:`StandardToolRegistry`, registering each with last-wins upsert
@@ -7219,6 +7242,8 @@ class HarnessBuilder:
             registry=self._registry,
             escalation_mode=self._escalation_mode,
             steering_source=self._steering_source,
+            tool_call_repair=self._tool_call_repair,
+            max_repair_attempts=self._max_repair_attempts,
         )
 
     def build(self) -> StandardHarness:
@@ -7682,6 +7707,70 @@ class StandardHarness:
         )
         return ToolOutputError(message=enriched, recoverable=True)
 
+    @staticmethod
+    def _is_param_error(message: str) -> bool:
+        """Whether a recoverable tool-error message is a PARAMETER problem (a
+        malformed call) rather than a command/runtime failure. Only
+        parameter-shaped errors benefit from the schema+hint enrichment.
+        Mirrors Rust's ``is_param_error``."""
+        m = message.lower()
+        return (
+            "invalid parameters" in m
+            or "invalid type" in m
+            or "missing required field" in m
+            or "missing field" in m
+            or "schema validation failed" in m
+            or "unknown field" in m
+            or "unknown variant" in m
+        )
+
+    async def _dispatch_with_repair(
+        self,
+        tool_registry: ToolRegistry,
+        call: ToolCall,
+    ) -> tuple[ToolCall, ToolOutput]:
+        """Dispatch a tool call, applying the configured tool-call repair on a
+        recoverable error: coerce the arguments and re-dispatch up to
+        ``max_repair_attempts``, enriching the error (schema + hint) when repair
+        gives up. Returns the call ACTUALLY dispatched (the repaired variant
+        when repair fired) and its final output. Mirrors Rust's
+        ``StandardHarness::dispatch_with_repair``."""
+        effective_call = call
+        output = await tool_registry.dispatch(effective_call)
+        repair = self._config.tool_call_repair
+        if repair is None:
+            return effective_call, output
+        attempts_left = self._config.max_repair_attempts
+        while attempts_left > 0:
+            if not (isinstance(output, ToolOutputError) and output.recoverable):
+                break
+            message = output.message
+            schema = next(
+                (s for s in tool_registry.schemas() if s.name == effective_call.name),
+                None,
+            )
+            repaired_call = repair.repair(effective_call, message, schema)
+            if repaired_call is None:
+                # Repair gave up. Enrich with the schema+hint ONLY for a
+                # parameter-shaped error; a command/runtime failure is left raw.
+                if self._is_param_error(message):
+                    output = self._enrich_tool_error(message, schema)
+                break
+            attempts_left -= 1
+            effective_call = repaired_call
+            output = await tool_registry.dispatch(effective_call)
+            if not (isinstance(output, ToolOutputError) and output.recoverable):
+                break
+            if attempts_left == 0:
+                message = output.message
+                if self._is_param_error(message):
+                    schema = next(
+                        (s for s in tool_registry.schemas() if s.name == effective_call.name),
+                        None,
+                    )
+                    output = self._enrich_tool_error(message, schema)
+        return effective_call, output
+
     @classmethod
     async def _drive_turn(
         cls,
@@ -8038,7 +8127,9 @@ class StandardHarness:
                     # Drain path: no place to issue a typed halt here, so flatten
                     # any tool-surfaced sandbox violation to a recoverable-vs-halt
                     # error per the policy (#150).
-                    output = self._normalize_sandbox_violation(await tool_registry.dispatch(call))
+                    output = self._normalize_sandbox_violation(
+                        (await self._dispatch_with_repair(tool_registry, call))[1]
+                    )
                     tr = HarnessToolResult(call_id=call.id, output=output)
                     await self._config.context_manager.append_tool_result(session_state, tr)
             # SC-BUG-1: a clarification that surfaced from inside a composed tree
@@ -8203,7 +8294,9 @@ class StandardHarness:
                 self._emit(
                     on_stream, StreamToolCall(call_id=call.id, name=call.name, args=call.input)
                 )
-                output = self._normalize_sandbox_violation(await tool_registry.dispatch(call))
+                output = self._normalize_sandbox_violation(
+                    (await self._dispatch_with_repair(tool_registry, call))[1]
+                )
                 tr = HarnessToolResult(call_id=call.id, output=output)
                 is_err = isinstance(output, ToolOutputError)
                 self._emit(
@@ -8223,7 +8316,9 @@ class StandardHarness:
                 self._emit(
                     on_stream, StreamToolCall(call_id=call.id, name=call.name, args=call.input)
                 )
-                output = self._normalize_sandbox_violation(await tool_registry.dispatch(call))
+                output = self._normalize_sandbox_violation(
+                    (await self._dispatch_with_repair(tool_registry, call))[1]
+                )
                 tr = HarnessToolResult(call_id=call.id, output=output)
                 is_err = isinstance(output, ToolOutputError)
                 self._emit(
@@ -8348,7 +8443,9 @@ class StandardHarness:
             for call in rest:
                 # Drain path: flatten a tool-surfaced sandbox violation per the
                 # policy — no place to issue a typed halt here (#150).
-                output = self._normalize_sandbox_violation(await tool_registry.dispatch(call))
+                output = self._normalize_sandbox_violation(
+                    (await self._dispatch_with_repair(tool_registry, call))[1]
+                )
                 tr = HarnessToolResult(call_id=call.id, output=output)
                 await self._config.context_manager.append_tool_result(session_state, tr)
 
@@ -10498,7 +10595,7 @@ class StandardHarness:
                     )
                     tool_started_at = _now()
                     tool_clock = time.monotonic()
-                    output = await tool_registry.dispatch(call)
+                    call, output = await self._dispatch_with_repair(tool_registry, call)
 
                     # Tool-surfaced sandbox violation: the HARNESS decides
                     # halt-vs-recoverable per ``sandbox_violation_policy``, not
