@@ -18,6 +18,9 @@ import {
 } from "../model/provider-http.js";
 import type { EmbeddingInfo, EmbeddingModel } from "./types.js";
 
+/** A fetch-like function (permissive first param so test mocks fit without casts). */
+export type FetchFn = (url: string, init: RequestInit) => Promise<Response>;
+
 const defaultSleep: SleepFn = (ms) =>
   new Promise<void>((resolve) => {
     setTimeout(resolve, ms);
@@ -54,9 +57,9 @@ export class OllamaEmbeddingModel implements EmbeddingModel {
   private readonly baseUrl: string;
   private readonly dims: number;
   private readonly timeoutMs: number;
-  private readonly fetchImpl: typeof fetch;
+  private readonly fetchImpl: FetchFn;
 
-  constructor(modelId: string, opts: { baseUrl?: string; dimensions?: number; timeoutMs?: number; fetchImpl?: typeof fetch } = {}) {
+  constructor(modelId: string, opts: { baseUrl?: string; dimensions?: number; timeoutMs?: number; fetchImpl?: FetchFn } = {}) {
     this.modelId = modelId;
     this.baseUrl = opts.baseUrl ?? OllamaEmbeddingModel.DEFAULT_BASE_URL;
     this.dims = opts.dimensions ?? 0;
@@ -200,13 +203,13 @@ export class OpenAIEmbeddingModel implements EmbeddingModel {
   private readonly dims: number;
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
-  private readonly fetchImpl: typeof fetch;
+  private readonly fetchImpl: FetchFn;
   private readonly sleep: SleepFn;
 
   constructor(
     apiKey: string,
     modelId: string,
-    opts: { baseUrl?: string; dimensions?: number; timeoutMs?: number; maxRetries?: number; fetchImpl?: typeof fetch; sleep?: SleepFn } = {},
+    opts: { baseUrl?: string; dimensions?: number; timeoutMs?: number; maxRetries?: number; fetchImpl?: FetchFn; sleep?: SleepFn } = {},
   ) {
     this.apiKey = apiKey;
     this.modelId = modelId;
@@ -219,7 +222,7 @@ export class OpenAIEmbeddingModel implements EmbeddingModel {
   }
 
   /** Read the key from `envVar` (rejects unset/empty). */
-  static fromEnv(envVar: string, modelId: string, opts: { baseUrl?: string; dimensions?: number; timeoutMs?: number; maxRetries?: number; fetchImpl?: typeof fetch; sleep?: SleepFn } = {}): OpenAIEmbeddingModel {
+  static fromEnv(envVar: string, modelId: string, opts: { baseUrl?: string; dimensions?: number; timeoutMs?: number; maxRetries?: number; fetchImpl?: FetchFn; sleep?: SleepFn } = {}): OpenAIEmbeddingModel {
     return new OpenAIEmbeddingModel(keyFromEnv(envVar), modelId, opts);
   }
 

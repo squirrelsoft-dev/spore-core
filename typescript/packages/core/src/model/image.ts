@@ -12,7 +12,7 @@ import { Buffer } from "node:buffer";
 import { readFile } from "node:fs/promises";
 import { extname } from "node:path";
 
-import type { ContentBlock } from "./schemas.js";
+import type { Content } from "./schemas.js";
 
 /**
  * The image media type for a file extension, or `null` if it is not a format
@@ -43,19 +43,19 @@ export function isImagePath(path: string): boolean {
 }
 
 /**
- * Base64-encode raw image `bytes` of `mediaType` into a `ContentBlock` image.
+ * Base64-encode raw image `bytes` of `mediaType` into a `Content` image block.
  * Pure (no I/O) so callers that already hold bytes can reuse the same encoding
  * the file-path helper uses.
  */
-export function imageContent(mediaType: string, bytes: Uint8Array): ContentBlock {
+export function imageContent(mediaType: string, bytes: Uint8Array): Content {
   return { type: "image", media_type: mediaType, data: toBase64(bytes) };
 }
 
 /**
- * Read an image file at `path` into a `ContentBlock` image. Rejects if the
+ * Read an image file at `path` into a `Content` image block. Rejects if the
  * extension is unrecognized or the file cannot be read.
  */
-export async function loadImageContent(path: string): Promise<ContentBlock> {
+export async function loadImageContent(path: string): Promise<Content> {
   const ext = extname(path);
   const mediaType = mediaTypeForExtension(ext.slice(1));
   if (mediaType == null) {

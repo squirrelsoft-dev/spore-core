@@ -218,7 +218,7 @@ describe("Tool-error-loop breaker (#137) — AC2 corrective injection", () => {
     expect(r.kind).toBe("success");
     if (r.kind !== "success") return;
 
-    const users = userMessages(r.session_state.messages);
+    const users = userMessages(r.session_state!.messages);
     const correctives = users.filter((m) => m.includes("Expected parameter schema"));
     expect(correctives.length).toBe(1);
     const corrective = correctives[0]!;

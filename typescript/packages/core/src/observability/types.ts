@@ -280,7 +280,7 @@ export function truncateField(s: string, max: number): [string, boolean] {
   // Back off to the largest UTF-8 char boundary <= max. A boundary byte is one
   // that is NOT a UTF-8 continuation byte (0b10xxxxxx).
   let boundary = max;
-  while (boundary > 0 && (bytes[boundary] & 0xc0) === 0x80) {
+  while (boundary > 0 && (bytes[boundary]! & 0xc0) === 0x80) {
     boundary -= 1;
   }
   const clipped = new TextDecoder("utf-8").decode(bytes.subarray(0, boundary));

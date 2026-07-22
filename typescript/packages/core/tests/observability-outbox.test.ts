@@ -128,7 +128,7 @@ describe("OutboxObservabilityProvider — durable JSONL outbox", () => {
     const root = tmpRoot();
     const obs = provider(root);
     obs.emitTurn(turn("s1", "sp1"));
-    const l = readLines(root, "s1")[0];
+    const l = readLines(root, "s1")[0]!;
     expect(l.kind).toBe("turn");
     expect(l.level).toBe("info");
     expect(l.span_id).toBe("sp1");
@@ -161,7 +161,7 @@ describe("OutboxObservabilityProvider — durable JSONL outbox", () => {
         { kind: "parameter_coercion", field: "a", from: "string", to: "number" },
       ),
     );
-    const l = readLines(root, "s1")[0];
+    const l = readLines(root, "s1")[0]!;
     expect(l.kind).toBe("patch");
     expect(l.level).toBe("warn");
     expect((attrs(l).patch_type as Record<string, unknown>).kind).toBe("parameter_coercion");
@@ -176,12 +176,12 @@ describe("OutboxObservabilityProvider — durable JSONL outbox", () => {
     obs.emitTurn(turn("s1", "err", { kind: "error", message: "boom" }));
     obs.emitTurn(turn("s1", "halt", { kind: "halted", reason: "stop" }));
     const lines = readLines(root, "s1");
-    expect(lines[0].status).toBe("ok");
-    expect(lines[0].status_detail).toBeNull();
-    expect(lines[1].status).toBe("error");
-    expect(lines[1].status_detail).toBe("boom");
-    expect(lines[2].status).toBe("halted");
-    expect(lines[2].status_detail).toBe("stop");
+    expect(lines[0]!.status).toBe("ok");
+    expect(lines[0]!.status_detail).toBeNull();
+    expect(lines[1]!.status).toBe("error");
+    expect(lines[1]!.status_detail).toBe("boom");
+    expect(lines[2]!.status).toBe("halted");
+    expect(lines[2]!.status_detail).toBe("stop");
   });
 
   it("distinguishes context_assembly from compaction kind", () => {
@@ -200,10 +200,10 @@ describe("OutboxObservabilityProvider — durable JSONL outbox", () => {
     );
     obs.emitContext(mk("comp", { kind: "compaction", messages_removed: 5, tokens_reclaimed: 50 }));
     const lines = readLines(root, "s1");
-    expect(lines[0].kind).toBe("context_assembly");
-    expect((attrs(lines[0]).operation as Record<string, unknown>).kind).toBe("assembly");
-    expect(lines[1].kind).toBe("compaction");
-    expect((attrs(lines[1]).operation as Record<string, unknown>).kind).toBe("compaction");
+    expect(lines[0]!.kind).toBe("context_assembly");
+    expect((attrs(lines[0]!).operation as Record<string, unknown>).kind).toBe("assembly");
+    expect(lines[1]!.kind).toBe("compaction");
+    expect((attrs(lines[1]!).operation as Record<string, unknown>).kind).toBe("compaction");
   });
 
   it("writes sensor and middleware lines (info level, verbatim attributes)", () => {
@@ -223,14 +223,14 @@ describe("OutboxObservabilityProvider — durable JSONL outbox", () => {
       decision: { kind: "continue" } as middleware.MiddlewareDecision,
     });
     const lines = readLines(root, "s1");
-    expect(lines[0].kind).toBe("sensor_evaluation");
-    expect(lines[0].level).toBe("info");
-    expect(attrs(lines[0]).sensor_id).toBe("test-runner");
-    expect((attrs(lines[0]).trigger as Record<string, unknown>).kind).toBe("post_turn");
-    expect(attrs(lines[0]).fired).toBe(true);
-    expect(lines[1].kind).toBe("middleware_hook");
-    expect(attrs(lines[1]).hook).toBe("before_turn");
-    expect((attrs(lines[1]).decision as Record<string, unknown>).kind).toBe("continue");
+    expect(lines[0]!.kind).toBe("sensor_evaluation");
+    expect(lines[0]!.level).toBe("info");
+    expect(attrs(lines[0]!).sensor_id).toBe("test-runner");
+    expect((attrs(lines[0]!).trigger as Record<string, unknown>).kind).toBe("post_turn");
+    expect(attrs(lines[0]!).fired).toBe(true);
+    expect(lines[1]!.kind).toBe("middleware_hook");
+    expect(attrs(lines[1]!).hook).toBe("before_turn");
+    expect((attrs(lines[1]!).decision as Record<string, unknown>).kind).toBe("continue");
   });
 
   it("flushSession writes the session summary line + .flushed marker", async () => {
@@ -242,7 +242,7 @@ describe("OutboxObservabilityProvider — durable JSONL outbox", () => {
       .setSessionOutcome(sid("s1"), { kind: "success" } as guideRegistry.SessionOutcome);
     await obs.flushSession(sid("s1"));
     const lines = readLines(root, "s1");
-    const last = lines[lines.length - 1];
+    const last = lines[lines.length - 1]!;
     expect(last.kind).toBe("session");
     expect(attrs(last).outcome).toBe("success");
     expect(attrs(last).total_turns).toBe(1);
@@ -259,7 +259,7 @@ describe("OutboxObservabilityProvider — durable JSONL outbox", () => {
     await obs.flushSession(sid("s1"));
     const lines = readLines(root, "s1");
     expect(lines).toHaveLength(1);
-    expect(lines[0].kind).toBe("turn");
+    expect(lines[0]!.kind).toBe("turn");
     // Marker is still written.
     expect(existsSync(join(root, "sessions", "s1", ".flushed"))).toBe(true);
   });
@@ -327,8 +327,8 @@ describe("OutboxObservabilityProvider — durable JSONL outbox", () => {
     obs.emitTurn(turn("s2", "c"));
     const s1 = readLines(root, "s1");
     const s2 = readLines(root, "s2");
-    expect(s1[0].trace_id).toBe(s1[1].trace_id);
-    expect(s1[0].trace_id).not.toBe(s2[0].trace_id);
+    expect(s1[0]!.trace_id).toBe(s1[1]!.trace_id);
+    expect(s1[0]!.trace_id).not.toBe(s2[0]!.trace_id);
   });
 });
 
@@ -401,8 +401,9 @@ describe("OutboxObservabilityProvider — cross-language fixture replay", () => 
 describe("InMemoryObservabilityProvider — optional outbox methods", () => {
   it("does not implement listUnflushedSessions / cleanupSession", () => {
     const obs = new InMemoryObservabilityProvider();
-    expect(obs.listUnflushedSessions).toBeUndefined();
-    expect(obs.cleanupSession).toBeUndefined();
+    const probe = obs as unknown as Record<string, unknown>;
+    expect(probe.listUnflushedSessions).toBeUndefined();
+    expect(probe.cleanupSession).toBeUndefined();
   });
 });
 

@@ -100,7 +100,7 @@ export class SetPlanTool implements Tool {
         return {
           kind: "error",
           message: `could not record task ${JSON.stringify(desc)}: ${tasklist.taskListErrorMessage(
-            res.error,
+            res.error.detail,
           )}`,
           recoverable: true,
         };

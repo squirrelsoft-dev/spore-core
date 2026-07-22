@@ -7,7 +7,7 @@ import { OllamaEmbeddingModel, OpenAIEmbeddingModel } from "../src/embedding/sta
 /** A fetch impl that returns scripted responses per request, recording calls. */
 function scriptedFetch(
   responses: Array<{ status?: number; body: unknown; headers?: Record<string, string> }>,
-): { fetch: typeof fetch; calls: Array<{ url: string; init: RequestInit }> } {
+): { fetch: (url: string, init: RequestInit) => Promise<Response>; calls: Array<{ url: string; init: RequestInit }> } {
   const calls: Array<{ url: string; init: RequestInit }> = [];
   let i = 0;
   const f = async (url: string, init: RequestInit): Promise<Response> => {
@@ -19,7 +19,7 @@ function scriptedFetch(
       headers: r.headers,
     });
   };
-  return { fetch: f as unknown as typeof fetch, calls };
+  return { fetch: f, calls };
 }
 
 describe("cosineSimilarity", () => {
@@ -53,7 +53,7 @@ describe("OllamaEmbeddingModel", () => {
       throw new Error("should not be called");
     };
     const model = new OllamaEmbeddingModel("nomic-embed-text", {
-      fetchImpl: fetch as unknown as typeof fetch,
+      fetchImpl: fetch,
       baseUrl: "http://127.0.0.1:1",
     });
     expect(await model.embed([])).toEqual([]);
@@ -66,7 +66,7 @@ describe("OllamaEmbeddingModel", () => {
       throw e;
     };
     const model = new OllamaEmbeddingModel("nomic-embed-text", {
-      fetchImpl: fetch as unknown as typeof fetch,
+      fetchImpl: fetch,
       baseUrl: "http://localhost:11434",
     });
     const err = await model.embed(["x"]).catch((e) => e);
@@ -112,13 +112,13 @@ describe("OpenAIEmbeddingModel", () => {
       );
     };
     const model = new OpenAIEmbeddingModel("test-key", "text-embedding-3-small", {
-      fetchImpl: fetch as unknown as typeof fetch,
+      fetchImpl: fetch,
     });
     const vectors = await model.embed(["a", "b"]);
     // Reordered by `index`, so input "a" (index 0) maps to [0.1, 0.1].
     expect(vectors).toEqual([[0.1, 0.1], [0.9, 0.9]]);
     expect(calls[0]!.url).toBe("https://api.openai.com/v1/embeddings");
-    const headers = new Headers(calls[0]!.init.headers as HeadersInit);
+    const headers = new Headers(calls[0]!.init.headers as Record<string, string>);
     expect(headers.get("authorization")).toBe("Bearer test-key");
   });
 
@@ -131,7 +131,7 @@ describe("OpenAIEmbeddingModel", () => {
       });
     };
     const model = new OpenAIEmbeddingModel("k", "text-embedding-3-small", {
-      fetchImpl: fetch as unknown as typeof fetch,
+      fetchImpl: fetch,
     });
     expect(model.dimensions()).toBe(1536);
     await model.embed(["x"]);
@@ -148,7 +148,7 @@ describe("OpenAIEmbeddingModel", () => {
       });
     };
     const model = new OpenAIEmbeddingModel("k", "text-embedding-ada-002", {
-      fetchImpl: fetch as unknown as typeof fetch,
+      fetchImpl: fetch,
     });
     expect(model.dimensions()).toBe(1536);
     await model.embed(["x"]);
@@ -180,7 +180,7 @@ describe("OpenAIEmbeddingModel", () => {
       });
     };
     const model = new OpenAIEmbeddingModel("k", "text-embedding-3-small", {
-      fetchImpl: fetch as unknown as typeof fetch,
+      fetchImpl: fetch,
       maxRetries: 1,
       sleep: async () => undefined,
     });
@@ -200,7 +200,7 @@ describe("OpenAIEmbeddingModel", () => {
       });
     };
     const model = new OpenAIEmbeddingModel("k", "text-embedding-3-small", {
-      fetchImpl: fetch as unknown as typeof fetch,
+      fetchImpl: fetch,
       maxRetries: 1,
       sleep: async (ms) => {
         slept = ms;
@@ -229,7 +229,7 @@ describe("OpenAIEmbeddingModel", () => {
       throw new Error("should not be called");
     };
     const model = new OpenAIEmbeddingModel("k", "text-embedding-3-small", {
-      fetchImpl: fetch as unknown as typeof fetch,
+      fetchImpl: fetch,
     });
     expect(await model.embed([])).toEqual([]);
   });

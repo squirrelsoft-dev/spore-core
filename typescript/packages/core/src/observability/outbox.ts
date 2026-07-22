@@ -372,6 +372,8 @@ function bareOutcome(outcome: SessionOutcome): string {
       return "failure";
     case "partial":
       return "partial";
+    default:
+      return outcome.kind;
   }
 }
 
@@ -745,7 +747,7 @@ class SessionWriter {
     let maxSeen = 0;
     for (const name of readdirSync(dir)) {
       const m = /^trace-(\d+)\.jsonl$/.exec(name);
-      if (m) maxSeen = Math.max(maxSeen, Number.parseInt(m[1], 10));
+      if (m) maxSeen = Math.max(maxSeen, Number.parseInt(m[1]!, 10));
     }
     return maxSeen + 1;
   }

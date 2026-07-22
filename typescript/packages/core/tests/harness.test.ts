@@ -38,6 +38,7 @@ import {
   type TokenUsage,
   type ToolCall,
   type ToolOutput,
+  type ToolRegistry,
   type ToolResultRecord,
   type ToolSchema,
   type TurnResult,
@@ -210,7 +211,7 @@ describe("Harness — ReAct loop", () => {
     a.push(tcr(toolCall("c", "read")));
     a.push(fr("ack"));
     const cfg = standardConfig(a);
-    cfg.sandbox = new ScriptedSandbox().push({ kind: "path_denied", path: "/p" });
+    cfg.sandbox = new ScriptedSandbox().push({ kind: "path_denied", path: "/p", matched_rule: "test" });
     const h = new StandardHarness(cfg);
     const r = await h.run({ task: react(5) });
     expect(r.kind).toBe("success");
@@ -788,7 +789,7 @@ describe("Harness — modelParams threading (#93)", () => {
     const h = new StandardHarness(recordingConfig(agent, { stop_sequences: [] }));
     await h.run({ task: react(5) });
     expect(agent.seen.length).toBeGreaterThan(0);
-    expect(agent.seen[0].params.structured_tool_calls).not.toBe(true);
+    expect(agent.seen[0]!.params.structured_tool_calls).not.toBe(true);
   });
 
   // (a) ReAct: the ReAct turn context carries the flag.
@@ -799,7 +800,7 @@ describe("Harness — modelParams threading (#93)", () => {
     );
     await h.run({ task: react(5) });
     expect(agent.seen.length).toBeGreaterThan(0);
-    expect(agent.seen[0].params.structured_tool_calls).toBe(true);
+    expect(agent.seen[0]!.params.structured_tool_calls).toBe(true);
   });
 
   // (b) Plan phase: the plan-turn context carries the flag.
@@ -813,7 +814,7 @@ describe("Harness — modelParams threading (#93)", () => {
     await h.run({ task: planTask93() });
     // First captured context is the plan turn.
     expect(agent.seen.length).toBeGreaterThan(0);
-    expect(agent.seen[0].params.structured_tool_calls).toBe(true);
+    expect(agent.seen[0]!.params.structured_tool_calls).toBe(true);
   });
 
   // (c) Execute sub-loops: a full PlanExecute run threads params through the
@@ -842,7 +843,7 @@ describe("Harness — modelParams threading (#93)", () => {
     );
     await h.run({ task: react(5), on_stream: () => {} });
     expect(agent.seen.length).toBeGreaterThan(0);
-    expect(agent.seen[0].params.structured_tool_calls).toBe(true);
+    expect(agent.seen[0]!.params.structured_tool_calls).toBe(true);
   });
 
   // Concatenate the text of a captured context's user/tool messages so we can
@@ -1037,7 +1038,7 @@ describe("Harness — rich middleware chain wired into the loop (#158)", () => {
     const r = await h.run({ task: react(5) });
     expect(r.kind).toBe("success");
     if (r.kind !== "success") throw new Error("expected success");
-    const toolTexts = r.session_state.messages
+    const toolTexts = r.session_state!.messages
       .filter((m) => m.role === "tool" && m.content.type === "text")
       .map((m) => (m.content.type === "text" ? m.content.text : ""));
     expect(toolTexts, `got ${JSON.stringify(toolTexts)}`).toContain("REWRITTEN");
@@ -1152,7 +1153,7 @@ describe("Harness — rich middleware chain wired into the loop (#158)", () => {
     if (r.kind !== "success") throw new Error("expected success");
     expect(r.output, "the forced second turn must win").toBe("second");
     expect(r.turns, "exactly one extra turn was forced").toBe(2);
-    const injected = r.session_state.messages.some(
+    const injected = r.session_state!.messages.some(
       (m) => m.role === "user" && m.content.type === "text" && m.content.text === "keep going",
     );
     expect(injected, "the force_another_turn injection must be recorded").toBe(true);

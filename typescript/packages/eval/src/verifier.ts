@@ -445,7 +445,7 @@ export class LlmJudgeVerifier implements TaskVerifier {
     private readonly params: ModelParams = { stop_sequences: [] },
   ) {}
 
-  async verify(_task: EvalTask, run: RunResult): Promise<VerificationResult> {
+  async verify(_task: EvalTask, run: RunResult, _workspace: string): Promise<VerificationResult> {
     const output = run.kind === "success" ? run.output : "";
     const [lo, hi] = this.scoreRange;
     const prompt = `${this.rubric}\n\nAgent output to evaluate:\n${output}\n\nReply with a single line \`score: <number>\` within [${lo}, ${hi}].`;
@@ -525,6 +525,7 @@ function sessionIdOf(run: RunResult): SessionId {
     case "success":
     case "failure":
     case "escalate":
+    case "consult":
       return run.session_id;
     case "waiting_for_human":
       return run.state.session_id;

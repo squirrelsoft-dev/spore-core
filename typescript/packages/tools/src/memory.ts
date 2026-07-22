@@ -173,8 +173,8 @@ export class MemoryTool implements Tool {
       // R6 (decision D2): merged read drives the single seam merge; otherwise a
       // scoped read (R5 isolation). R10: neither path writes.
       entries = params.merged
-        ? await memoryStore.getMemoriesMerged(sessionId, params.limit)
-        : await memoryStore.getMemories(scope, sessionId, params.limit);
+        ? await memoryStore.getMemoriesMerged(sessionId, params.limit ?? 50)
+        : await memoryStore.getMemories(scope, sessionId, params.limit ?? 50);
     } catch (e) {
       return {
         kind: "error",

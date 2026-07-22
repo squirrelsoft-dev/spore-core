@@ -237,9 +237,9 @@ describe("InMemoryObservabilityProvider", () => {
     obs.emitToolCall(tc);
     const trace = await obs.getTrace(sid("s1"));
     expect(trace.length).toBe(2);
-    expect(trace[0].base.span_id.asString()).toBe("sp1");
-    expect(trace[1].base.span_id.asString()).toBe("sp2");
-    expect(trace[1].base.parent_span_id?.asString()).toBe("sp1");
+    expect(trace[0]!.base.span_id.asString()).toBe("sp1");
+    expect(trace[1]!.base.span_id.asString()).toBe("sp2");
+    expect(trace[1]!.base.parent_span_id?.asString()).toBe("sp1");
   });
 
   // ── Rule: middleware span recorded with hook + decision ───────────────────
@@ -263,7 +263,7 @@ describe("InMemoryObservabilityProvider", () => {
     obs.emitMiddleware(span);
     const trace = await obs.getTrace(sid("s1"));
     expect(trace.length).toBe(1);
-    expect(trace[0].base.kind).toBe("middleware_hook");
+    expect(trace[0]!.base.kind).toBe("middleware_hook");
   });
 
   // ── Rule: getSessions filters by outcome ──────────────────────────────────
@@ -277,7 +277,7 @@ describe("InMemoryObservabilityProvider", () => {
       kind: "success",
     });
     expect(success.length).toBe(1);
-    expect(success[0].session_id.asString()).toBe("good");
+    expect(success[0]!.session_id.asString()).toBe("good");
   });
 
   // ── Rule: getSessions filters by since timestamp ──────────────────────────

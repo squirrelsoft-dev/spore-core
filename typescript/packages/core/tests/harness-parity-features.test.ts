@@ -26,7 +26,7 @@ import {
   type TokenUsage,
   type ToolCall,
   type ToolOutput,
-  type ToolSchema,
+
   type TurnResult,
 } from "../src/index.js";
 
@@ -217,7 +217,7 @@ describe("G-D steering source", () => {
 
 describe("G-E tool-call repair", () => {
   it("coerceToolArgs coerces string booleans/numbers and quoted keys", () => {
-    const schema: ToolSchema = {
+    const schema: toolRegistry.ToolSchema = {
       name: "t",
       description: "",
       parameters: {
@@ -256,8 +256,7 @@ describe("G-E tool-call repair", () => {
     reg.withSchema({
       name: "t",
       description: "",
-      parameters: { type: "object", properties: { flag: { type: "boolean" } } },
-      annotations: { read_only: false, destructive: false, idempotent: false, open_world: false },
+      input_schema: { type: "object", properties: { flag: { type: "boolean" } } },
     });
 
     const cfg = standardConfig(a);
@@ -317,8 +316,7 @@ describe("G-F behavioral tool-call nudge", () => {
     tr.withSchema({
       name: "read_file",
       description: "",
-      parameters: { type: "object", properties: { path: { type: "string" } } },
-      annotations: { read_only: true, destructive: false, idempotent: false, open_world: false },
+      input_schema: { type: "object", properties: { path: { type: "string" } } },
     });
     const cfg = standardConfig(a);
     cfg.toolRegistry = tr;
@@ -339,8 +337,7 @@ describe("G-F behavioral tool-call nudge", () => {
     tr.withSchema({
       name: "read_file",
       description: "",
-      parameters: { type: "object", properties: { path: { type: "string" } } },
-      annotations: { read_only: true, destructive: false, idempotent: false, open_world: false },
+      input_schema: { type: "object", properties: { path: { type: "string" } } },
     });
     const cfg = standardConfig(a);
     cfg.toolRegistry = tr;
@@ -453,7 +450,7 @@ describe("G-B ToolProgress live streaming", () => {
         description: "a tool that streams progress",
         parameters: { type: "object", properties: {} },
         annotations: { read_only: true, destructive: false, idempotent: false, open_world: false },
-      } as ToolSchema,
+      } as toolRegistry.ToolSchema,
     };
 
     const a = new MockAgent(AgentId.of("test"));

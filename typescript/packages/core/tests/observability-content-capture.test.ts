@@ -275,9 +275,9 @@ describe("emitGenaiEvents", () => {
     );
     const events = emitGenaiEvents(line);
     expect(events).toHaveLength(1);
-    expect(events[0].name).toBe("gen_ai.assistant.message");
-    expect(events[0].attributes["gen_ai.message.role"]).toBe("assistant");
-    expect(events[0].attributes["gen_ai.message.content"]).toBe("done");
+    expect(events[0]!.name).toBe("gen_ai.assistant.message");
+    expect(events[0]!.attributes["gen_ai.message.role"]).toBe("assistant");
+    expect(events[0]!.attributes["gen_ai.message.content"]).toBe("done");
   });
 
   it("emits one assistant.message event per requested tool call", () => {
@@ -305,11 +305,11 @@ describe("emitGenaiEvents", () => {
       expect(ev.name).toBe("gen_ai.assistant.message");
       expect(ev.attributes["gen_ai.message.role"]).toBe("assistant");
     }
-    expect(events[0].attributes["gen_ai.tool.name"]).toBe("shell");
-    expect(events[0].attributes["gen_ai.tool.call.arguments"]).toBe(
+    expect(events[0]!.attributes["gen_ai.tool.name"]).toBe("shell");
+    expect(events[0]!.attributes["gen_ai.tool.call.arguments"]).toBe(
       JSON.stringify({ command: "ls" }),
     );
-    expect(events[1].attributes["gen_ai.tool.name"]).toBe("read");
+    expect(events[1]!.attributes["gen_ai.tool.name"]).toBe("read");
   });
 
   it("emits one tool.message event for a tool result", () => {
@@ -328,8 +328,8 @@ describe("emitGenaiEvents", () => {
     const line = TraceLine.fromToolCall(span, TRACE_ID);
     const events = emitGenaiEvents(line);
     expect(events).toHaveLength(1);
-    expect(events[0].name).toBe("gen_ai.tool.message");
-    expect(events[0].attributes["gen_ai.message.role"]).toBe("tool");
-    expect(events[0].attributes["gen_ai.message.content"]).toBe("total 0");
+    expect(events[0]!.name).toBe("gen_ai.tool.message");
+    expect(events[0]!.attributes["gen_ai.message.role"]).toBe("tool");
+    expect(events[0]!.attributes["gen_ai.message.content"]).toBe("total 0");
   });
 });

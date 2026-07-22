@@ -480,7 +480,7 @@ describe("StandardCompactionAdapter — compaction loop fixture parity (issue #5
       expect(warns.length > 0).toBe(c.expected.warn_emitted);
       if (c.expected.warn_emitted) {
         expect(warns).toHaveLength(1);
-        const ev = warns[0]!.event;
+        const ev = warns[0]!.event as { warn: string; missing_items: string[]; accepted_anyway: boolean };
         expect(ev.warn).toBe("compaction_verification_failed");
         expect(ev.missing_items).toEqual(c.expected.final_missing_items);
         expect(ev.accepted_anyway).toBe(true);

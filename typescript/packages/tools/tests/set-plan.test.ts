@@ -42,8 +42,8 @@ describe("SetPlanTool", () => {
   it("schema requires a tasks array", () => {
     const s = SetPlanTool.schema();
     expect(s.name).toBe("set_plan");
-    expect(s.parameters.required).toContain("tasks");
-    expect((s.parameters.properties as { tasks: { type: string } }).tasks.type).toBe("array");
+    expect((s.parameters as { required: string[] }).required).toContain("tasks");
+    expect(((s.parameters as { properties: { tasks: { type: string } } }).properties).tasks.type).toBe("array");
   });
 
   it("records a linear plan into the durable task_list store and returns success", async () => {

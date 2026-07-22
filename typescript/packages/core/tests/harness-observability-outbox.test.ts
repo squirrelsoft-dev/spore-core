@@ -154,7 +154,7 @@ describe("Harness — spans through durable outbox (hermetic)", () => {
     const calls = (turnWithCalls!.attributes as Record<string, unknown>)[
       "gen_ai.response.tool_calls"
     ] as Array<Record<string, unknown>>;
-    expect(calls[0].name).toBe("shell");
+    expect(calls[0]!.name).toBe("shell");
 
     // The final-response turn carries gen_ai.response.content.
     const turnFinal = lines.find((l) => {

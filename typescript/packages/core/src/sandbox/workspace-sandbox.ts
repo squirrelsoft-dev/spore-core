@@ -42,7 +42,7 @@ import type {
 
 /** Construction-time errors for `WorkspaceScopedSandbox`. */
 export class BuildError extends Error {
-  readonly name = "BuildError";
+  override readonly name = "BuildError";
   constructor(
     readonly kind:
       | "root_not_found"
