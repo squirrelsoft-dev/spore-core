@@ -67,6 +67,7 @@ describe("InMemoryVectorStore", () => {
     const store = new InMemoryVectorStore(3);
     const err = await store.add([rec("a", [1, 0], "chunk")]).catch((e) => e);
     expect(err).toBeInstanceOf(VectorStoreErrorException);
+    expect((err as VectorStoreErrorException).kind).toBe("dimension_mismatch");
     expect((err as VectorStoreErrorException).detail).toEqual(dimensionMismatch(3, 2));
   });
 

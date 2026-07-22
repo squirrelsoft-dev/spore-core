@@ -356,6 +356,26 @@ describe("CommandHook", () => {
     });
   });
 
+  it("nonzero exit is not masked by stdin EPIPE when command exits immediately", async () => {
+    const hook = new CommandHook("cmd", ["stop"], "sh", ["-c", "exit 7"]);
+    const chain = new StandardHookChain();
+    chain.register(hook);
+    const ctx: HookContext = {
+      event: "stop",
+      session_id: sid(),
+      turn_number: 1,
+      last_output: { text: "", had_tool_calls: false },
+      // Large enough to make stdin.write contend with a process that has
+      // already exited/closed fd 0; CI previously surfaced this as code -1.
+      task_instruction: "x".repeat(2 * 1024 * 1024),
+      session_state: null,
+    };
+    await expect(chain.fire(ctx)).rejects.toMatchObject({
+      kind: "command_failed",
+      detail: { kind: "command_failed", code: 7 },
+    });
+  });
+
   // R21: malformed stdout → command_output_invalid.
   it("malformed stdout raises command_output_invalid", async () => {
     const hook = new CommandHook("cmd", ["stop"], "sh", ["-c", "echo 'not json at all'"]);

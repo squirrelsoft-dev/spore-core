@@ -58,7 +58,7 @@ export type RequestBuilder = (signal: AbortSignal) => Promise<Response>;
 /** Sleep hook — tests override to skip waits. Defaults to `setTimeout`. */
 export type SleepFn = (ms: number, signal?: AbortSignal) => Promise<void>;
 
-const defaultSleep: SleepFn = (ms, signal) =>
+export const defaultSleep: SleepFn = (ms, signal) =>
   new Promise<void>((resolve, reject) => {
     if (signal?.aborted) {
       reject(new ProviderError(0, `request aborted: ${abortMessage(signal.reason)}`));

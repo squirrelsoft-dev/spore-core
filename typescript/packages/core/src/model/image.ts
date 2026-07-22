@@ -15,14 +15,18 @@ import { extname } from "node:path";
 import type { Content } from "./schemas.js";
 
 export type ImageContentErrorKind =
-  | { kind: "unsupported_extension"; extension: string; expected: readonly string[] };
+  | { kind: "unsupported_extension"; extension: string; expected: readonly string[] }
+  | { kind: "read_failed"; path: string; message: string }
+  | { kind: "aborted"; path: string; message: string };
 
 /** Typed public image helper error (no plain package-boundary Error). */
 export class ImageContentError extends Error {
   override readonly name = "ImageContentError";
+  readonly kind: ImageContentErrorKind["kind"];
 
-  constructor(readonly detail: ImageContentErrorKind) {
-    super(imageContentErrorMessage(detail));
+  constructor(readonly detail: ImageContentErrorKind, options?: ErrorOptions) {
+    super(imageContentErrorMessage(detail), options);
+    this.kind = detail.kind;
   }
 }
 
@@ -30,6 +34,10 @@ export function imageContentErrorMessage(detail: ImageContentErrorKind): string 
   switch (detail.kind) {
     case "unsupported_extension":
       return `unsupported image extension: ${detail.extension === "" ? '\"\"' : detail.extension} (expected ${detail.expected.join("/")})`;
+    case "read_failed":
+      return `failed to read image ${detail.path}: ${detail.message}`;
+    case "aborted":
+      return `image read aborted for ${detail.path}: ${detail.message}`;
   }
 }
 
@@ -86,8 +94,21 @@ export async function loadImageContent(path: string, signal?: AbortSignal): Prom
       expected: SUPPORTED_IMAGE_EXTENSIONS,
     });
   }
-  const bytes = await readFile(path, { signal });
-  return imageContent(mediaType, bytes);
+  try {
+    const bytes = await readFile(path, { signal });
+    return imageContent(mediaType, bytes);
+  } catch (e) {
+    if (e instanceof ImageContentError) throw e;
+    const message = e instanceof Error ? e.message : String(e);
+    if (isAbortError(e)) {
+      throw new ImageContentError({ kind: "aborted", path, message }, { cause: e });
+    }
+    throw new ImageContentError({ kind: "read_failed", path, message }, { cause: e });
+  }
+}
+
+function isAbortError(e: unknown): boolean {
+  return e instanceof Error && e.name === "AbortError";
 }
 
 /** Base64-encode bytes (Node `Buffer`). */

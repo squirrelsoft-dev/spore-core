@@ -113,9 +113,11 @@ export function backendError(message: string): VectorStoreError {
 /** Error subclass carrying a structured {@link VectorStoreError} detail. */
 export class VectorStoreErrorException extends Error {
   override readonly name = "VectorStoreErrorException";
+  readonly kind: VectorStoreError["kind"];
 
   constructor(readonly detail: VectorStoreError) {
     super(vectorStoreErrorMessage(detail));
+    this.kind = detail.kind;
   }
 }
 

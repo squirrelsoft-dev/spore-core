@@ -229,7 +229,28 @@ describe("OpenAIEmbeddingModel", () => {
     expect(slept).toBe(7000);
   });
 
-  it("retry backoff sleep observes AbortSignal", async () => {
+  it("default retry backoff sleep observes AbortSignal", async () => {
+    let i = 0;
+    const controller = new AbortController();
+    const fetch = async (): Promise<Response> => {
+      i += 1;
+      return new Response("{}", { status: 429 });
+    };
+    const model = new OpenAIEmbeddingModel("k", "text-embedding-3-small", {
+      fetchImpl: fetch,
+      maxRetries: 1,
+    });
+    setTimeout(() => controller.abort(new Error("stop-now")), 20);
+    const started = Date.now();
+    const err = await model.embed(["x"], controller.signal).catch((e) => e);
+    const elapsed = Date.now() - started;
+    expect(err).toBeInstanceOf(ProviderError);
+    expect((err as ProviderError).providerMessage).toContain("request aborted");
+    expect(elapsed).toBeLessThan(250);
+    expect(i).toBe(1);
+  });
+
+  it("custom retry backoff sleep observes AbortSignal", async () => {
     let i = 0;
     const controller = new AbortController();
     const fetch = async (): Promise<Response> => {

@@ -1,10 +1,9 @@
 # Rust → TypeScript Harness Parity Plan
 
-> **Status: PLAN-FIRST CHECKPOINT (revised) — no implementation started.**
-> Authoritative Rust revision recorded below. This document inventories the
-> Rust harness and the current TypeScript implementation end to end, records a
-> parity matrix, and specifies file-level steps. It is ready for captain
-> approval. No implementation code has been written.
+> **Status: IMPLEMENTED AND VALIDATED.** Authoritative Rust revision recorded
+> below. This document began as the gap inventory and implementation plan, and
+> now records the completed TypeScript parity work, final evidence matrix, known
+> out-of-scope Rust-only extension crates/backends, and closure-review fixes.
 >
 > **Revision note (captain scope decision incorporated):** the complete
 > TypeScript `spore-core` + `spore-eval` surface is IN SCOPE, including the
@@ -66,26 +65,22 @@ implemented (§5 G-L). Only the separate `@spore/sqlvec` *backend package*
 
 ## 3. Baseline (current TypeScript state)
 
-- **Tests:** `pnpm -r test` — green. `@spore/core` 1502 passed | 7 skipped;
-  `@spore/tools` 269 passed; `@spore/eval` 46 passed.
+- **Tests:** `pnpm -r test` — green. `@spore/core` 1563 passed | 7 skipped;
+  `@spore/tools` 278 passed; `@spore/eval` 46 passed.
 - **Lint:** `pnpm -r lint` — green (eslint, all packages).
-- **Type-check:** `tsc --noEmit` (core `tsconfig.json` includes `tests/**/*`)
-  reports **pre-existing errors** in test files only:
-  `tests/tasklist.test.ts` (11× `TS2532 Object is possibly 'undefined'` under
-  `noUncheckedIndexedAccess`) and `tests/tool-error-loop.test.ts:221`
-  (`TS18048 'r.session_state' is possibly 'undefined'`). No `typecheck` script
-  is defined in any `package.json`; `build` is `pnpm -r build` and core has no
-  `build` script (source-only package). These test-only tsc errors are a
-  pre-existing baseline and will be fixed as part of this work (they block a
-  clean type-check gate).
+- **Type-check:** `pnpm -r typecheck` — green across core/tools/eval. The
+  earlier pre-existing test-only `tsc` errors were fixed and package
+  `typecheck` scripts are present. `pnpm -r build` remains a no-op confirmation:
+  no selected package has a `build` script (source-only packages).
 - **Package layout:** pnpm workspace; `@spore/core` (source-only, ESM, zod),
   `@spore/tools`, `@spore/eval`, `@spore/test-utils`. Node 20 LTS, Vitest.
 - **Examples:** `examples/typescript/01..12` mirror `examples/rust/01..12`
   one-for-one (hello-agent, conversational-repl, tool-use, filesystem-agent,
   custom-sandboxed-tool, web-research, memory, plan-execute, self-verifying,
   hill-climbing, multi-agent, cordyceps).
-- **Docs:** `docs/typescript/` has only a stub `quickstart.md`. Rust has
-  `quickstart.md`, `building-a-tool.md`, `conversation.md`, `custom-harness.md`.
+- **Docs:** `docs/typescript/` now includes `quickstart.md`,
+  `building-a-tool.md`, `conversation.md`, `custom-harness.md`, and this parity
+  plan/evidence file.
 
 ## 4. Parity matrix
 
@@ -96,17 +91,17 @@ implemented (§5 G-L). Only the separate `@spore/sqlvec` *backend package*
 | L1 | `RunResult` variants (`success`/`failure`/`waiting_for_human`/`escalate`/`consult`) + `session_state` carry | `rust/crates/spore-core/src/harness/types.rs:1608-1700` | `typescript/packages/core/src/harness/types.ts:5243-5318` (+ `runResultSessionState` helper) | OBSERVED PARITY | — |
 | L2 | `HaltReason` variants (budget/termination/middleware/agent/context/sandbox/unrecoverable/human/stagnation/strategy_not_yet_implemented/empty_plan/step_failed/plan_phase_failed/self_verify_*/ralph_*/hill_climbing_misconfigured/tasks_blocked_by_failure/task_graph_cycle/tool_error_loop/output_schema_violation/configuration_error) | `rust/.../harness/types.rs:1421-1606` | `typescript/.../harness/types.ts:5103-5241` | OBSERVED PARITY | — |
 | L3 | `HarnessStreamEvent` coarse + delta variants (turn_start/end, tool_call, tool_result, final_response, budget_warning, user_message, text/reasoning/tool_args delta, block_start/stop, tool_call_start, tool_error_loop_detected/broken, output_schema_retry/violation) | `rust/.../harness/types.rs:60-410` | `typescript/.../harness/types.ts:4042-4121` | OBSERVED PARITY (variants) | — |
-| L4 | **`NodeAttr` attribution on every stream event + `wrap_node_sink`** (multi-agent node routing) | `rust/.../harness/types.rs:426-460` (`NodeAttr`), `wrap_node_sink` in `types.rs:461+`, used in `react.rs:2125`, `plan_execute.rs:385`, `hill_climbing.rs:252`, `self_verifying.rs:246`, `ralph.rs:255` | **No `NodeAttr` type, no `node` field on any event, no `wrapNodeSink`.** `grep NodeAttr` in TS harness → 0 hits. | **GAP** | major |
-| L5 | **`StreamEvent::ToolProgress`** (live tail-snapshot preview from a running tool) | `rust/.../harness/types.rs:166-178` | **No `tool_progress` variant** in `HarnessStreamEvent` (`typescript/.../harness/types.ts:4042-4121`) | **GAP** | major |
-| L6 | `tool_result.revised` flag (AfterTool middleware rewrite signal) | `rust/.../harness/types.rs:148-160` | **No `revised` field** on TS `tool_result` (`typescript/.../harness/types.ts:4067-4072`) | **GAP** | major |
-| L7 | `user_message.steered` flag (user-authored steering vs agent narration) | `rust/.../harness/types.rs:181-200` | **No `steered` field** on TS `user_message` (`typescript/.../harness/types.ts:4079-4081`) | **GAP** | major |
+| L4 | `NodeAttr` attribution on every stream event + `wrap_node_sink` (multi-agent node routing) | `rust/.../harness/types.rs:426-460` (`NodeAttr`), `wrap_node_sink` in `types.rs:461+`, used in `react.rs:2125`, `plan_execute.rs:385`, `hill_climbing.rs:252`, `self_verifying.rs:246`, `ralph.rs:255` | TS has `NodeAttr`, optional `node`, and `wrapNodeSink`; react leaf and combinators preserve nested stream paths. | OBSERVED PARITY | — |
+| L5 | `StreamEvent::ToolProgress` (live tail-snapshot preview from a running tool) | `rust/.../harness/types.rs:166-178` | TS has `tool_progress`, `ToolProgressSink`, `ToolContext.commandProgress`, and workspace-backed command progress forwarding. | OBSERVED PARITY | — |
+| L6 | `tool_result.revised` flag (AfterTool middleware rewrite signal) | `rust/.../harness/types.rs:148-160` | TS `tool_result` has optional `revised`; revised events emit only when the stream-visible result changes. | OBSERVED PARITY | — |
+| L7 | `user_message.steered` flag (user-authored steering vs agent narration) | `rust/.../harness/types.rs:181-200` | TS `user_message` has optional `steered`; steering source messages emit `true`, send_message narration emits `false`. | OBSERVED PARITY | — |
 | L8 | `HarnessConfig` field set | `rust/.../harness/config.rs:100-205` | `typescript/.../harness/standard.ts:261-540` | INFERRED SIMILARITY (most fields present; see L9–L12) | — |
-| L9 | **`steering_source: Option<SteeringSource>`** + mid-run drain at turn boundary (inject queued user messages, emit `UserMessage{steered:true}`, persist via ContextManager) | `rust/.../harness/config.rs:154`, `rust/.../harness/react.rs:343-360` | **No `steeringSource` field**, no drain logic. `grep steeringSource` TS → 0 hits. | **GAP** | major |
-| L10 | **`tool_call_repair: Option<Arc<dyn ToolCallRepair>>` + `max_repair_attempts`** (coerce malformed tool args, retry within attempts, enrich error) | `rust/.../harness/config.rs:130-133`, `rust/.../harness/react.rs:27-35`, trait `rust/.../tool_call_repair.rs:332-345`, `coerce_tool_args` `:45`, `StandardToolCallRepair` `:342` | **No `ToolCallRepair` interface, no `StandardToolCallRepair`, no `coerceToolArgs`, no `maxRepairAttempts` config.** TS `define-tool.ts:14,139` only *references* "a configured ToolCallRepair" in comments. TS has `detectProseResponse` only. | **GAP** | major |
-| L11 | **`tool_call_nudge: bool`** + behavioral nudge (inject a tool-calling nudge when a turn ends having called zero tools, capped at `MAX_TOOL_CALL_NUDGES=2`) | `rust/.../harness/config.rs:145`, `rust/.../harness/react.rs:328-335,741-810` | **No `toolCallNudge` config, no nudge logic, no `tools_called_this_window` tracking.** | **GAP** | major |
-| L12 | **`plan_empty_max_retries: u32`** + plan-empty re-ask loop (re-ask with tools suppressed + `/no_think` nudge before halting `EmptyPlan`; fold discarded usage) | `rust/.../harness/config.rs:135-138`, `rust/.../harness/plan_execute.rs:499-670`, `StrategyExecutor::plan_empty_max_retries` `rust/.../harness/strategy_executor.rs:298-299` | **No `planEmptyMaxRetries` config, no re-ask loop.** TS `captureAndPersistPlan` (`typescript/.../harness/standard.ts:2556-2612`) is single-shot. | **GAP** | major |
-| L13 | **`HarnessSignal::PlanRecorded`** (set_plan tool's terminal signal, consumed in PlanExecute plan phase) | `rust/.../harness/types.rs:552-555`, handled in `plan_execute.rs:560-575` | **No `plan_recorded` variant** in TS `HarnessSignal` (`typescript/.../harness/types.ts:4271-4276`: only enter_plan_mode/exit_plan_mode/switch_mode/abort) | **GAP** | major |
-| L14 | **Narration refund**: `send_message`-only turns do not consume the productive-turn budget (refund one turn, capped at ~2× budget) | `rust/.../harness/react.rs:336-345` + gate logic | TS react loop (`typescript/.../harness/standard.ts:3140-3200`) has no narration refund; `send_message` success only emits `user_message` (`:4007-4009`) | **GAP** | major |
+| L9 | `steering_source: Option<SteeringSource>` + mid-run drain at turn boundary (inject queued user messages, emit `UserMessage{steered:true}`, persist via ContextManager) | `rust/.../harness/config.rs:154`, `rust/.../harness/react.rs:343-360` | TS has optional `steeringSource` config/builder support and turn-boundary drain logic. | OBSERVED PARITY | — |
+| L10 | `tool_call_repair: Option<Arc<dyn ToolCallRepair>>` + `max_repair_attempts` (coerce malformed tool args, retry within attempts, enrich error) | `rust/.../harness/config.rs:130-133`, `rust/.../harness/react.rs:27-35`, trait `rust/.../tool_call_repair.rs:332-345`, `coerce_tool_args` `:45`, `StandardToolCallRepair` `:342` | TS has `ToolCallRepair`, `StandardToolCallRepair`, `coerceToolArgs`, `maxRepairAttempts`, repair on normal/resume/consult dispatches, effective-call bookkeeping, and enriched parameter errors. | OBSERVED PARITY | — |
+| L11 | `tool_call_nudge: bool` + behavioral nudge (inject a tool-calling nudge when a turn ends having called zero tools, capped at `MAX_TOOL_CALL_NUDGES=2`) | `rust/.../harness/config.rs:145`, `rust/.../harness/react.rs:328-335,741-810` | TS has optional `toolCallNudge` config and bounded zero-tools-called nudge logic. | OBSERVED PARITY | — |
+| L12 | `plan_empty_max_retries: u32` + plan-empty re-ask loop (re-ask with tools suppressed + `/no_think` nudge before halting `EmptyPlan`; fold discarded usage) | `rust/.../harness/config.rs:135-138`, `rust/.../harness/plan_execute.rs:499-670`, `StrategyExecutor::plan_empty_max_retries` `rust/.../harness/strategy_executor.rs:298-299` | TS has `planEmptyMaxRetries`, tools-suppressed retry plan, forced `{tasks,rationale}` schema, corrective nudge, and folded usage. | OBSERVED PARITY | — |
+| L13 | `HarnessSignal::PlanRecorded` (set_plan tool's terminal signal, consumed in PlanExecute plan phase) | `rust/.../harness/types.rs:552-555`, handled in `plan_execute.rs:560-575` | TS has additive `plan_recorded` signal handling for `set_plan`. | OBSERVED PARITY | — |
+| L14 | Narration refund: `send_message`-only turns do not consume the productive-turn budget (refund one turn, capped at ~2× budget) | `rust/.../harness/react.rs:336-345` + gate logic | TS tracks narration refunds so send_message-only turns do not consume productive-turn budget. | OBSERVED PARITY | — |
 | L15 | Defaults: `error_loop_threshold=3`, `output_schema_max_retries=2`, `max_compaction_attempts=2`, `enforce_output_schemas=false`, `max_stop_blocks` default | `rust/.../harness/config.rs:521-551` | `typescript/.../harness/standard.ts:535,538,1910,1915,4351,909` | OBSERVED PARITY | — |
 | L16 | ReAct / PlanExecute / SelfVerifying / HillClimbing / Ralph strategy shapes & combinators | `rust/.../harness/{react,plan_execute,self_verifying,hill_climbing,ralph}.rs` | `typescript/.../harness/standard.ts` (all five implemented) | INFERRED SIMILARITY — exercised by passing fixture-replay tests; full behavioral equivalence to be confirmed by representative E2E tests during implementation | — |
 | L17 | Budget policy/enforcement/exhaustion, `BudgetExhaustedBehavior`, `ExhaustionCause` | `rust/.../harness/budget.rs:146-200` | `typescript/.../harness/types.ts:190,888`; `budget-policy.test.ts`/`budget-enforcement.test.ts` pass | OBSERVED PARITY | — |
@@ -119,11 +114,11 @@ implemented (§5 G-L). Only the separate `@spore/sqlvec` *backend package*
 | # | Capability | Rust evidence | TS behavior | Status | Sev |
 |---|---|---|---|---|---|
 | T1 | `Tool` trait (call/schema/annotations/progress), `ToolRegistry`, `RealToolRegistry`/`StandardToolRegistry`, `RegistrationError`/`DispatchError`, `ToolNamespace`/`ToolSet`/`ToolSearchConfig`/`ToolSearchRegistry`/`TaskPhase`, `ToolContext` | `rust/.../tool_registry.rs` | `typescript/.../tool-registry/*.ts` | OBSERVED PARITY (interface-level) | — |
-| T2 | **`ToolProgressSink` / `ToolProgressUpdate`** (run-level progress sink → `StreamEvent::ToolProgress`), `ToolContext::command_progress` | `rust/.../tool_registry.rs:140-200` | **No `ToolProgressSink`/`ToolProgressUpdate`, no `commandProgress` on `ToolContext`.** | **GAP** | major |
-| T3 | **`SetPlanTool` (`set_plan`)** — atomic plan authoring into the durable `task_list` store; escalates `PlanRecorded` | `rust/.../tools/set_plan.rs` (154 lines), catalogued `rust/.../tools/catalogue.rs:216` | **No `SetPlanTool`, no `set_plan` in `StandardTools`, no `set_plan` params.** `grep set_plan` TS → 0 hits. | **GAP** | major |
-| T4 | **`CreateDirTool` (`create_dir`)** — mkdir -p | `rust/.../tools/fs.rs:276`, catalogued `catalogue.rs:131` | **No `CreateDirTool`, no `create_dir` params, no catalogue entry.** | **GAP** | major |
-| T5 | `StandardTools` catalogue: `move_file`, `delete_file` constructors | `rust/.../tools/catalogue.rs:138,143` | TS impls exist (`MoveFileTool`/`DeleteFileTool` in `typescript/.../tools/src/fs.ts`) but **not exposed as `StandardTools` constructors** (`typescript/.../tools/src/catalogue.ts` has no `moveFile`/`deleteFile`) | **GAP** | major |
-| T6 | `StandardTools.coding_set` membership (Rust includes `create_dir`, `move_file`, `delete_file`, `set_plan`) | `rust/.../tools/catalogue.rs:279-302` | TS `codingSet` (`typescript/.../tools/src/catalogue.ts:283-308`) **omits all four** | **GAP** | major |
+| T2 | `ToolProgressSink` / `ToolProgressUpdate` (run-level progress sink → `StreamEvent::ToolProgress`), `ToolContext::command_progress` | `rust/.../tool_registry.rs:140-200` | TS has `ToolProgressSink`/`ToolProgressUpdate`; `ToolContext.commandProgress` emits run-level `tool_progress`. | OBSERVED PARITY | — |
+| T3 | `SetPlanTool` (`set_plan`) — atomic plan authoring into the durable `task_list` store; escalates `PlanRecorded` | `rust/.../tools/set_plan.rs` (154 lines), catalogued `rust/.../tools/catalogue.rs:216` | TS has `SetPlanTool`, `set_plan` params, catalogue wiring, and `StandardTools.setPlan`. | OBSERVED PARITY | — |
+| T4 | `CreateDirTool` (`create_dir`) — mkdir -p | `rust/.../tools/fs.rs:276`, catalogued `catalogue.rs:131` | TS has `CreateDirTool`, params, catalogue entry, and tests. | OBSERVED PARITY | — |
+| T5 | `StandardTools` catalogue: `move_file`, `delete_file` constructors | `rust/.../tools/catalogue.rs:138,143` | TS exposes `moveFile` and `deleteFile` constructors in `StandardTools`. | OBSERVED PARITY | — |
+| T6 | `StandardTools.coding_set` membership (Rust includes `create_dir`, `move_file`, `delete_file`, `set_plan`) | `rust/.../tools/catalogue.rs:279-302` | TS `codingSet` includes `create_dir`, `move_file`, `delete_file`, and `set_plan`. | OBSERVED PARITY | — |
 | T7 | `readonly_set` / `full_set` membership | `rust/.../tools/catalogue.rs:264-335` | TS `readonlySet`/`fullSet` (`catalogue.ts:249-330`) | OBSERVED PARITY (modulo T6) | — |
 | T8 | Tool impls: `read_file` (range #132), `write_file`, `edit_file`, `list_dir`, `grep`/`grep_files` (output modes, context lines #133), `find_files`, `bash_command`/`exec`/`run_tests`, `git_*`, `http_get`/`http_post`, `web_fetch`/`web_search`, `send_message`, `todo_write`, `task_list`, `memory`, `enter_plan_mode`/`exit_plan_mode`/`ask_user_question`/`abort`, `subagent` | `rust/.../tools/*.rs` | `typescript/.../tools/src/*.ts` | INFERRED SIMILARITY — covered by passing fixture-replay + per-tool tests; equivalence to be confirmed by representative E2E tests | — |
 | T9 | `finish_with_possible_truncation` + `LARGE_OUTPUT_THRESHOLD` (64KiB) + `DEFAULT_HEAD/TAIL_TOKENS` (2000/2000) | `rust/.../tools/mod.rs:80-110` | TS truncation path present (`typescript/.../tools/src/fs.ts` etc.); `sandbox.test.ts` covers `handleLargeOutput` | INFERRED SIMILARITY | — |
@@ -134,8 +129,8 @@ implemented (§5 G-L). Only the separate `@spore/sqlvec` *backend package*
 | # | Capability | Rust evidence | TS behavior | Status | Sev |
 |---|---|---|---|---|---|
 | S1 | `SandboxProvider` (`validate`, `execute_command`, `handle_large_output`, `resolve_path`, `isolation_mode`, `workspace_root`) | `rust/.../harness/providers.rs:113-260` | `typescript/.../harness/types.ts:4622-4660` | OBSERVED PARITY | — |
-| S2 | **`execute_command_streaming` (with `CommandProgressSink`)** — streaming subprocess output, default delegates to `execute_command` | `rust/.../harness/providers.rs:111,177-200` | **No `executeCommandStreaming`, no `CommandProgressSink`** in TS `SandboxProvider` | **GAP** | major |
-| S3 | `WorkspaceScopedSandbox`, `NullSandbox`, `ReadOnlySandbox`, `BwrapProfile`, `NetworkPolicy`, `IsolationMode`, `SandboxViolation`, `ExecConfig` (`kill_on_drop`) | `rust/.../sandbox.rs`, `providers.rs:306-360` | `typescript/.../sandbox/*.ts`, `harness/types.ts:4449-4552` | OBSERVED PARITY | — |
+| S2 | `execute_command_streaming` (with `CommandProgressSink`) — streaming subprocess output, default delegates to `execute_command` | `rust/.../harness/providers.rs:111,177-200` | TS `SandboxProvider` has optional `executeCommandStreaming`; `WorkspaceScopedSandbox` and wrappers forward sanitized tail snapshots. | OBSERVED PARITY | — |
+| S3 | `WorkspaceScopedSandbox`, `NullSandbox`, `ReadOnlySandbox`, `BwrapProfile`, `NetworkPolicy`, `IsolationMode`, `SandboxViolation`, `ExecConfig` (`kill_on_drop`) | `rust/.../sandbox.rs`, `providers.rs:306-360` | `typescript/.../sandbox/*.ts`, `harness/types.ts:4449-4552`; Unix `kill_on_drop` uses a killable process group/session so timeout/abort kills descendants. | OBSERVED PARITY | — |
 | S4 | `sandbox_petri` (Petri isolation backend, feature-gated) | `rust/.../sandbox_petri.rs` | **No TS equivalent** (feature-gated Rust-only backend) | **GAP** (out of scope — known gap, §9) | minor |
 
 ### 4.4 Model providers, streaming, recording/replay, prompt-tool-call, tool-call-repair
@@ -147,9 +142,9 @@ implemented (§5 G-L). Only the separate `@spore/sqlvec` *backend package*
 | M3 | `enforce_budget` / `enforce_context_limit` | `rust/.../model.rs` | TS `model/index.ts` exports | INFERRED SIMILARITY | — |
 | M4 | `RecordingModelInterface` + `RecordingMode` + `RecordedExchange`; `ReplayModelInterface` + `ReplayMode` | `rust/.../model.rs` | `typescript/.../model/{recording,replay}.ts`; `recording.test.ts`/`replay.test.ts` pass | OBSERVED PARITY | — |
 | M5 | `Anthropic`/`OpenAI`/`Ollama` provider HTTP shape, auth, endpoint, request/response + tool-call mapping | `rust/.../{anthropic,openai,ollama,provider_http}.rs` | `typescript/.../model/{anthropic,openai,ollama}.ts`; provider tests + fixture replay pass | INFERRED SIMILARITY (TS uses Node `fetch`; no shared `provider_http` client) | — |
-| M6 | `image.rs` helpers: `media_type_for_extension`, `is_image_path`, `image_content`, `load_image_content` | `rust/.../image.rs:16-50` | **No `image.ts` module / no image helpers** (the `image` ContentBlock *type* exists in `schemas.ts:46-48`) | **GAP** | minor |
+| M6 | `image.rs` helpers: `media_type_for_extension`, `is_image_path`, `image_content`, `load_image_content` | `rust/.../image.rs:16-50` | TS has image helpers, cancellable `loadImageContent`, and typed public image errors. | OBSERVED PARITY | — |
 | M7 | `PromptBasedToolCallModelInterface` + `AdaptiveToolCallModelInterface` + `inject_tool_prompt` + `parse_prose_response` | `rust/.../prompt_tool_call.rs` | `typescript/.../model/prompt-tool-call.ts` (all four present) | OBSERVED PARITY | — |
-| M8 | **`ToolCallRepair` trait + `StandardToolCallRepair` + `coerce_tool_args` + `ToolCallFailure`** | `rust/.../tool_call_repair.rs:45,227,252,332-345` | **Absent in TS** (see L10) | **GAP** | major |
+| M8 | `ToolCallRepair` trait + `StandardToolCallRepair` + `coerce_tool_args` + `ToolCallFailure` | `rust/.../tool_call_repair.rs:45,227,252,332-345` | TS has the repair trait, standard coercion repair, and model-facing enriched failures (see L10). | OBSERVED PARITY | — |
 | M9 | `detect_prose_response` | `rust/.../tool_call_repair.rs:252` | `typescript/.../model/prompt-tool-call.ts:282` | OBSERVED PARITY | — |
 
 ### 4.5 Context, compaction, prompt assembly, prompt chunk registry, cache provider, output schema
@@ -183,8 +178,8 @@ implemented (§5 G-L). Only the separate `@spore/sqlvec` *backend package*
 | X14 | `plan` (`capture_plan_artifact`, `PlanPhaseError`, `PLAN_EXECUTE_EXTRAS_KEY`) | `rust/.../plan.rs` | `typescript/.../plan/*.ts` | OBSERVED PARITY | — |
 | X15 | `tasklist` (`plan_artifact_to_task_list` [deprecated], `TaskList`, `TaskStatus`, `TASK_LIST_EXTRAS_KEY`, `push_step_ledger`, `render_step_ledger`, `StepLedgerEntry`, `STEP_LEDGER_*`) | `rust/.../tasklist.rs` | `typescript/.../tasklist/*.ts` | OBSERVED PARITY | — |
 | X16 | `ExecutionRegistry`/`ExecutionRegistryBuilder`/`EscalationMode`/`AutoGrantInfo`/`StrategyResolution`/`GrantCallback` | `rust/.../execution_registry.rs` | `typescript/.../harness/execution-registry.ts` | OBSERVED PARITY | — |
-| X17 | **`vector_store` (`VectorStore`, `VectorRecord`, `VectorHit`, `MetadataFilter`, `VectorStoreError`)** — full trait (add/search/delete/len/is_empty), upsert-by-id, dimension-mismatch rejection, AND-filter, in-memory reference impl | `rust/.../vector_store.rs` (345 lines, in spore-core) | **No TS module.** `grep VectorStore` TS → 0 hits. | **GAP** (IN SCOPE — §5 G-L) | major |
-| X18 | **`embedding` (`cosine_similarity`, `EmbeddingInfo`, `EmbeddingModel`, `OllamaEmbeddingModel`, `OpenAIEmbeddingModel`)** — full provider behavior: Ollama `/api/embed` (no key, fail-fast on connect, `probe_dimensions`), OpenAI `${base}/embeddings` (bearer auth, shared retry loop + `{error:{message}}` envelope, `dimensions` param for `text-embedding-3-*`, sort-by-index, `from_env`, `default_dimensions`) | `rust/.../embedding.rs` (550 lines, in spore-core) | **No TS module.** TS `memory/standard.ts:10` notes embedding similarity is spec'd but unimplemented. | **GAP** (IN SCOPE — §5 G-L) | major |
+| X17 | `vector_store` (`VectorStore`, `VectorRecord`, `VectorHit`, `MetadataFilter`, `VectorStoreError`) — full trait (add/search/delete/len/is_empty), upsert-by-id, dimension-mismatch rejection, AND-filter, in-memory reference impl | `rust/.../vector_store.rs` (345 lines, in spore-core) | TS has `vector-store` module with in-memory backend, structural metadata filters, and typed public errors with top-level `kind`. | OBSERVED PARITY | — |
+| X18 | `embedding` (`cosine_similarity`, `EmbeddingInfo`, `EmbeddingModel`, `OllamaEmbeddingModel`, `OpenAIEmbeddingModel`) — full provider behavior: Ollama `/api/embed` (no key, fail-fast on connect, `probe_dimensions`), OpenAI `${base}/embeddings` (bearer auth, shared retry loop + `{error:{message}}` envelope, `dimensions` param for `text-embedding-3-*`, sort-by-index, `from_env`, `default_dimensions`) | `rust/.../embedding.rs` (550 lines, in spore-core) | TS has `embedding` module with `model_id` wire shape, Ollama timeout, OpenAI retry/default dimensions, and abort-aware default retry waits. | OBSERVED PARITY | — |
 | X19 | `text_util` (internal helpers) | `rust/.../text_util.rs` | TS uses inline equivalents (`truncateField` etc.) | INFERRED SIMILARITY | — |
 | X20 | `sync_util` (`BoxFut` object-safe async alias) | `rust/.../sync_util.rs` | N/A (TS uses native `Promise`/`async`) | OBSERVED PARITY (idiomatic) | — |
 | X21 | `macros.rs` (derive macros) | `rust/.../macros.rs` | N/A (TS has no proc-macro equivalent; zod schemas substitute) | OBSERVED PARITY (idiomatic) | — |
@@ -198,15 +193,15 @@ implemented (§5 G-L). Only the separate `@spore/sqlvec` *backend package*
 | E3 | `EvalHarness` library API (`harness`/`task`/`manifest`/`report`/`stats`/`verifier`/`metric_map`/`worktree`) | `rust/crates/spore-eval/src/*.rs` | `typescript/packages/eval/src/*.ts`; `eval-harness.test.ts` (36) + `stats.test.ts` (10) pass | OBSERVED PARITY | — |
 | E4 | `e2e-agent` tool binary | `rust/.../tools` (Rust exposes tools via catalogue, no separate e2e bin) | `typescript/packages/tools/src/bin/e2e-agent.ts` (TS-only convenience binary) | OBSERVED PARITY (TS additive) | — |
 | E5 | Examples 01–12 | `examples/rust/01..12` | `examples/typescript/01..12` (one-to-one) | OBSERVED PARITY | — |
-| E6 | Docs: `building-a-tool.md`, `conversation.md`, `custom-harness.md` | `docs/rust/{building-a-tool,conversation,custom-harness,quickstart}.md` | `docs/typescript/` has only stub `quickstart.md` | **GAP** (IN SCOPE — §5 G-M) | minor |
+| E6 | Docs: `building-a-tool.md`, `conversation.md`, `custom-harness.md` | `docs/rust/{building-a-tool,conversation,custom-harness,quickstart}.md` | `docs/typescript/` includes quickstart plus `building-a-tool.md`, `conversation.md`, and `custom-harness.md`. | OBSERVED PARITY | — |
 | E7 | Workspace/build config | Cargo workspace + feature flags (`petri`) | pnpm workspace, no feature flags | OBSERVED PARITY (idiomatic) | — |
 | E8 | `spore-mcp` crate | `rust/crates/spore-mcp` (511 lines) | **No TS equivalent** | **GAP** (out of scope — known gap, §9) | major |
 | E9 | `spore-sqlvec` crate | `rust/crates/spore-sqlvec` | **No TS equivalent** | **GAP** (out of scope — known gap, §9) | major |
 
-## 5. Concrete gaps to close (implementation work, after plan approval)
+## 5. Concrete gaps closed (completed implementation record)
 
-Grouped by area. Each item lists: TS file-level steps, regression/E2E validation,
-compatibility constraints, risk.
+Grouped by area. Each item records the TypeScript file-level work, regression/E2E
+validation, compatibility constraints, and risk notes from the implementation.
 
 ### G-A. Stream-event node attribution (L4) — major — **DONE**
 - **Steps:** add `NodeAttr` type + optional `node?: NodeAttr` field to every
@@ -564,13 +559,14 @@ work," with the TS-specific terminal being a typed failure.
 
 ### 5.2.4 Cleanup
 
-- **CL1 — `kill_on_drop` reaps the child on timeout/abort.** Rust:
-  `ExecConfig.kill_on_drop` + the executor's wait loop. TS:
-  `typescript/.../sandbox/workspace-sandbox.ts:432-451` (`controller.abort()`
-  kills the child; with `kill_on_drop` set, an additional `SIGKILL` guarantees
-  reaping). **Assertion:** a timed-out child whose sentinel is never created is
-  reaped (no zombie/leak); the process table has no orphan after the run. This
-  is already covered by `sandbox.test.ts` (SC-12) and is re-asserted.
+- **CL1 — `kill_on_drop` reaps the child process tree on timeout/abort.** Rust:
+  `ExecConfig.kill_on_drop` + the executor's wait loop create/kill a Unix
+  process group. TS mirrors this for `WorkspaceScopedSandbox`: with
+  `kill_on_drop` on Unix, commands spawn in a detached process group/session and
+  timeout/abort sends `SIGKILL` to `-pid` (Windows keeps direct-child best
+  effort). **Assertion:** a timed-out command with a background descendant that
+  would touch a sentinel never creates it; direct-child sentinel cleanup remains
+  covered by `sandbox.test.ts` (SC-12).
 - **CL2 — Sandbox wrapper cleanup forwarding.** `ReadOnlySandbox` and any
   combinator child harness must forward `executeCommandStreaming` (G-B) so a
   streamed exec under a read-only-wrapped sandbox still reaps on abort. **Assertion:**
@@ -748,11 +744,14 @@ are closed by this decision. Rust remains strictly read-only throughout.
 All gaps in §5 are implemented and green, including the PR #169 independent-review
 remediations for PlanExecute continuation/stream/retry parity, workspace command
 progress, repair-on-resume bookkeeping, typed public errors, embedding wire shape,
-and abort-aware async waits. Final gates (§7): `pnpm -r test` (core 1559 passed |
+and abort-aware async waits. Final gates (§7): `pnpm -r test` (core 1563 passed |
 7 skipped, tools 278, eval 46), `pnpm -r lint` clean, `pnpm -r typecheck` clean
 (0 `tsc --noEmit` errors across core/tools/eval), and `pnpm -r build` confirmed
 there are no selected package build scripts. TypeScript examples 05-12 were
 installed with frozen locks and their available `test`/`lint` scripts passed.
+Closure-review regressions added: `sandbox.test.ts` proves Unix `kill_on_drop`
+kills background descendants via process group cleanup; `hooks.test.ts` proves
+CommandHook stdin EPIPE cannot mask a command's real nonzero exit code.
 
 | Gap | Status | Tests | Notes |
 | --- | --- | --- | --- |
@@ -766,8 +765,8 @@ installed with frozen locks and their available `test`/`lint` scripts passed.
 | G-H SetPlanTool | **DONE** | `set-plan.test.ts` (7) | `SetPlanTool` writes durable task_list store; `plan_recorded` signal variant; catalogue + `codingSet` membership. |
 | G-I CreateDirTool | **DONE** | `fs.test.ts` | `CreateDirTool` + `CreateDirParamsSchema`; `createDir`/`moveFile`/`deleteFile` in `StandardTools` + `codingSet`. |
 | G-J Narration refund | **DONE** | `harness-parity-features.test.ts` | `narrationRefund` tracking + `budgetExceeded` `turnCapOverride`; send_message-only turns refund at window gate. |
-| G-K Image helpers | **DONE** | `image.test.ts` (6) | `mediaTypeForExtension`, `isImagePath`, `imageContent`, cancellable `loadImageContent`, typed unsupported-extension errors. |
-| G-L VectorStore/EmbeddingModel | **DONE** | `embedding.test.ts` + `vector-store.test.ts` (29) | `VectorStore`/`EmbeddingModel` traits + Ollama/OpenAI providers with mocked-HTTP retry, Rust `model_id` wire shape, structural metadata equality, typed vector errors, Ollama timeouts, and abort-aware retry waits. |
+| G-K Image helpers | **DONE** | `image.test.ts` (7) | `mediaTypeForExtension`, `isImagePath`, `imageContent`, cancellable `loadImageContent`, typed unsupported-extension/read/abort errors with top-level `kind`. |
+| G-L VectorStore/EmbeddingModel | **DONE** | `embedding.test.ts` + `vector-store.test.ts` (30) | `VectorStore`/`EmbeddingModel` traits + Ollama/OpenAI providers with mocked-HTTP retry, Rust `model_id` wire shape, structural metadata equality, typed vector errors with top-level `kind`, Ollama timeouts, and abort-aware default retry waits. |
 | G-M Docs | **DONE** | — | `building-a-tool.md`, `conversation.md`, `custom-harness.md` authored; `quickstart.md` cross-linked. |
 | G-N tsc cleanup | **DONE** | — | 0 `tsc --noEmit` errors; `typecheck` script added to all 3 packages. |
 

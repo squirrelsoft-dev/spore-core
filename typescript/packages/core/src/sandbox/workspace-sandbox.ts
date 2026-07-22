@@ -418,6 +418,7 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
 
     return new Promise<CommandOutput | SandboxViolation>((resolveFn) => {
       const controller = new AbortController();
+      const killProcessGroup = ec?.kill_on_drop === true && process.platform !== "win32";
       // SC-15: `spawn` can FAIL SYNCHRONOUSLY (e.g. ENOEXEC for a non-binary
       // executable, EMFILE, …) by throwing instead of emitting `"error"`. That is
       // still a "the process never started" failure, so convert it to the typed
@@ -431,6 +432,7 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
           signal: controller.signal,
           ...(childEnv != null ? { env: childEnv } : {}),
           ...(stdio != null ? { stdio } : {}),
+          ...(killProcessGroup ? { detached: true } : {}),
         });
       } catch (err) {
         resolveFn({ kind: "exec_spawn_failed", command, message: String(err) });
@@ -467,17 +469,22 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
         if (timer) clearTimeout(timer);
         if (signal) signal.removeEventListener("abort", onAbort);
       };
-      // SC-12: `kill_on_drop` reaps the child when the exec is cancelled/timed
-      // out. `controller.abort()` already kills the spawned process; with the
-      // knob set we additionally SIGKILL to guarantee the child cannot outlive
-      // the aborted exec (instead of being orphaned).
+      // SC-12: `kill_on_drop` reaps the command when the exec is cancelled/timed
+      // out. On Unix, commands launched with the knob become their own process
+      // group/session (`detached: true`), so SIGKILL goes to `-pid` and reaps
+      // background descendants too. Windows has no negative-PID process groups,
+      // so it keeps the legacy direct-child best effort.
       const abortChild = (): void => {
         controller.abort();
         if (ec?.kill_on_drop) {
           try {
-            child.kill("SIGKILL");
+            if (killProcessGroup && child.pid != null) {
+              process.kill(-child.pid, "SIGKILL");
+            } else {
+              child.kill("SIGKILL");
+            }
           } catch {
-            // Child may already be gone — nothing to reap.
+            // Child/process group may already be gone — nothing to reap.
           }
         }
       };

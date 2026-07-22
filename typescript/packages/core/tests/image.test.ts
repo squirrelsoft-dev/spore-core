@@ -54,10 +54,18 @@ describe("image helpers", () => {
   it("loadImageContent rejects an unrecognized extension with typed error", async () => {
     const err = await loadImageContent("file.bmp").catch((e) => e);
     expect(err).toBeInstanceOf(ImageContentError);
+    expect((err as ImageContentError).kind).toBe("unsupported_extension");
     expect((err as ImageContentError).detail.kind).toBe("unsupported_extension");
   });
 
-  it("loadImageContent passes AbortSignal to the file read", async () => {
+  it("loadImageContent wraps file read failures in a typed error", async () => {
+    const err = await loadImageContent("/definitely/not/found.png").catch((e) => e);
+    expect(err).toBeInstanceOf(ImageContentError);
+    expect((err as ImageContentError).kind).toBe("read_failed");
+    expect((err as ImageContentError).detail.kind).toBe("read_failed");
+  });
+
+  it("loadImageContent passes AbortSignal to the file read and wraps aborts", async () => {
     const dir = await mkdtemp(join(tmpdir(), "spore-img-"));
     try {
       const p = join(dir, "x.png");
@@ -65,7 +73,9 @@ describe("image helpers", () => {
       const controller = new AbortController();
       controller.abort();
       const err = await loadImageContent(p, controller.signal).catch((e) => e);
-      expect((err as Error).name).toBe("AbortError");
+      expect(err).toBeInstanceOf(ImageContentError);
+      expect((err as ImageContentError).kind).toBe("aborted");
+      expect((err as ImageContentError).detail.kind).toBe("aborted");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

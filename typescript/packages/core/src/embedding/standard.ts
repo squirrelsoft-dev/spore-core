@@ -11,6 +11,7 @@
 import { ProviderError, Timeout, Transport, type ModelError } from "../model/errors.js";
 import {
   RETRYABLE_STATUSES,
+  defaultSleep,
   errorParts,
   keyFromEnv,
   sendWithRetry,
@@ -20,11 +21,6 @@ import type { EmbeddingInfo, EmbeddingModel } from "./types.js";
 
 /** A fetch-like function (permissive first param so test mocks fit without casts). */
 export type FetchFn = (url: string, init: RequestInit) => Promise<Response>;
-
-const defaultSleep: SleepFn = (ms) =>
-  new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
-  });
 
 // ============================================================================
 // Ollama
