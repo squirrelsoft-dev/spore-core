@@ -3533,6 +3533,13 @@ type HarnessConfig struct {
 	// without sporecore importing the storage package (which would be a cycle).
 	SessionStore SessionStore // optional
 
+	// ChunkProvider supplies optional prompt chunks to harness sub-phases (§F1).
+	// It is kept as an adapter field (any) because promptassembly imports
+	// sporecore, so the root package cannot name promptassembly.ChunkProvider
+	// without an import cycle. Providers with a Load(context.Context) method that
+	// returns a slice of structs carrying ID/Content fields are supported.
+	ChunkProvider any
+
 	// AutoPersistSessions opts this harness into the issue #102 session-store
 	// auto-load + auto-persist contract above. Per-harness builder config (NOT a
 	// per-run flag). Defaults to false: when false there is ZERO session-store
@@ -3663,6 +3670,13 @@ func (c HarnessConfig) WithSteeringSource(source func() []string) HarnessConfig 
 // WithToolCallNudge enables/disables opt-in tool-call nudges for execute steps.
 func (c HarnessConfig) WithToolCallNudge(on bool) HarnessConfig {
 	c.ToolCallNudge = on
+	return c
+}
+
+// WithChunkProvider sets the prompt chunk provider used by harness sub-phases.
+// nil restores the never-nil default empty provider at harness construction.
+func (c HarnessConfig) WithChunkProvider(provider any) HarnessConfig {
+	c.ChunkProvider = provider
 	return c
 }
 
@@ -3858,6 +3872,9 @@ func NewStandardHarness(c HarnessConfig) *StandardHarness {
 	// to the per-window session id — today's single-process behaviour.
 	if c.Hooks == nil {
 		c.Hooks = NewStandardHookChain()
+	}
+	if c.ChunkProvider == nil {
+		c.ChunkProvider = emptyChunkProvider{}
 	}
 	// #124: the per-strategy single-collaborator fields are gone — collaborator
 	// resolution now goes through the ExecutionRegistry. Fold the default

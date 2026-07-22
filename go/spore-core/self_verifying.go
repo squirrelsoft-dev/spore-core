@@ -34,6 +34,7 @@ package sporecore
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"time"
 )
 
@@ -89,6 +90,73 @@ type Verifier interface {
 // chunk; sporecore cannot import that package (cycle), so the content is
 // duplicated here as the single source of truth for the harness loop.
 const RoleEvaluatorChunk = "You are a fresh evaluator. You did not write the code under review. Default to FAIL."
+
+type emptyChunkProvider struct{}
+
+type harnessPromptChunk struct {
+	ID      string
+	Content string
+}
+
+func (emptyChunkProvider) Load(context.Context) ([]harnessPromptChunk, error) { return nil, nil }
+
+func (h *StandardHarness) roleEvaluatorChunk(ctx context.Context) string {
+	if h.config.ChunkProvider == nil {
+		return RoleEvaluatorChunk
+	}
+	loaded, ok := loadChunkProvider(ctx, h.config.ChunkProvider)
+	if !ok {
+		return RoleEvaluatorChunk
+	}
+	for _, chunk := range loaded {
+		if chunk.ID == "role-evaluator" {
+			return chunk.Content
+		}
+	}
+	return RoleEvaluatorChunk
+}
+
+func loadChunkProvider(ctx context.Context, provider any) ([]harnessPromptChunk, bool) {
+	v := reflect.ValueOf(provider)
+	if !v.IsValid() {
+		return nil, false
+	}
+	m := v.MethodByName("Load")
+	if !m.IsValid() || m.Type().NumIn() != 1 || m.Type().NumOut() != 2 {
+		return nil, false
+	}
+	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()
+	if !m.Type().In(0).AssignableTo(ctxType) {
+		return nil, false
+	}
+	outs := m.Call([]reflect.Value{reflect.ValueOf(ctx)})
+	if errVal := outs[1]; !errVal.IsNil() {
+		return nil, false
+	}
+	chunksVal := outs[0]
+	if chunksVal.Kind() != reflect.Slice && chunksVal.Kind() != reflect.Array {
+		return nil, false
+	}
+	chunks := make([]harnessPromptChunk, 0, chunksVal.Len())
+	for i := 0; i < chunksVal.Len(); i++ {
+		item := chunksVal.Index(i)
+		if item.Kind() == reflect.Pointer {
+			if item.IsNil() {
+				continue
+			}
+			item = item.Elem()
+		}
+		if item.Kind() != reflect.Struct {
+			continue
+		}
+		id := item.FieldByName("ID")
+		content := item.FieldByName("Content")
+		if id.IsValid() && content.IsValid() && id.Kind() == reflect.String && content.Kind() == reflect.String {
+			chunks = append(chunks, harnessPromptChunk{ID: id.String(), Content: content.String()})
+		}
+	}
+	return chunks, true
+}
 
 // ============================================================================
 // ReadOnlySandbox decorator (R3)
@@ -198,12 +266,13 @@ func (h *StandardHarness) EvaluatePhase(
 	totalUsage *AggregateUsage,
 ) RunResult {
 	// R4 (presence-only): prepend the role-evaluator chunk content to the review
-	// directive.
+	// directive. §F1: load it from HarnessConfig.ChunkProvider when present;
+	// default empty provider falls back to the byte-identical built-in constant.
 	directive := fmt.Sprintf(
 		"%s\n\nReview the work produced for the following task and report whether "+
 			"it is correct. You did NOT write this code; default to FAIL unless you "+
 			"can confirm it is right.\n\nTask:\n%s",
-		RoleEvaluatorChunk, task.Instruction,
+		h.roleEvaluatorChunk(ctx), task.Instruction,
 	)
 
 	// R2/R9: fresh, never-shared session id for the evaluate run.
