@@ -50,6 +50,7 @@ from .git import (
 from .http import HttpGetTool, HttpPostTool
 from .message import SendMessageTool
 from .search import FindFilesTool, GrepFilesTool, GrepTool
+from .set_plan import SetPlanTool
 from .subagent import (
     BuildError,
     ContextSharing,
@@ -98,6 +99,7 @@ __all__ = [
     "RunTestsTool",
     "SandboxViolationError",
     "SendMessageTool",
+    "SetPlanTool",
     "ExecuteFn",
     "StandardTool",
     "StandardTools",

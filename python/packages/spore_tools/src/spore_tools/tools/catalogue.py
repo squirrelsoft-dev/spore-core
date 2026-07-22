@@ -84,6 +84,7 @@ from .fs import ListDirTool, ReadFileTool, WriteFileTool
 from .memory import MemoryTool
 from .message import SendMessageTool
 from .search import FindFilesTool, GrepFilesTool, GrepTool
+from .set_plan import SetPlanTool
 from .tasklist import TaskListTool
 from .todo import TodoWriteTool
 from .web import WebFetchTool, WebSearchTool
@@ -184,6 +185,13 @@ class StandardTools:
     def task_list() -> StandardTool:
         """``task_list`` — EXISTING #71 tool (Q5 overlap: reused, not renamed)."""
         return StandardTool(TaskListTool(), TaskListTool.schema())
+
+    @staticmethod
+    def set_plan() -> StandardTool:
+        """``set_plan`` — atomic plan authoring (#126): the planner records its
+        whole plan in ONE call, persisting under the same durable key
+        ``task_list`` uses."""
+        return StandardTool(SetPlanTool(), SetPlanTool.schema())
 
     @staticmethod
     def memory() -> StandardTool:
