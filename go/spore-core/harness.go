@@ -3567,6 +3567,11 @@ type HarnessConfig struct {
 	// phrase-based prose escalation remains independent.
 	ToolCallNudge bool
 
+	// ToolSearch enables deferred tool exposure (§C2): the model sees a core set
+	// plus the tool_search meta-tool; real tool dispatch still delegates to the
+	// underlying registry.
+	ToolSearch *ToolSearchConfig
+
 	// ConsultHandlers is the per-kind consult-handler map (issue #114), keyed by
 	// ConsultRequest.Kind. Per go/CONVENTIONS.md this is a struct FIELD, not a
 	// builder setter — matching the established PlannerAgent / Verifier /
@@ -3687,6 +3692,12 @@ func (c HarnessConfig) WithChunkProvider(provider any) HarnessConfig {
 // WithPlanEmptyMaxRetries sets the number of empty-plan re-asks before HaltEmptyPlan.
 func (c HarnessConfig) WithPlanEmptyMaxRetries(retries uint32) HarnessConfig {
 	c.PlanEmptyMaxRetries = &retries
+	return c
+}
+
+// WithToolSearch enables deferred tool exposure via ToolSearchRegistry.
+func (c HarnessConfig) WithToolSearch(config ToolSearchConfig) HarnessConfig {
+	c.ToolSearch = &config
 	return c
 }
 
@@ -4781,15 +4792,22 @@ func (h *StandardHarness) effectiveToolRegistryWithProgress(sessionID SessionID,
 				// resets), while ephemeral session state stays on sessionID.
 				baseCtx,
 			)
-			return catalogue
+			return h.wrapToolSearch(catalogue)
 		}
 	}
 	// Fallback: empty handle (back-compat) or unregistered non-empty handle.
 	if h.config.CatalogueRegistry == nil {
-		return h.config.ToolRegistry
+		return h.wrapToolSearch(h.config.ToolRegistry)
 	}
 	h.config.CatalogueRegistry.SetToolContext(baseCtx)
-	return h.config.CatalogueRegistry
+	return h.wrapToolSearch(h.config.CatalogueRegistry)
+}
+
+func (h *StandardHarness) wrapToolSearch(registry ToolRegistry) ToolRegistry {
+	if h.config.ToolSearch == nil || registry == nil {
+		return registry
+	}
+	return NewToolSearchRegistry(registry, *h.config.ToolSearch)
 }
 
 // registrySchemas flattens a tool registry's active schemas (full catalogue —

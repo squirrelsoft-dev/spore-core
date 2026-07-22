@@ -43,7 +43,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // ============================================================================
@@ -556,6 +558,22 @@ type Tool interface {
 // ToolRegistry interface
 // ============================================================================
 
+// ToolNamespace is a logical group of tools (e.g. one MCP server). It is a
+// metadata surface for grouping registries/catalogues; it does not affect the
+// storage ProjectNamespace.
+type ToolNamespace struct {
+	Name  string
+	Tools []RegistryToolSchema
+}
+
+// ToolSearchConfig configures deferred tool exposure: CoreTools are advertised
+// up front alongside the tool_search meta-tool; DescriptionBudget bounds each
+// surfaced schema description in the search result (0 = no truncation).
+type ToolSearchConfig struct {
+	CoreTools         []string
+	DescriptionBudget uint32
+}
+
 // ToolRegistry is the canonical issue-#4 interface. Implementations maintain
 // the catalog and dispatch incoming tool calls.
 type ToolRegistry interface {
@@ -588,6 +606,113 @@ type ToolRegistry interface {
 	// Layer-1 always-halt tool. Kept for the harness loop's pre-dispatch
 	// short circuit.
 	IsAlwaysHalt(toolName string) bool
+}
+
+const ToolSearchToolName = "tool_search"
+
+// ToolSearchRegistry wraps another registry, advertising only a configured core
+// set plus the tool_search meta-tool while delegating real dispatch to the inner
+// registry. A search returns matching non-core schemas as JSON; callers may then
+// invoke the surfaced tool by name through the same wrapper.
+type ToolSearchRegistry struct {
+	inner ToolRegistry
+	cfg   ToolSearchConfig
+}
+
+func NewToolSearchRegistry(inner ToolRegistry, cfg ToolSearchConfig) *ToolSearchRegistry {
+	return &ToolSearchRegistry{inner: inner, cfg: cfg}
+}
+
+func (r *ToolSearchRegistry) Register(tool Tool, schema RegistryToolSchema) error {
+	return r.inner.Register(tool, schema)
+}
+
+func (r *ToolSearchRegistry) RegisterSet(set ToolSet) error { return r.inner.RegisterSet(set) }
+
+func (r *ToolSearchRegistry) ActiveSchemas(phase *TaskPhase) []RegistryToolSchema {
+	all := r.inner.ActiveSchemas(phase)
+	core := map[string]struct{}{}
+	for _, name := range r.cfg.CoreTools {
+		core[name] = struct{}{}
+	}
+	out := make([]RegistryToolSchema, 0, len(core)+1)
+	for _, schema := range all {
+		if _, ok := core[schema.Name]; ok {
+			out = append(out, schema)
+		}
+	}
+	out = append(out, toolSearchSchema())
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func toolSearchSchema() RegistryToolSchema {
+	return RegistryToolSchema{
+		Name:        ToolSearchToolName,
+		Description: "Search deferred tools by name or description and return matching tool schemas.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}`),
+		Annotations: ToolAnnotations{ReadOnly: true},
+	}
+}
+
+func (r *ToolSearchRegistry) Dispatch(ctx context.Context, call ToolCall, sandbox SandboxProvider) (HarnessToolResult, error) {
+	if call.Name != ToolSearchToolName {
+		return r.inner.Dispatch(ctx, call, sandbox)
+	}
+	var params struct {
+		Query string `json:"query"`
+		Limit int    `json:"limit"`
+	}
+	if err := json.Unmarshal(call.Input, &params); err != nil || strings.TrimSpace(params.Query) == "" {
+		return HarnessToolResult{CallID: call.ID, Output: ToolOutput{Kind: ToolOutputError, Message: "tool_search requires a non-empty query", Recoverable: true}}, nil
+	}
+	if params.Limit <= 0 {
+		params.Limit = 10
+	}
+	core := map[string]struct{}{}
+	for _, name := range r.cfg.CoreTools {
+		core[name] = struct{}{}
+	}
+	q := strings.ToLower(params.Query)
+	var matches []RegistryToolSchema
+	for _, schema := range r.inner.ActiveSchemas(nil) {
+		if _, isCore := core[schema.Name]; isCore || schema.Name == ToolSearchToolName {
+			continue
+		}
+		if strings.Contains(strings.ToLower(schema.Name), q) || strings.Contains(strings.ToLower(schema.Description), q) {
+			if r.cfg.DescriptionBudget > 0 && uint32(len(schema.Description)) > r.cfg.DescriptionBudget {
+				desc := schema.Description[:r.cfg.DescriptionBudget]
+				for len(desc) > 0 && !utf8.ValidString(desc) {
+					desc = desc[:len(desc)-1]
+				}
+				schema.Description = desc
+			}
+			matches = append(matches, schema)
+			if len(matches) >= params.Limit {
+				break
+			}
+		}
+	}
+	payload, _ := json.Marshal(matches)
+	return HarnessToolResult{CallID: call.ID, Output: ToolOutput{Kind: ToolOutputSuccess, Content: string(payload)}}, nil
+}
+
+func (r *ToolSearchRegistry) DispatchAll(ctx context.Context, calls []ToolCall, sandbox SandboxProvider) []DispatchOutcome {
+	out := make([]DispatchOutcome, len(calls))
+	for i, call := range calls {
+		res, err := r.Dispatch(ctx, call, sandbox)
+		if err != nil {
+			out[i].Err = err.(*DispatchError)
+		} else {
+			out[i].Result = res
+		}
+	}
+	return out
+}
+
+func (r *ToolSearchRegistry) HasSubagentTools() bool { return r.inner.HasSubagentTools() }
+func (r *ToolSearchRegistry) IsAlwaysHalt(toolName string) bool {
+	return r.inner.IsAlwaysHalt(toolName)
 }
 
 // DispatchOutcome is the per-slot result of DispatchAll. Exactly one of
