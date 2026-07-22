@@ -394,6 +394,11 @@ func progressPreview(stdout, stderr *sharedOutputBuffer) string {
 
 func drainCommandPipe(r io.Reader, buf *sharedOutputBuffer, done chan<- struct{}) {
 	defer close(done)
+	defer func() {
+		if c, ok := r.(io.Closer); ok {
+			_ = c.Close()
+		}
+	}()
 	_, _ = io.Copy(buf, r)
 }
 
@@ -554,20 +559,30 @@ func (s *WorkspaceScopedSandbox) ExecuteCommandStreaming(
 		}
 	}
 
-	// Drain stdout/stderr through explicit pipes so cmd.Wait only waits for the
-	// direct child; bounded post-wait drain joins prevent a background grandchild
-	// that inherited a pipe from holding the harness forever.
+	// Drain stdout/stderr through parent-owned pipes so cmd.Wait only waits for
+	// the direct child and cannot close the read side before our drains capture
+	// short output. The child receives the write ends; the parent closes its write
+	// descriptors immediately after Start, then bounded post-wait joins prevent a
+	// background grandchild that inherited a pipe from holding the harness forever.
 	stdoutBuf, stderrBuf := &sharedOutputBuffer{}, &sharedOutputBuffer{}
-	stdoutPipe, err := cmd.StdoutPipe()
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		return CommandOutput{}, &SandboxViolation{Kind: SandboxExecSpawnFailed, Command: command, Message: err.Error()}
 	}
-	stderrPipe, err := cmd.StderrPipe()
+	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
 		return CommandOutput{}, &SandboxViolation{Kind: SandboxExecSpawnFailed, Command: command, Message: err.Error()}
 	}
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
 	stdoutDone, stderrDone := make(chan struct{}), make(chan struct{})
 	if err := cmd.Start(); err != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		_ = stderrR.Close()
+		_ = stderrW.Close()
 		// SC-15: a failed spawn is a typed violation, not a fake
 		// CommandOutput{ExitCode: -1}.
 		return CommandOutput{}, &SandboxViolation{
@@ -576,8 +591,10 @@ func (s *WorkspaceScopedSandbox) ExecuteCommandStreaming(
 			Message: err.Error(),
 		}
 	}
-	go drainCommandPipe(stdoutPipe, stdoutBuf, stdoutDone)
-	go drainCommandPipe(stderrPipe, stderrBuf, stderrDone)
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
+	go drainCommandPipe(stdoutR, stdoutBuf, stdoutDone)
+	go drainCommandPipe(stderrR, stderrBuf, stderrDone)
 	pgid := processGroupID(cmd)
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()

@@ -2,6 +2,7 @@ package sporecore
 
 import (
 	"context"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +36,45 @@ func TestExecuteCommandSanitizesFinalAndProgressOutput(t *testing.T) {
 		if strings.Contains(p, "\x1b") || strings.Contains(p, "\r") {
 			t.Fatalf("preview not sanitized: %#v", previews)
 		}
+	}
+}
+
+func TestExecuteCommandLinuxCapturesBackgroundChildOutputAfterDirectExit(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux pipe ownership regression")
+	}
+	dir := t.TempDir()
+	sb, err := NewWorkspaceScopedSandbox(cfg(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, v := sb.ExecuteCommand(context.Background(), "/bin/sh", []string{"-c", "(sleep 0.1; echo late) & echo early"}, "", 0)
+	if v != nil {
+		t.Fatalf("violation: %+v", v)
+	}
+	stdout := strings.TrimSpace(out.Stdout)
+	if !strings.Contains(stdout, "early") || !strings.Contains(stdout, "late") {
+		t.Fatalf("stdout=%q, want early and late background-child output", out.Stdout)
+	}
+}
+
+func TestExecuteCommandLinuxCapturesInjectedEnvOutput(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux pipe ownership regression")
+	}
+	dir := t.TempDir()
+	cfg := cfg(dir)
+	cfg.ExecConfig = &ExecConfig{NonInteractiveEnv: map[string]string{"SPORE_PIPE_ENV": "captured"}}
+	sb, err := NewWorkspaceScopedSandbox(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, v := sb.ExecuteCommand(context.Background(), "/bin/sh", []string{"-c", "echo $SPORE_PIPE_ENV"}, "", 0)
+	if v != nil {
+		t.Fatalf("violation: %+v", v)
+	}
+	if strings.TrimSpace(out.Stdout) != "captured" {
+		t.Fatalf("stdout=%q, want injected env output", out.Stdout)
 	}
 }
 
