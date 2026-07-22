@@ -27,6 +27,7 @@ from spore_core import (
     InMemoryObservabilityProvider,
     InMemoryStorageProvider,
     PlanExecuteConfig,
+    PromptToolCallFlag,
     MockAgent,
     ModelAgent,
     NoopContextManager,
@@ -85,6 +86,7 @@ def _config(agent: MockAgent, **overrides: object) -> HarnessConfig:
         storage=overrides.get("storage", StorageProvider.single(InMemoryStorageProvider())),
         tool_call_nudge=overrides.get("tool_call_nudge", False),
         plan_empty_max_retries=overrides.get("plan_empty_max_retries", 0),
+        prompt_tool_call_flag=overrides.get("prompt_tool_call_flag"),
     )
 
 
@@ -115,6 +117,7 @@ class _RecordingAgent:
         self._results: list[TurnResult] = []
         self.call_count = 0
         self.tools_seen: list[list[str]] = []
+        self.seen: list[Any] = []
 
     def push(self, result: TurnResult) -> _RecordingAgent:
         self._results.append(result)
@@ -122,6 +125,7 @@ class _RecordingAgent:
 
     async def turn(self, context: Any) -> TurnResult:
         self.call_count += 1
+        self.seen.append(context)
         self.tools_seen.append([t.name for t in context.tools])
         if not self._results:
             raise AssertionError("recording agent ran out of scripted turns")
@@ -132,8 +136,8 @@ class _RecordingAgent:
 
 
 class _SchemaToolRegistry:
-    def __init__(self, name: str = "inspect") -> None:
-        self.name = name
+    def __init__(self, *names: str) -> None:
+        self.names = list(names) or ["inspect"]
         self.call_count = 0
 
     async def dispatch(self, call: ToolCall) -> ToolOutput:
@@ -147,11 +151,49 @@ class _SchemaToolRegistry:
     def schemas(self) -> list[ToolSchema]:
         return [
             ToolSchema(
-                name=self.name,
-                description="inspect project state",
+                name=name,
+                description=f"{name} tool",
                 input_schema={"type": "object", "properties": {}},
             )
+            for name in self.names
         ]
+
+
+def _texts_seen(context: Any) -> str:
+    parts: list[str] = []
+    for m in context.messages:
+        content = m.content
+        if isinstance(content, str):
+            parts.append(content)
+            continue
+        text = getattr(content, "text", None)
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
+
+
+class _RecordingContextManager:
+    async def assemble(self, session: SessionState, task: Task, sources: Any) -> Any:
+        _ = (task, sources)
+        from spore_core.agent import Context
+        from spore_core.model import ModelParams
+
+        return Context(messages=list(session.messages), tools=[], params=ModelParams())
+
+    async def append_user_message(self, session: SessionState, text: str) -> None:
+        from spore_core.model import Message, Role, TextContent
+
+        session.messages.append(Message(role=Role.USER, content=TextContent(text=text)))
+
+    async def append_assistant_message(self, session: SessionState, msg: Any) -> None:
+        session.messages.append(msg)
+
+    async def append_tool_result(self, session: SessionState, result: Any) -> None:
+        _ = (session, result)
+
+    def should_compact(self, session: SessionState) -> bool:
+        _ = session
+        return False
 
 
 # A two-task plan + the two step responses, in agent-queue order.
@@ -245,17 +287,31 @@ async def test_plan_empty_max_retries_reasks_with_tools_suppressed() -> None:
     a.push(FinalResponse(content='{"tasks":[],"rationale":"hidden"}', usage=_usage(1, 2)))
     a.push(FinalResponse(content='{"tasks":["retry task"],"rationale":"r"}', usage=_usage(3, 4)))
     a.push(FinalResponse(content="done after retry", usage=_usage(5, 6)))
-    reg = _SchemaToolRegistry("inspect")
-    h = StandardHarness(_config(a, tool_registry=reg, plan_empty_max_retries=1))
+    reg = _SchemaToolRegistry("set_plan", "inspect")
+    h = StandardHarness(
+        _config(
+            a,
+            tool_registry=reg,
+            plan_empty_max_retries=1,
+            context_manager=_RecordingContextManager(),
+        )
+    )
 
     r = await h.run(HarnessRunOptions(_task()))
 
     assert isinstance(r, RunResultSuccess)
     assert r.output == "done after retry"
     assert a.call_count == 3
-    # Plan attempt 0 kept tools; retry attempt used the reserved no-tools
-    # toolset; execute attempt restored the normal registry.
-    assert a.tools_seen == [["inspect"], [], ["inspect"]]
+    # Normal first attempt keeps the plan tool available and directs the model
+    # to author through set_plan, while retry suppresses all tools and asks for
+    # JSON message content because set_plan is unavailable.
+    assert a.tools_seen == [["set_plan", "inspect"], [], ["set_plan", "inspect"]]
+    first_plan_text = _texts_seen(a.seen[0])
+    assert "Record the plan ONLY through `set_plan`" in first_plan_text
+    assert "single JSON object" not in first_plan_text
+    retry_plan_text = _texts_seen(a.seen[1])
+    assert "single JSON object" in retry_plan_text
+    assert "do NOT call any tools" in retry_plan_text
     # Usage from the discarded empty attempt is folded into the terminal run.
     assert r.usage.input_tokens == 1 + 3 + 5
     assert r.usage.output_tokens == 2 + 4 + 6
@@ -292,7 +348,15 @@ async def test_tool_call_nudge_enabled_reasks_tool_free_execute_final() -> None:
     )
     a.push(FinalResponse(content="grounded", usage=_usage()))
     reg = _SchemaToolRegistry("inspect")
-    h = StandardHarness(_config(a, tool_registry=reg, tool_call_nudge=True))
+    flag = PromptToolCallFlag(False)
+    h = StandardHarness(
+        _config(
+            a,
+            tool_registry=reg,
+            tool_call_nudge=True,
+            prompt_tool_call_flag=flag,
+        )
+    )
 
     r = await h.run(HarnessRunOptions(_task()))
 
@@ -300,6 +364,10 @@ async def test_tool_call_nudge_enabled_reasks_tool_free_execute_final() -> None:
     assert r.output == "grounded"
     assert a.call_count == 4
     assert reg.call_count == 1
+    # Rust's adaptive branch flips the shared prompt-tool flag when either the
+    # phrase detector OR the structural zero-tool nudge fires, so the next turn
+    # switches conversational/local models into prompt-based tool calling.
+    assert flag.value is True
 
 
 # ---------------------------------------------------------------------------

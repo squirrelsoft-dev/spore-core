@@ -3,7 +3,7 @@
 > **Status: IMPLEMENTATION COMPLETE — reviewed; review findings fixed.**
 > Authoritative Rust revision: `7058db115b4f05b6b7cde1a3f62ba345c202bcde`
 > (`git rev-parse HEAD` at task start, branch `fm/parity-python`).
-> Final evidence: 1732 passed, 8 skipped; `ruff check` + `ruff format --check`
+> Final evidence: 1733 passed, 8 skipped; `ruff check` + `ruff format --check`
 > clean; 12 `examples/python/*` import + tests pass. See §12 for the
 > capability→evidence matrix and the review/rereview-fix log.
 
@@ -681,7 +681,7 @@ change. The Go and TypeScript parity tasks are prohibited from editing
 ## 12. Final parity matrix (implementation complete)
 
 Rust authoritative revision: `7058db115b4f05b6b7cde1a3f62ba345c202bcde`.
-Python suite: **1732 passed, 8 skipped**; `ruff check` clean; `ruff format --check` clean; all 12 `examples/python/*` import + per-example tests pass.
+Python suite: **1733 passed, 8 skipped**; `ruff check` clean; `ruff format --check` clean; all 12 `examples/python/*` import + per-example tests pass.
 
 | Step | Capability | Implementation | Evidence |
 |---|---|---|---|
@@ -689,14 +689,14 @@ Python suite: **1732 passed, 8 skipped**; `ruff check` clean; `ruff format --che
 | §5.1/§5.7/§5.9 | Stream-event wire format (`NodeAttr`, `TurnEnd.usage`, `ToolResult.revised`, `UserMessage.steered`, `StreamToolProgress`) | `harness.py` `_StreamEvent` base + `NodeAttr` + `wrap_node_sink` wired in react leaf + 4 combinators; resume-path `StreamToolCall`/`StreamToolResult` emission | `test_harness_stream_events.py` (9); golden `test_harness_streaming.py` normalized |
 | §5.4 | Mid-run `steering_source` | `HarnessConfig`/`HarnessBuilder.steering_source` + react-loop drain → `StreamUserMessage(steered=True)` | `test_harness_stream_events.py` steering test |
 | §5.6 | `CommandProgressSink` + `ToolProgress` | `harness.py` `CommandProgressSink` + `SandboxProvider.execute_command_streaming`; `tool_registry.py` `ToolProgressUpdate`/`ToolProgressSink` + `ToolContext.command_progress`/`with_progress`; `_effective_tool_registry` bridges stream→`StreamToolProgress` | `test_harness_stream_events.py` ToolProgress test |
-| §5.5 | Tool-call repair + prose/nudge recovery | new `tool_call_repair.py` (`coerce_tool_args`/`ToolCallFailure`/unified extended `detect_prose_response`/`StandardToolCallRepair`); runtime `prompt_tool_call.detect_prose_response` delegates to the same detector; `HarnessConfig.tool_call_repair`/`max_repair_attempts` + `_dispatch_with_repair`; `HarnessConfig.tool_call_nudge`/builder + structural execute-phase zero-tool nudge | `test_tool_call_repair.py` (17); `test_harness_plan_execute.py` nudge tests |
+| §5.5 | Tool-call repair + prose/nudge recovery | new `tool_call_repair.py` (`coerce_tool_args`/`ToolCallFailure`/unified extended `detect_prose_response`/`StandardToolCallRepair`); runtime `prompt_tool_call.detect_prose_response` delegates to the same detector; `HarnessConfig.tool_call_repair`/`max_repair_attempts` + `_dispatch_with_repair`; `HarnessConfig.tool_call_nudge`/builder + structural execute-phase zero-tool nudge; structural nudge also flips the adaptive prompt-tool flag on conversational/local-model harnesses | `test_tool_call_repair.py` (17); `test_harness_plan_execute.py` nudge tests; `test_harness_conversational.py` adaptive structural-nudge regression |
 | §5.3 | Hill-climbing VCS-aware revert | `HillCandidate`; `VcsProvider.head/commit_checkpoint/reset_to`; `_hill_climbing_head_sha/commit_accepted/reset_to/apply_winner`; `hill_iteration` mutates `cand`; winner applied at exits; `best_sha` in partial JSON | `test_harness_hill_climbing.py` VCS-aware + winner tests |
 | §5.10/§5.11 | Tool-registry progress + search | `ToolProgressSink`/`ToolProgressUpdate`; `ToolNamespace`/`ToolSearchConfig`/`ToolSearchRegistry` (LRU, budget eviction, namespace collision drop, dispatch-not-gated); harness wraps only catalogue-backed registries and preserves injected custom `tool_registry` unchanged | `test_tool_search_registry.py` (13) |
 | §5.12 | `HarnessContextManagerExt` | `compaction_adapter.py` name-parity shim | re-export + `test_public_api.py` |
 | §5.13 | `CustomCondition` | `prompt_assembly.CustomCondition = CustomPredicate`; root re-export | `test_public_api.py` alias test |
 | §5.14 | `embedding` + `vector_store` (full provider impls) | new `embedding.py` (`cosine_similarity`/`EmbeddingModel`/`OllamaEmbeddingModel`/`OpenAIEmbeddingModel`); terminal OpenAI embedding 429s classify as `ProviderError`; new `vector_store.py` (`VectorStore`/`InMemoryVectorStore`/…) | `test_embedding.py` (22) |
 | §5.15 | `image` module | new `image.py` (`media_type_for_extension`/`is_image_path`/`image_content`/`load_image_content`) | `test_image.py` (5) |
-| §5.16 | `set_plan` + `StandardTools` | new `spore_tools/tools/set_plan.py` + `StandardTools.set_plan()` preset | `test_set_plan.py` (6) |
+| §5.16 | `set_plan` + `StandardTools` | new `spore_tools/tools/set_plan.py` + `StandardTools.set_plan()` preset; normal PlanExecute directive now requires authoring the plan ONLY via `set_plan` (retry path remains JSON/no-tools because `set_plan` is unavailable) | `test_set_plan.py` (6); `test_harness_instruction_delivery.py` directive regression; `test_harness_plan_execute.py` retry JSON/no-tools regression |
 | §5.17 | Eval/CLI executable validation | `test_eval_cli_fixture.py` pins CLI to shared `core_suite.json` | `test_eval_cli_fixture.py` (7) |
 | rereview | PlanExecute empty-plan retry | `HarnessConfig.plan_empty_max_retries`/builder + PlanExecute re-ask loop; retry suppresses tools via reserved `__none__` toolset and forces canonical plan schema; default `0` preserves hard-fail | `test_harness_plan_execute.py` (18) |
 | §4.15 | Cancellation/timeout/retry/concurrency/cleanup/steering regression | `test_parity_lifecycle.py` (retryable set, backoff curve, `retryable()`, wall-time budget, `dispatch_all` concurrency, cleanup finalization success+failure, steering in-flight no-cancel) | `test_parity_lifecycle.py` (9) |
@@ -748,8 +748,10 @@ Every actionable finding in `data/parity-python-rereview/report.md` was fixed:
   `"I'll inspect ..."` on the runtime path.
 - **Medium — `tool_call_nudge`**: added `HarnessConfig.tool_call_nudge` +
   `HarnessBuilder.tool_call_nudge`; ReAct tracks execute-phase zero-tool windows
-  and applies Rust's bounded structural nudge. Regressions cover default-off and
-  enabled behavior.
+  and applies Rust's bounded structural nudge. The structural signal also flips
+  the adaptive prompt-tool flag on conversational/local-model harnesses, matching
+  Rust's combined `phrase || structural` branch. Regressions cover default-off,
+  enabled behavior, and adaptive prompt-mode activation.
 - **Medium — `plan_empty_max_retries`**: added config/builder/accessor and a
   PlanExecute retry loop. Retries suppress tools with reserved `__none__` and
   force the canonical plan JSON schema; discarded usage is folded into terminal
@@ -765,6 +767,25 @@ Every actionable finding in `data/parity-python-rereview/report.md` was fixed:
 - **Low — matrix freshness**: §12 evidence and counts updated to the rereview
   state.
 
+### Final-verification-fix log (final independent verification of PR #168)
+
+The final two actionable findings in `data/parity-python-final-review/report.md`
+were fixed:
+
+- **Medium — PlanExecute first-attempt contract**: `StandardHarness.plan_directive`
+  now uses Rust's `set_plan` wording: planners must record the plan ONLY through
+  `set_plan` and must not write the normal first-attempt plan as JSON/text.
+  The retry path is unchanged: retries suppress tools and ask for JSON content
+  because `set_plan` is unavailable. Regressions cover directive delivery,
+  first-attempt `set_plan` advertisement, and retry JSON/no-tools behavior.
+- **Medium — structural `tool_call_nudge` adaptive mode**: the structural
+  zero-tool execute signal is now evaluated inside the adaptive prompt-tool flag
+  branch and sets the shared flag, matching Rust's `phrase || structural`
+  behavior. A conversational harness regression observes prompt-tool instructions
+  injected on the next model request.
+- **Low — matrix freshness**: §12 evidence and counts updated to the final
+  verification state.
+
 ---
 
 resolved: plan review decisions incorporated (C1 full embedding/vector_store provider impls now; C5 image.rs confirmed public module, concrete plan; C6 eval/CLI parity pinned by executable validation against fixtures/task_suites/core_suite.json; §4.15 cancellation/timeout/retry/cleanup + async/concurrency matrix added with evidence and regression tests)
@@ -772,3 +793,5 @@ resolved: plan review decisions incorporated (C1 full embedding/vector_store pro
 resolved: independent review findings fixed (NodeAttr wire compat, VectorStore delete/len/is_empty, ToolSearchRegistry harness integration, OpenAI error envelope, non-string query, non-finite coercion, cleanup/steering lifecycle tests, status text coherence) [key=parity-python-review]
 
 resolved: second independent rereview findings fixed (unified runtime prose detector, `tool_call_nudge`, `plan_empty_max_retries`, custom-registry `tool_search` fallback, terminal OpenAI embedding 429 classification, `CustomCondition` alias/export, final matrix refreshed) [key=parity-python-rereview]
+
+resolved: final independent verification findings fixed (PlanExecute first-attempt `set_plan` directive while preserving retry JSON/no-tools behavior; structural `tool_call_nudge` flips adaptive prompt-tool flag; final matrix refreshed) [key=parity-python-final-review]

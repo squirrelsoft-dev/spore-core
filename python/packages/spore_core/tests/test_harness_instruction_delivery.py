@@ -241,8 +241,8 @@ async def test_model_params_reach_execute_subloop() -> None:
 # ---------------------------------------------------------------------------
 # #93: the plan-phase directive must NOT leak into the execute-step contexts.
 #
-# The plan phase ("Produce a step-by-step plan… Respond with a single JSON
-# object…") used to be appended to the SHARED session_state, which the execute
+# The plan phase ("Produce a step-by-step plan… Record the plan ONLY through
+# set_plan…") used to be appended to the SHARED session_state, which the execute
 # phase threads into every subtask sub-loop. An instruction-following model then
 # re-emits a plan each step instead of calling tools. The fix scratch-clones the
 # planning turn so the directive reaches only the plan turn. Mirrors Rust's
@@ -251,7 +251,8 @@ async def test_model_params_reach_execute_subloop() -> None:
 
 
 _PLAN_DIRECTIVE_HEAD = "Produce a step-by-step plan"
-_PLAN_DIRECTIVE_JSON = "Respond with a single JSON object"
+_PLAN_DIRECTIVE_SET_PLAN = "Record the plan ONLY through `set_plan`"
+_PLAN_DIRECTIVE_OLD_JSON = "Respond with a single JSON object"
 
 
 class _ScriptedTurnAgent:
@@ -346,7 +347,12 @@ async def test_plan_directive_does_not_leak_into_execute_context() -> None:
     # The PLAN turn (index 0) DOES carry the directive — that's correct.
     plan_text = _context_texts(agent.seen[0])
     assert _PLAN_DIRECTIVE_HEAD in plan_text, f"plan turn should see the directive: {plan_text!r}"
-    assert _PLAN_DIRECTIVE_JSON in plan_text, f"plan turn should see the directive: {plan_text!r}"
+    assert _PLAN_DIRECTIVE_SET_PLAN in plan_text, (
+        f"plan turn should see the set_plan directive: {plan_text!r}"
+    )
+    assert _PLAN_DIRECTIVE_OLD_JSON not in plan_text, (
+        f"normal first plan attempt should not use the old JSON directive: {plan_text!r}"
+    )
 
     # No EXECUTE-step context (indices 1..) may carry the directive.
     for i, c in enumerate(agent.seen[1:], start=1):
@@ -354,7 +360,7 @@ async def test_plan_directive_does_not_leak_into_execute_context() -> None:
         assert _PLAN_DIRECTIVE_HEAD not in text, (
             f"execute-step context {i} leaked the directive: {text!r}"
         )
-        assert _PLAN_DIRECTIVE_JSON not in text, (
+        assert _PLAN_DIRECTIVE_SET_PLAN not in text, (
             f"execute-step context {i} leaked the directive: {text!r}"
         )
 

@@ -1524,9 +1524,11 @@ class StrategyExecutor(Protocol):
 
     def plan_directive(self, instruction: str) -> str:
         """The planning directive seeded before the plan sub-strategy runs (R1) —
-        the "respond with a single JSON plan" instruction wrapped around the
-        task. Seeded by the recursive PlanExecute ``run`` body before it dispatches
-        ``self.plan`` (#124)."""
+        the "record your plan via the ``set_plan`` tool" instruction wrapped
+        around the task: the canonical authoring path (#126 decision C). The
+        retry nudge still asks for JSON message content because retries run with
+        tools suppressed (``set_plan`` unavailable). Seeded by the recursive
+        PlanExecute ``run`` body before it dispatches ``self.plan`` (#124)."""
         ...
 
     async def seed_user_message(self, session_state: SessionState, text: str) -> None:
@@ -8976,9 +8978,11 @@ class StandardHarness:
         """:class:`StrategyExecutor` primitive: the planning directive seeded
         before the plan sub-strategy runs (R1)."""
         return (
-            "Produce a step-by-step plan for the following task. Respond with a "
-            'single JSON object: {"tasks": [<ordered step strings>], '
-            '"rationale": <string>}.\n\nTask:\n' + instruction
+            "Produce a step-by-step plan for the following task, then RECORD it by "
+            "calling the `set_plan` tool with `tasks` = the ordered list of concrete "
+            "step strings (plus an optional one-line `rationale`). Record the plan "
+            "ONLY through `set_plan` — do NOT write it as a JSON or text message."
+            "\n\nTask:\n" + instruction
         )
 
     async def seed_user_message(self, session_state: SessionState, text: str) -> None:
@@ -10685,21 +10689,32 @@ class StandardHarness:
 
                 # Adaptive prompt-based tool-calling escalation (#111). When
                 # tools were advertised but the model answered in prose with
-                # action-intent language (it *meant* to act), set the session
-                # flag so the wrapped model switches to prompt-based tool calling,
-                # nudge the model, and force another turn instead of completing.
-                # Guarded on the flag being unset so it fires at most once per
-                # window (bounded — one extra turn) and only on the conversational
-                # adaptive path.
+                # action-intent language (it *meant* to act), OR when the
+                # opt-in structural ``tool_call_nudge`` detects an EXECUTE-phase
+                # terminal answer that called ZERO tools while tools were
+                # advertised, set the session flag so the wrapped model switches
+                # to prompt-based tool calling, nudge the model, and force
+                # another turn instead of completing. Guarded on the flag being
+                # unset so it fires at most once per window (bounded — one extra
+                # turn) and only on the conversational adaptive path. Mirrors
+                # Rust's combined ``phrase || structural`` adaptive branch.
                 flag = config.prompt_tool_call_flag
+                prose_detected = detect_prose_response(result.content, tools_advertised) is not None
+                structural_detected = (
+                    config.tool_call_nudge
+                    and in_execute_step
+                    and tools_advertised
+                    and tools_called_this_window == 0
+                    and output_schema is None
+                )
                 if (
                     flag is not None
                     and flag.value is False
-                    and detect_prose_response(result.content, tools_advertised) is not None
+                    and (prose_detected or structural_detected)
                 ):
                     flag.value = True
-                    # Record the model's prose, then a corrective nudge, so the
-                    # next turn has coherent context.
+                    # Record the model's failed output, then a corrective nudge,
+                    # so the next turn has coherent context.
                     appender = getattr(config.context_manager, "append_assistant_message", None)
                     if appender is not None:
                         await appender(
@@ -10710,8 +10725,10 @@ class StandardHarness:
                             ),
                         )
                     nudge = (
-                        "You described an action but did not call a tool. Use the "
-                        "provided tool-call format to actually invoke the tool."
+                        "No tool call was detected in your last response. The "
+                        "tools available to you and the exact tool-call format are "
+                        "described in the system prompt — use that format now to "
+                        "actually invoke a tool, not prose or a code block."
                     )
                     await config.context_manager.append_user_message(session_state, nudge)
                     continue

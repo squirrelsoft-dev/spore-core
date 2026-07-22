@@ -8,19 +8,27 @@ and ``Task.simple`` should default to a fresh session id + ReAct(8).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
 from spore_core import (
     CompleteOnFinalResponse,
     EmptyToolRegistry,
     HarnessBuilder,
     HarnessRunOptions,
+    InMemoryStorageProvider,
+    PlanExecuteConfig,
     ReactConfig,
+    RegistryToolSchema,
     NoopContextManager,
     NullSandbox,
     ProviderInfo,
     RunResultSuccess,
+    StorageProvider,
     Task,
     TerminationContinue,
     ToolCall,
+    ToolOutputSuccess,
 )
 from spore_core.harness import BudgetSnapshot, SessionState
 from spore_core.model import (
@@ -59,6 +67,104 @@ class _GreetingModel:
 
     def provider(self) -> ProviderInfo:
         return ProviderInfo(name="test", model_id="greeting", context_window=8192)
+
+
+class _ScriptedRecordingModel:
+    def __init__(self, responses: list[str]) -> None:
+        self._responses = list(responses)
+        self.requests: list[ModelRequest] = []
+
+    async def call(self, request: ModelRequest) -> ModelResponse:
+        self.requests.append(request.model_copy(deep=True))
+        if not self._responses:
+            raise AssertionError("scripted model ran out of responses")
+        return ModelResponse(
+            content=[TextBlock(text=self._responses.pop(0))],
+            usage=TokenUsage(input_tokens=1, output_tokens=1),
+            stop_reason=StopReason.END_TURN,
+        )
+
+    async def call_streaming(self, request: ModelRequest):  # pragma: no cover - unused
+        yield  # type: ignore[misc]
+
+    async def count_tokens(self, request: ModelRequest) -> int:
+        _ = request
+        return 1
+
+    def provider(self) -> ProviderInfo:
+        return ProviderInfo(name="test", model_id="scripted", context_window=8192)
+
+
+class _InspectTool:
+    def name(self) -> str:
+        return "inspect"
+
+    def is_subagent_tool(self) -> bool:
+        return False
+
+    def may_produce_large_output(self) -> bool:
+        return False
+
+    async def execute(self, call: Any, sandbox: Any, ctx: Any) -> Any:
+        _ = (call, sandbox, ctx)
+        return ToolOutputSuccess.success("inspected")
+
+
+@dataclass
+class _ToolBundle:
+    implementation: Any
+    schema: Any
+
+
+def _inspect_bundle() -> _ToolBundle:
+    return _ToolBundle(
+        implementation=_InspectTool(),
+        schema=RegistryToolSchema(
+            name="inspect",
+            description="inspect project state",
+            parameters={"type": "object", "properties": {}},
+        ),
+    )
+
+
+async def test_conversational_structural_nudge_activates_prompt_tool_mode() -> None:
+    model = _ScriptedRecordingModel(
+        [
+            '{"tasks":["inspect repo"],"rationale":"r"}',
+            "guessed without tools",
+            "<tool_call><name>inspect</name><input>{}</input></tool_call>",
+            "grounded",
+        ]
+    )
+    harness = (
+        HarnessBuilder.conversational(model)
+        .tool(_inspect_bundle())
+        .tool_call_nudge(True)
+        .storage(StorageProvider.single(InMemoryStorageProvider()))
+        .build()
+    )
+
+    result = await harness.run(
+        HarnessRunOptions(Task.new("inspect", "conv-nudge", PlanExecuteConfig.simple()))
+    )
+
+    assert isinstance(result, RunResultSuccess)
+    assert result.output == "grounded"
+    assert len(model.requests) == 4
+    # Request 2 is the first execute answer and is still native mode. The
+    # structural nudge flips the shared adaptive flag, so request 3 has the
+    # prompt-tool instructions injected before the inner model is called.
+    assert "<available_tools>" not in _request_text(model.requests[1])
+    assert "<available_tools>" in _request_text(model.requests[2])
+
+
+def _request_text(request: ModelRequest) -> str:
+    parts: list[str] = []
+    for message in request.messages:
+        text = getattr(message.content, "text", None)
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
 
 
 async def test_conversational_single_turn_success() -> None:
