@@ -332,6 +332,52 @@ func (t *ListDirTool) Execute(ctx context.Context, call sporecore.ToolCall, sand
 }
 
 // ============================================================================
+// CreateDir
+// ============================================================================
+
+// CreateDirTool creates a directory and any missing parents (mkdir -p).
+type CreateDirTool struct{}
+
+func NewCreateDirTool() *CreateDirTool { return &CreateDirTool{} }
+
+const CreateDirToolName = "create_dir"
+
+func (*CreateDirTool) Name() string                { return CreateDirToolName }
+func (*CreateDirTool) IsSubagentTool() bool        { return false }
+func (*CreateDirTool) MayProduceLargeOutput() bool { return false }
+
+func (*CreateDirTool) Schema() sporecore.RegistryToolSchema {
+	return sporecore.RegistryToolSchema{
+		Name:        CreateDirToolName,
+		Description: "Create a directory, including any missing parent directories (like mkdir -p)",
+		Parameters: json.RawMessage(`{
+			"type": "object",
+			"properties": {"path": {"type": "string"}},
+			"required": ["path"]
+		}`),
+		Annotations: sporecore.ToolAnnotations{},
+	}
+}
+
+func (t *CreateDirTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
+	var params CreateDirParams
+	if e := parseParams(call, &params); e != nil {
+		return e.ToToolOutput()
+	}
+	resolved, v := sandbox.ResolvePath(ctx, params.Path, sporecore.OperationWrite)
+	if v != nil {
+		return SandboxViolationError(v).ToToolOutput()
+	}
+	if err := os.MkdirAll(resolved, 0o755); err != nil {
+		return ExecutionFailed(fmt.Sprintf("create_dir failed: %s", err), true).ToToolOutput()
+	}
+	return sporecore.ToolOutput{
+		Kind:    sporecore.ToolOutputSuccess,
+		Content: fmt.Sprintf("created directory %s", params.Path),
+	}
+}
+
+// ============================================================================
 // DeleteFile
 // ============================================================================
 

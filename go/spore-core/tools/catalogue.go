@@ -92,6 +92,15 @@ func (StandardTools) WriteFile() StandardTool { return newStandardTool(NewWriteF
 // EditFile — NEW unique-match in-place edit (alongside write_file).
 func (StandardTools) EditFile() StandardTool { return newStandardTool(NewEditFileTool()) }
 
+// CreateDir — NEW; mkdir -p a directory (and any missing parents).
+func (StandardTools) CreateDir() StandardTool { return newStandardTool(NewCreateDirTool()) }
+
+// MoveFile — NEW; move/rename a file (mv semantics).
+func (StandardTools) MoveFile() StandardTool { return newStandardTool(NewMoveFileTool()) }
+
+// DeleteFile — NEW; delete a file.
+func (StandardTools) DeleteFile() StandardTool { return newStandardTool(NewDeleteFileTool()) }
+
 // ListDir — EXISTING #5 tool (Q5 overlap: reused, not renamed).
 func (StandardTools) ListDir() StandardTool { return newStandardTool(NewListDirTool()) }
 
@@ -133,6 +142,11 @@ func (StandardTools) TodoWrite() StandardTool { return newStandardTool(NewTodoWr
 
 // TaskList — EXISTING #71 tool (Q5 overlap: reused, not renamed).
 func (StandardTools) TaskList() StandardTool { return newStandardTool(NewTaskListTool()) }
+
+// SetPlan — NEW; the planner authors its whole plan in ONE atomic call,
+// persisting it under the same durable task_list key the execute phase reads.
+// Its terminal signal is HarnessSignal.PlanRecorded (consumed inside PlanExecute).
+func (StandardTools) SetPlan() StandardTool { return newStandardTool(NewSetPlanTool()) }
 
 // Memory — NEW #82; scope-aware episodic read/write over the #78 memory seam.
 func (StandardTools) Memory() StandardTool { return newStandardTool(NewMemoryTool()) }
@@ -178,6 +192,9 @@ func (s StandardTools) CodingSet() []StandardTool {
 		s.ReadFile(),
 		s.WriteFile(),
 		s.EditFile(),
+		s.CreateDir(),
+		s.MoveFile(),
+		s.DeleteFile(),
 		s.ListDir(),
 		s.GrepFiles(),
 		s.Grep(),
@@ -188,6 +205,7 @@ func (s StandardTools) CodingSet() []StandardTool {
 		s.WebSearch(),
 		s.TodoWrite(),
 		s.TaskList(),
+		s.SetPlan(),
 		s.Memory(),
 	}
 }

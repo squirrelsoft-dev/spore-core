@@ -64,6 +64,10 @@ type DeleteFileParams struct {
 	Path string `json:"path"`
 }
 
+type CreateDirParams struct {
+	Path string `json:"path"`
+}
+
 type MoveFileParams struct {
 	Src string `json:"src"`
 	Dst string `json:"dst"`

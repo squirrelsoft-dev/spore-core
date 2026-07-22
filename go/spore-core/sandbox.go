@@ -174,16 +174,44 @@ func (s *WorkspaceScopedSandbox) ResolvePath(_ context.Context, raw string, op O
 	// path that resolves *outside* the root is still a PathEscape.
 	canonical, err := canonicalize(joined)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			parent := filepath.Dir(joined)
-			leaf := filepath.Base(joined)
-			cp, parentErr := canonicalize(parent)
-			if parentErr != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", &SandboxViolation{Kind: SandboxPathEscape, Path: raw}
+		}
+		// Walk up to the nearest EXISTING ancestor, canonicalize it, and re-join
+		// the missing components — so a target several levels inside a
+		// not-yet-created subtree still resolves (write_file / create_dir then
+		// materialize the directories). Mirrors the Rust reference's ancestor
+		// walk. Symlinks can only live in the existing prefix (a missing path
+		// contains none), so canonicalizing that prefix is as strong as
+		// canonicalizing a direct parent. A `..`-terminated ancestor aborts
+		// the walk: a lexical re-join across `..` cannot be trusted once the
+		// directories exist.
+		ancestor := joined
+		var missing []string
+		for {
+			name := filepath.Base(ancestor)
+			if name == string(filepath.Separator) || name == "." || name == "" {
 				return "", &SandboxViolation{Kind: SandboxPathEscape, Path: raw}
 			}
-			canonical = filepath.Join(cp, leaf)
-		} else {
-			return "", &SandboxViolation{Kind: SandboxPathEscape, Path: raw}
+			missing = append(missing, name)
+			parent := filepath.Dir(ancestor)
+			if parent == ancestor {
+				return "", &SandboxViolation{Kind: SandboxPathEscape, Path: raw}
+			}
+			cp, parentErr := canonicalize(parent)
+			if parentErr == nil {
+				// Re-join the missing components (in reverse — outermost first)
+				// onto the canonicalized existing ancestor.
+				canonical = cp
+				for i := len(missing) - 1; i >= 0; i-- {
+					canonical = filepath.Join(canonical, missing[i])
+				}
+				break
+			}
+			if !errors.Is(parentErr, os.ErrNotExist) {
+				return "", &SandboxViolation{Kind: SandboxPathEscape, Path: raw}
+			}
+			ancestor = parent
 		}
 	}
 
@@ -348,10 +376,13 @@ func (s *WorkspaceScopedSandbox) ExecuteCommand(
 		runCtx, cancel = context.WithTimeout(ctx, effectiveTimeout)
 		defer cancel()
 	}
-	// KillOnDrop is satisfied by construction: exec.CommandContext kills the
-	// child when runCtx is cancelled (the timeout firing, or an outer cancel),
-	// which is Go's native kill-on-drop. No extra wiring is needed.
+	// Process-group reap parity (Rust `cmd.process_group(0)` + GroupKillGuard):
+	// make the child a group leader so a cancel/timeout can kill the WHOLE
+	// group, not just the direct child. Without this, a grandchild holding the
+	// stdout pipe open (e.g. `sh -c "echo x; sleep 30"`) would block cmd.Output()
+	// until it exits naturally — orphaning work on cancel/timeout.
 	cmd := exec.CommandContext(runCtx, command, args...)
+	setProcessGroup(cmd)
 	if workingDir != "" {
 		cmd.Dir = workingDir
 	} else {
@@ -382,41 +413,68 @@ func (s *WorkspaceScopedSandbox) ExecuteCommand(
 		}
 	}
 
-	stdout, err := cmd.Output()
-	stderr := ""
-	if ee, ok := err.(*exec.ExitError); ok {
-		stderr = string(ee.Stderr)
+	// Drain stdout/stderr into buffers so the pipes don't fill and block the
+	// child, and so the bytes captured so far remain reachable after a
+	// group-kill (mirrors the Rust shared-buffer drain).
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+	if err := cmd.Start(); err != nil {
+		// SC-15: a failed spawn is a typed violation, not a fake
+		// CommandOutput{ExitCode: -1}.
+		return CommandOutput{}, &SandboxViolation{
+			Kind:    SandboxExecSpawnFailed,
+			Command: command,
+			Message: err.Error(),
+		}
 	}
-	exitCode := 0
-	if err != nil {
+	pgid := processGroupID(cmd)
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+
+	select {
+	case err := <-waitCh:
+		// Normal exit. The group guard is disarmed (nothing to reap).
+		exitCode := 0
+		if err != nil {
+			if ee, ok := err.(*exec.ExitError); ok {
+				exitCode = ee.ExitCode()
+			} else {
+				// Should not happen after a successful Start, but stay safe.
+				return CommandOutput{}, &SandboxViolation{
+					Kind:    SandboxExecSpawnFailed,
+					Command: command,
+					Message: err.Error(),
+				}
+			}
+		}
+		return CommandOutput{
+			Stdout:   stdoutBuf.String(),
+			Stderr:   stderrBuf.String(),
+			ExitCode: exitCode,
+		}, nil
+	case <-runCtx.Done():
+		// Cancel/timeout: kill the WHOLE process group (child + grandchildren),
+		// then reap the child so it doesn't zombie.
+		killProcessGroup(pgid)
+		<-waitCh
 		if runCtx.Err() == context.DeadlineExceeded {
 			return CommandOutput{
-				Stdout:   "",
+				Stdout:   stdoutBuf.String(),
 				Stderr:   fmt.Sprintf("command timed out after %s", effectiveTimeout),
 				ExitCode: -1,
 				TimedOut: true,
 			}, nil
 		}
-		if ee, ok := err.(*exec.ExitError); ok {
-			exitCode = ee.ExitCode()
-		} else {
-			// SC-15: a failed spawn is a typed violation, not a fake
-			// CommandOutput{ExitCode: -1}. Callers already handle the
-			// *SandboxViolation arm. Timeout (handled above) keeps its
-			// CommandOutput{ExitCode: -1, TimedOut: true} — a real run that
-			// exceeded the clock, not a spawn failure.
-			return CommandOutput{}, &SandboxViolation{
-				Kind:    SandboxExecSpawnFailed,
-				Command: command,
-				Message: err.Error(),
-			}
-		}
+		// Outer context cancelled (not a deadline). Surface as a signal-killed
+		// CommandOutput — not TimedOut — so callers can distinguish cancel vs
+		// timeout. The group has been reaped.
+		return CommandOutput{
+			Stdout:   stdoutBuf.String(),
+			Stderr:   "command cancelled",
+			ExitCode: -1,
+		}, nil
 	}
-	return CommandOutput{
-		Stdout:   string(stdout),
-		Stderr:   stderr,
-		ExitCode: exitCode,
-	}, nil
 }
 
 // ============================================================================
