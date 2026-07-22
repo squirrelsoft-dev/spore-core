@@ -1,10 +1,20 @@
 # Rust → TypeScript Harness Parity Plan
 
-> **Status: PLAN-FIRST CHECKPOINT — no implementation started.**
+> **Status: PLAN-FIRST CHECKPOINT (revised) — no implementation started.**
 > Authoritative Rust revision recorded below. This document inventories the
 > Rust harness and the current TypeScript implementation end to end, records a
-> parity matrix, and specifies file-level steps. It is ready for second-mate
-> review. No implementation code has been written.
+> parity matrix, and specifies file-level steps. It is ready for captain
+> approval. No implementation code has been written.
+>
+> **Revision note (captain scope decision incorporated):** the complete
+> TypeScript `spore-core` + `spore-eval` surface is IN SCOPE, including the
+> full in-core `VectorStore` / `EmbeddingModel` traits and their Ollama/OpenAI
+> providers (§5 G-L, mocked-HTTP validation) and the three missing TypeScript
+> doc pages (§5 G-M). The separate `spore-mcp` / `spore-sqlvec` packages and
+> the feature-gated Petri backend are OUT OF SCOPE — documented as known gaps,
+> not created (§9). Added §5.2 with explicit executable cancellation, timeout,
+> retry, cleanup, and async/concurrency scenarios. Rust remains strictly
+> read-only.
 
 ## 1. Authoritative revision & scope
 
@@ -22,22 +32,25 @@
 - **TypeScript edit surface:** `typescript/`, `docs/typescript/`,
   `examples/typescript/`, and TypeScript-specific tests/configuration only.
 
-### Out-of-scope Rust crates (decision required)
+### Out-of-scope Rust subsystems (captain decision — known gaps, not created)
 
 - `rust/crates/spore-mcp` — MCP client that surfaces a remote MCP server's
   tools as native `Tool`s via the `rmcp` SDK. A **separate crate** depending on
   `spore-core`; not part of the core harness library. No TypeScript package
-  equivalent exists today.
+  equivalent will be created.
 - `rust/crates/spore-sqlvec` — sqlite-vec `VectorStore` backend. A **separate
   crate** depending on `spore-core`'s `VectorStore`/`EmbeddingModel` traits.
-  No TypeScript package equivalent exists today.
+  No TypeScript package equivalent will be created.
+- `rust/crates/spore-core/src/sandbox_petri.rs` — feature-gated Petri
+  isolation backend (`#[cfg(feature = "petri")]`). No TS equivalent will be
+  created.
 
-These are extension crates, not the harness itself. **Decision needed** (see
-§9): whether "full observable behavioral parity" requires authoring TypeScript
-`@spore/mcp` and `@spore/sqlvec` packages, or whether parity is scoped to the
-`spore-core` + `spore-eval` surface (the harness runtime + eval). The plan
-below assumes the **core + eval** scope and flags the trait-level prerequisites
-(`VectorStore`, `EmbeddingModel`) that currently have no TS home.
+Per the captain's scope decision (§9), these are documented as **known gaps**
+in the final matrix (§10) and are NOT implemented in this parity pass. NOTE:
+the `VectorStore` / `EmbeddingModel` *traits and their in-core Ollama/OpenAI
+providers* are NOT out of scope — they live in `spore-core` itself and ARE
+implemented (§5 G-L). Only the separate `@spore/sqlvec` *backend package*
+(and `@spore/mcp`, Petri) are out of scope.
 
 ## 2. Methodology & evidence conventions
 
@@ -123,7 +136,7 @@ below assumes the **core + eval** scope and flags the trait-level prerequisites
 | S1 | `SandboxProvider` (`validate`, `execute_command`, `handle_large_output`, `resolve_path`, `isolation_mode`, `workspace_root`) | `rust/.../harness/providers.rs:113-260` | `typescript/.../harness/types.ts:4622-4660` | OBSERVED PARITY | — |
 | S2 | **`execute_command_streaming` (with `CommandProgressSink`)** — streaming subprocess output, default delegates to `execute_command` | `rust/.../harness/providers.rs:111,177-200` | **No `executeCommandStreaming`, no `CommandProgressSink`** in TS `SandboxProvider` | **GAP** | major |
 | S3 | `WorkspaceScopedSandbox`, `NullSandbox`, `ReadOnlySandbox`, `BwrapProfile`, `NetworkPolicy`, `IsolationMode`, `SandboxViolation`, `ExecConfig` (`kill_on_drop`) | `rust/.../sandbox.rs`, `providers.rs:306-360` | `typescript/.../sandbox/*.ts`, `harness/types.ts:4449-4552` | OBSERVED PARITY | — |
-| S4 | `sandbox_petri` (Petri isolation backend, feature-gated) | `rust/.../sandbox_petri.rs` | **No TS equivalent** (feature-gated Rust-only backend) | **GAP** (minor — opt-in backend; see §9) | minor |
+| S4 | `sandbox_petri` (Petri isolation backend, feature-gated) | `rust/.../sandbox_petri.rs` | **No TS equivalent** (feature-gated Rust-only backend) | **GAP** (out of scope — known gap, §9) | minor |
 
 ### 4.4 Model providers, streaming, recording/replay, prompt-tool-call, tool-call-repair
 
@@ -170,8 +183,8 @@ below assumes the **core + eval** scope and flags the trait-level prerequisites
 | X14 | `plan` (`capture_plan_artifact`, `PlanPhaseError`, `PLAN_EXECUTE_EXTRAS_KEY`) | `rust/.../plan.rs` | `typescript/.../plan/*.ts` | OBSERVED PARITY | — |
 | X15 | `tasklist` (`plan_artifact_to_task_list` [deprecated], `TaskList`, `TaskStatus`, `TASK_LIST_EXTRAS_KEY`, `push_step_ledger`, `render_step_ledger`, `StepLedgerEntry`, `STEP_LEDGER_*`) | `rust/.../tasklist.rs` | `typescript/.../tasklist/*.ts` | OBSERVED PARITY | — |
 | X16 | `ExecutionRegistry`/`ExecutionRegistryBuilder`/`EscalationMode`/`AutoGrantInfo`/`StrategyResolution`/`GrantCallback` | `rust/.../execution_registry.rs` | `typescript/.../harness/execution-registry.ts` | OBSERVED PARITY | — |
-| X17 | **`vector_store` (`VectorStore`, `VectorRecord`, `VectorHit`, `MetadataFilter`, `VectorStoreError`)** | `rust/.../vector_store.rs` (in spore-core) | **No TS module.** `grep VectorStore` TS → 0 hits. | **GAP** | major (trait prerequisite for sqlvec; see §9) |
-| X18 | **`embedding` (`cosine_similarity`, `EmbeddingInfo`, `EmbeddingModel`, `OllamaEmbeddingModel`, `OpenAIEmbeddingModel`)** | `rust/.../embedding.rs` (in spore-core) | **No TS module.** TS `memory/standard.ts:10` notes embedding similarity is spec'd but unimplemented. | **GAP** | major (trait prerequisite for sqlvec; see §9) |
+| X17 | **`vector_store` (`VectorStore`, `VectorRecord`, `VectorHit`, `MetadataFilter`, `VectorStoreError`)** — full trait (add/search/delete/len/is_empty), upsert-by-id, dimension-mismatch rejection, AND-filter, in-memory reference impl | `rust/.../vector_store.rs` (345 lines, in spore-core) | **No TS module.** `grep VectorStore` TS → 0 hits. | **GAP** (IN SCOPE — §5 G-L) | major |
+| X18 | **`embedding` (`cosine_similarity`, `EmbeddingInfo`, `EmbeddingModel`, `OllamaEmbeddingModel`, `OpenAIEmbeddingModel`)** — full provider behavior: Ollama `/api/embed` (no key, fail-fast on connect, `probe_dimensions`), OpenAI `${base}/embeddings` (bearer auth, shared retry loop + `{error:{message}}` envelope, `dimensions` param for `text-embedding-3-*`, sort-by-index, `from_env`, `default_dimensions`) | `rust/.../embedding.rs` (550 lines, in spore-core) | **No TS module.** TS `memory/standard.ts:10` notes embedding similarity is spec'd but unimplemented. | **GAP** (IN SCOPE — §5 G-L) | major |
 | X19 | `text_util` (internal helpers) | `rust/.../text_util.rs` | TS uses inline equivalents (`truncateField` etc.) | INFERRED SIMILARITY | — |
 | X20 | `sync_util` (`BoxFut` object-safe async alias) | `rust/.../sync_util.rs` | N/A (TS uses native `Promise`/`async`) | OBSERVED PARITY (idiomatic) | — |
 | X21 | `macros.rs` (derive macros) | `rust/.../macros.rs` | N/A (TS has no proc-macro equivalent; zod schemas substitute) | OBSERVED PARITY (idiomatic) | — |
@@ -185,10 +198,10 @@ below assumes the **core + eval** scope and flags the trait-level prerequisites
 | E3 | `EvalHarness` library API (`harness`/`task`/`manifest`/`report`/`stats`/`verifier`/`metric_map`/`worktree`) | `rust/crates/spore-eval/src/*.rs` | `typescript/packages/eval/src/*.ts`; `eval-harness.test.ts` (36) + `stats.test.ts` (10) pass | OBSERVED PARITY | — |
 | E4 | `e2e-agent` tool binary | `rust/.../tools` (Rust exposes tools via catalogue, no separate e2e bin) | `typescript/packages/tools/src/bin/e2e-agent.ts` (TS-only convenience binary) | OBSERVED PARITY (TS additive) | — |
 | E5 | Examples 01–12 | `examples/rust/01..12` | `examples/typescript/01..12` (one-to-one) | OBSERVED PARITY | — |
-| E6 | Docs: `building-a-tool.md`, `conversation.md`, `custom-harness.md` | `docs/rust/{building-a-tool,conversation,custom-harness,quickstart}.md` | `docs/typescript/` has only stub `quickstart.md` | **GAP** | minor |
+| E6 | Docs: `building-a-tool.md`, `conversation.md`, `custom-harness.md` | `docs/rust/{building-a-tool,conversation,custom-harness,quickstart}.md` | `docs/typescript/` has only stub `quickstart.md` | **GAP** (IN SCOPE — §5 G-M) | minor |
 | E7 | Workspace/build config | Cargo workspace + feature flags (`petri`) | pnpm workspace, no feature flags | OBSERVED PARITY (idiomatic) | — |
-| E8 | `spore-mcp` crate | `rust/crates/spore-mcp` (511 lines) | **No TS equivalent** | **GAP** (extension crate; see §9) | major |
-| E9 | `spore-sqlvec` crate | `rust/crates/spore-sqlvec` | **No TS equivalent** | **GAP** (extension crate; see §9) | major |
+| E8 | `spore-mcp` crate | `rust/crates/spore-mcp` (511 lines) | **No TS equivalent** | **GAP** (out of scope — known gap, §9) | major |
+| E9 | `spore-sqlvec` crate | `rust/crates/spore-sqlvec` | **No TS equivalent** | **GAP** (out of scope — known gap, §9) | major |
 
 ## 5. Concrete gaps to close (implementation work, after plan approval)
 
@@ -321,21 +334,107 @@ compatibility constraints, risk.
   `loadImageContent` round-trip.
 - **Compat:** additive. Risk: low.
 
-### G-L. VectorStore + EmbeddingModel traits (X17, X18) — major (scope decision)
-- **Steps (if in scope):** add `typescript/.../src/vector-store/` +
-  `typescript/.../src/embedding/` modules mirroring the Rust traits
-  (`VectorStore`, `VectorRecord`, `VectorHit`, `MetadataFilter`,
-  `VectorStoreError`; `EmbeddingModel`, `EmbeddingInfo`, `cosineSimilarity`,
-  `OllamaEmbeddingModel`, `OpenAIEmbeddingModel`); export from `index.ts`.
-- **Validation:** unit tests for `cosineSimilarity` + trait shape; an in-memory
-  `VectorStore` stub.
-- **Compat:** additive. Risk: low. **Scope: see §9.**
+### G-L. VectorStore + EmbeddingModel traits + full Ollama/OpenAI providers (X17, X18) — major — **IN SCOPE**
 
-### G-M. Docs (E6) — minor
+Confirmed in scope by second-mate review. This is **not** a trait-shape stub:
+the TS implementation must reproduce the full Rust provider behavior, validated
+against mocked HTTP (the Rust side uses `wiremock`; the TS side will use a
+mocked `fetch` / `MockServer` equivalent, consistent with the existing
+`ollama.test.ts` / `openai.test.ts` provider tests).
+
+**New modules:**
+- `typescript/packages/core/src/embedding/{index.ts,types.ts,standard.ts}`
+  - `EmbeddingModel` interface: `embed(inputs: string[]): Promise<number[][]>`,
+    `embedOne(input): Promise<number[]>` (default → one-element `embed`,
+    `ProviderError` if zero vectors returned), `dimensions(): number`,
+    `info(): EmbeddingInfo`.
+  - `EmbeddingInfo` (`provider`, `model_id`, `dimensions`).
+  - `cosineSimilarity(a, b): number` — `[-1,1]`, `0.0` on length-mismatch OR
+    zero-magnitude (never `NaN`).
+  - `OllamaEmbeddingModel`: `DEFAULT_BASE_URL="http://localhost:11434"`,
+    `DEFAULT_TIMEOUT=120s`, `new(modelId)`, `withBaseUrl`, `withDimensions`,
+    `withTimeout`, `withHttpClient` (injectable for mocked fetch),
+    `probeDimensions()` (embed `"dimension probe"`, return length, no
+    mutation). `embed`: empty input → `[]` without contacting the server;
+    POST `${base}/api/embed` `{model, input}`; map `is_timeout`→`Timeout`,
+    `is_connect`→`ProviderError(0, "Ollama not running at <base>")`, else
+    `Transport`; non-2xx → `ProviderError(code, first 500 chars of body)`;
+    decode `{embeddings: number[][]}`.
+  - `OpenAIEmbeddingModel`: `DEFAULT_BASE_URL="https://api.openai.com/v1"`,
+    `DEFAULT_TIMEOUT=120s`, `DEFAULT_MAX_RETRIES=3`, `new(apiKey, modelId)`,
+    `fromEnv(envVar, modelId)` (reject unset/empty with `ProviderError`),
+    `withBaseUrl`, `withDimensions`, `withTimeout`, `withMaxRetries`,
+    `withHttpClient`. `defaultDimensions`: `text-embedding-3-large`→3072,
+    `text-embedding-3-small`|`text-embedding-ada-002`→1536, else 0.
+    `supportsDimensionsParam` iff `modelId` starts with `text-embedding-3`.
+    `embed`: empty input → `[]`; POST `${base}/embeddings` with
+    `Authorization: Bearer <key>`; body `{model, input, dimensions?}` where
+    `dimensions` is sent only when pinned AND `supportsDimensionsParam`;
+    **reuse the existing OpenAI retry plumbing** (`sendWithRetry` /
+    `backoffDelayMs` / `RETRYABLE_STATUSES` / `parseRetryAfter` in
+    `model/openai.ts`) — or extract a shared `provider-http` helper first to
+    avoid the current duplication (mirrors Rust's `provider_http::send_with_retry`);
+    retryable set `408|425|429|500|502|503|504`, exponential backoff 0.5s→
+    30s cap, honor `retry-after`; non-retryable → `ProviderError(code, msg)`
+    from the `{error:{message}}` envelope (fallback first 500 chars); decode
+    `{data:[{embedding,index}]}`, **sort by `index`** so a non-conforming
+    compatible server cannot scramble input↔vector order.
+  - `Debug`/redaction: `OpenAIEmbeddingModel` must not log the key (mirror
+    Rust's `<redacted>`).
+- `typescript/packages/core/src/vector-store/{index.ts,types.ts,standard.ts}`
+  - `VectorRecord` (`id`, `vector: number[]`, `metadata: unknown`), `new(...)`.
+  - `VectorHit` (`id`, `score`, `metadata`), higher = more similar.
+  - `MetadataFilter`: `equals: [key, value][]`, `new()`, `eq(k,v)` builder,
+    `isEmpty()`, `matches(metadata)` (AND of equalities).
+  - `VectorStoreError` (discriminated): `dimension_mismatch {expected, actual}`,
+    `backend {message}`.
+  - `VectorStore` interface: `add(records)`, `search(query, topK, filter?)`,
+    `delete(filter)` (empty filter = full clear, returns count), `len()`,
+    `isEmpty()` (default `len()==0`). `add` rejects a record whose vector
+    length ≠ store dimensionality with `dimension_mismatch`; upsert by `id`.
+  - `InMemoryVectorStore` (reference backend, mirror Rust's test impl):
+    `new(dimensions)`, cosine `search` sorted desc with `truncate(topK)`,
+    filter applied as part of search (not post-truncation), `delete` via
+    `retain(!filter.matches)`.
+- Export both from `typescript/packages/core/src/index.ts` (`export * as vectorStore ...` /
+  `export * as embedding ...`, matching the existing namespace-export style).
+
+**Validation (mocked HTTP, not stubs):**
+- `cosineSimilarity`: identical vectors → 1.0; orthogonal → 0.0; zero-magnitude
+  → 0.0; length-mismatch → 0.0 (never `NaN`).
+- Ollama: mocked `/api/embed` round-trip returns vectors in input order; empty
+  input skips the call (no mock mounted, unreachable base URL); connect error
+  → `ProviderError(0, "Ollama not running at <base>")`; non-2xx →
+  `ProviderError(code, body[:500])`; `probeDimensions` returns the vector
+  length.
+- OpenAI: mocked `/embeddings` with `Authorization: Bearer <key>` header
+  assertion; data returned out-of-order by `index` is reordered to input
+  order; `text-embedding-3-small` default `dimensions=1536` and the request
+  body includes `dimensions` only for `text-embedding-3-*`; `fromEnv` rejects
+  unset/empty; 400 `{error:{message}}` → `ProviderError(400, msg)` with
+  `maxRetries=0`; 429 retried then succeeds (with a no-sleep test hook);
+  `retry-after` header honored.
+- `InMemoryVectorStore`: add/search orders by similarity; filter scopes search;
+  upsert does not duplicate; delete returns count; dimension mismatch rejected;
+  `len`/`isEmpty` correct.
+- Object-shape: a `VectorStore`/`EmbeddingModel` value is usable where the
+  interface is expected (TS structural typing; mirrors Rust's `Box<dyn>`/
+  `Arc<dyn>` object-safety test).
+
+**Compat:** additive modules/exports → back-compatible. Risk: low–medium
+(retry plumbing reuse must not change the chat providers' behavior).
+
+### G-M. Docs (E6) — minor — **IN SCOPE**
+
+Confirmed in scope by second-mate review.
 - **Steps:** author `docs/typescript/building-a-tool.md`,
   `conversation.md`, `custom-harness.md` mirroring the Rust pages' structure
-  with TS code.
-- **Validation:** doc build/links. Risk: low.
+  with TS code (imports from `@spore/core` / `@spore/tools`); cross-link from
+  `docs/typescript/quickstart.md` (currently a stub) and update its
+  "stub" notice.
+- **Validation:** doc build/links; code samples type-check against the
+  implemented API.
+- **Compat:** docs-only. Risk: low.
 
 ### G-N. Pre-existing tsc errors (baseline) — minor
 - **Steps:** fix the 12 `noUncheckedIndexedAccess` errors in
@@ -344,6 +443,159 @@ compatibility constraints, risk.
   (`tsc --noEmit`) and wire it into CI-equivalent local validation.
 - **Validation:** `tsc --noEmit` clean across packages.
 - **Compat:** test-only. Risk: low.
+
+## 5.2 Executable lifecycle, cancellation, timeout, retry, cleanup & async/concurrency scenarios
+
+These are concrete, executable test scenarios (not new gaps) that pin the
+observable lifecycle behavior the harness must share with Rust. Each scenario
+names the seam under test, the Rust reference behavior (file:line), the TS
+location, and the assertion. They are added to the implementation's regression
+suite. Rust is read-only evidence; the TS behavior is exercised against a
+mocked model + sandbox so no real provider is contacted.
+
+### 5.2.1 Cancellation (AbortSignal)
+
+- **C1 — Mid-turn abort surfaces as a typed agent error.** Abort the
+  `HarnessRunOptions.signal` while a model call is in flight. Rust: the in-flight
+  future is dropped; the surfaced error is an `AgentError` → `HaltReason::AgentError`
+  (`rust/.../harness/types.rs:1436-1438`). TS: `model.call(request, signal)`
+  rejects with `ProviderError(0, "request aborted: …")`
+  (`typescript/.../model/{anthropic,openai,ollama}.ts` AbortError mapping),
+  which the react loop routes to `agent_error` halt
+  (`typescript/.../harness/standard.ts` agent-error path). **Assertion:** the run
+  returns `RunResult.failure{reason:{kind:"agent_error"}}` and `turns` reflects
+  the turn that was aborted; no further turns run; the stream emitted `turn_start`
+  for the aborted turn but no `turn_end`.
+- **C2 — Abort between turns stops the loop.** Abort the signal after a turn
+  completes but before the next model call. **Assertion:** the loop does not
+  start the next turn; the partial `usage`/`turns` are reported on the failure.
+- **C3 — Abort propagates to tool dispatch.** Abort during a long-running tool
+  (exec). TS: the tool's `execute(call, sandbox, ctx, signal)` threads the
+  signal to `sbExecuteCommand` (`typescript/.../tools/src/exec.ts:117`); the
+  sandbox's `AbortController` aborts the child (`workspace-sandbox.ts:421-451`).
+  **Assertion:** the exec returns a recoverable `error` (timed_out/aborted) and
+  the child is reaped (no orphan) — see 5.2.4.
+- **C4 — Abort is non-destructive to session state.** After C1, resuming with
+  `HarnessRunOptions.session_state` (the carried `session_state` on the
+  failure) continues losslessly: the aborted turn's partial assistant message
+  is NOT double-recorded. **Assertion:** a resume run's transcript equals a
+  single uninterrupted run's transcript for the same model responses.
+
+### 5.2.2 Timeout
+
+- **T1 — Per-exec timeout.** `exec`/`bash_command` with `timeout` (seconds).
+  Rust: `rust/.../tools/exec.rs:104` → `execute_command_streaming(.., timeout,..)`;
+  timeout → `CommandOutput{timed_out:true, exit_code:-1}` → recoverable `error`
+  `"command timed out after Ns"`. TS: `typescript/.../tools/src/exec.ts:124-131`.
+  **Assertion:** a sleeping command with `timeout=1` returns a recoverable error
+  with the exact message shape; `stderr`/`stdout` captured up to the abort are
+  not lost when the sandbox buffers them.
+- **T2 — Model-call timeout.** A provider timeout (`OllamaEmbeddingModel`/
+  `OpenAIEmbeddingModel`/chat providers' `withTimeout`) maps to `ModelError::Timeout`
+  (Rust `rust/.../provider_http.rs:138-141`, `rust/.../embedding.rs` timeout
+  branch). TS: `model/{anthropic,openai,ollama}.ts` map timeout/ETIMEDOUT to
+  `Timeout`. **Assertion:** a mocked provider that never responds within the
+  timeout returns `Timeout` (not `ProviderError`); on the embedding providers
+  (G-L) a timeout with `maxRetries>0` is retried (5.2.3) and only the final
+  exhaustion surfaces `Timeout`.
+- **T3 — Budget timeout.** `BudgetLimits.time_ms` overrun halts with
+  `budget_exceeded{limit_type:"time"}`. Rust `rust/.../harness/budget.rs`;
+  TS `typescript/.../harness/standard.ts:3160` (`budgetExceeded`). **Assertion:**
+  a run whose wall-clock exceeds `time_ms` between turn gates halts with the
+  `time` limit type (checked at the turn gate, not mid-turn).
+
+### 5.2.3 Retry
+
+- **R1 — Hosted-provider HTTP retry.** A 429/503 response followed by a 200.
+  Rust: `provider_http::send_with_retry` retries `408|425|429|500|502|503|504`
+  up to `max_retries`, exponential backoff 0.5s→30s cap, honors `retry-after`
+  (`rust/.../provider_http.rs:25-160`). TS: `sendWithRetry` in
+  `model/{anthropic,openai}.ts` (same set/backoff/retry-after). **Assertion:**
+  with a no-sleep test hook, a 429-then-200 succeeds on attempt 2 and the run
+  continues; a 400 (non-retryable) is NOT retried and surfaces
+  `ProviderError(400, …)`.
+- **R2 — Retry exhaustion.** `maxRetries=0` + 429 → immediate `ProviderError`;
+  `maxRetries=2` + three consecutive 503s → `ProviderError(503, …)` after the
+  final retry. **Assertion:** the attempt count is bounded and the final status
+  code/message is preserved.
+- **R3 — Embedding provider retry (G-L).** `OpenAIEmbeddingModel` reuses the
+  same retry loop; a 500-then-200 succeeds; `retry-after` header is honored over
+  the computed backoff; Ollama has NO retry (fail-fast) — a connect error is a
+  terminal `ProviderError(0, "Ollama not running at …")`.
+- **R4 — Tool-call repair retry (G-E).** `maxRepairAttempts=1`: a malformed
+  tool call whose args are coercible succeeds after one repair; a
+  non-coercible call returns `invalid_parameters` after the budget is spent;
+  default (no repair configured) → single-shot, byte-identical to today.
+- **R5 — Plan-empty re-ask (G-G).** `planEmptyMaxRetries=2`: an empty-then-empty
+  -then-real plan succeeds; default `0` → `empty_plan` halt immediately
+  (byte-identical); discarded attempts' usage is folded into the terminal
+  result's `usage`.
+- **R6 — Output-schema retry (existing).** `outputSchemaMaxRetries=2`: a
+  terminal that fails validation twice then passes succeeds; three failures →
+  `output_schema_violation`; budget-cap-wins precedence (a retry that would
+  exceed the turn budget surfaces `budget_exceeded` instead). Covered by
+  `harness-output-schema.test.ts`; re-asserted for parity.
+
+### 5.2.4 Cleanup
+
+- **CL1 — `kill_on_drop` reaps the child on timeout/abort.** Rust:
+  `ExecConfig.kill_on_drop` + the executor's wait loop. TS:
+  `typescript/.../sandbox/workspace-sandbox.ts:432-451` (`controller.abort()`
+  kills the child; with `kill_on_drop` set, an additional `SIGKILL` guarantees
+  reaping). **Assertion:** a timed-out child whose sentinel is never created is
+  reaped (no zombie/leak); the process table has no orphan after the run. This
+  is already covered by `sandbox.test.ts` (SC-12) and is re-asserted.
+- **CL2 — Sandbox wrapper cleanup forwarding.** `ReadOnlySandbox` and any
+  combinator child harness must forward `executeCommandStreaming` (G-B) so a
+  streamed exec under a read-only-wrapped sandbox still reaps on abort. **Assertion:**
+  a streamed exec under `ReadOnlySandbox` emits `tool_progress` then reaps on
+  abort.
+- **CL3 — Run-finalization cleanup.** On every terminal `RunResult` (success,
+  failure, escalate, consult, waiting_for_human), the harness emits the closing
+  `turn_end` for the in-flight turn (when applicable) and flushes observability
+  spans; no `turn_start` is left unbalanced. **Assertion:** for each terminal,
+  `turn_start`/`turn_end` counts balance (modulo an aborted in-flight turn per
+  C1) and the observability outbox JSONL has one line per emitted span.
+- **CL4 — Storage cleanup on failure.** A failed run does not leave a
+  half-written active-run slot: `complete_active_run` is called on the terminal
+  path. Rust `rust/.../storage.rs:529`; TS `typescript/.../storage/providers.ts`.
+  **Assertion:** after a `failure`/`escalate`, `loadActiveRun` reflects
+  `completed` (or the slot is cleared per the configured decision).
+
+### 5.2.5 Async / concurrency
+
+- **A1 — Sequential tool dispatch within a turn.** Tools that mutate shared
+  RunStore state (`task_list`, `set_plan`, `todo_write`) dispatch sequentially
+  (not `Promise.all`), preserving the durable blob's consistency. Rust: these
+  tools are NOT `read_only` → sequential dispatch. TS: `typescript/.../harness/standard.ts`
+  tool-dispatch loop. **Assertion:** two `task_list` calls in one turn are
+  applied in order and the persisted blob reflects the second call.
+- **A2 — Concurrent runs are isolated by session.** Two `harness.run()` calls
+  with different `SessionId`s on the same harness instance do not share
+  `budget_used`/`session_state`. **Assertion:** parallel runs produce
+  independent `usage`/`turns` and independent transcripts.
+- **A3 — No shared mutable global state.** Provider HTTP clients, the
+  `StandardMemoryProvider`'s `Map`s, and the `InMemoryVectorStore` (G-L) are
+  not mutated across runs in a way that leaks. **Assertion:** a run that stores
+  a memory/vector does not appear in a second run's query (scoped by
+  session/project).
+- **A4 — Streaming sink is synchronous & inline (no isolation).** `StreamSink`
+  is called inline from the run loop (`rust/.../harness/mod.rs:1384` `s(event)`
+  with no `catch_unwind`; `StreamSink = Arc<dyn Fn(StreamEvent) + Send + Sync>`).
+  TS `StreamSink` is a sync callback invoked inline
+  (`typescript/.../harness/standard.ts` `emit`). **Parity assertion:** a sink
+  that throws propagates the error out of `run()` (NOT swallowed into a warn) —
+  matching Rust, which does not isolate sink panics. A documented non-throwing
+  sink is the contract; the test pins that a throwing sink is NOT silently
+  swallowed (the run rejects).
+- **A5 — Combinator child runs do not reentrantly mutate parent state.** A
+  PlanExecute/SelfVerifying/HillClimbing/Ralph child harness built from a
+  config clone does not mutate the parent's `session_state` or `budget_used`.
+  **Assertion:** after a combinator run, the parent's `budget_used` reflects
+  only the folded child `usage`, not aliasing.
+- **A6 — `AbortSignal` is never retained beyond the call.** The signal is
+  passed down, not stored on long-lived config. **Assertion:** an aborted signal
+  from run N does not affect run N+1 on the same harness instance.
 
 ## 6. Compatibility constraints
 
@@ -389,28 +641,36 @@ compatibility constraints, risk.
 - **No Rust edits:** if any gap is found to require a Rust-side change to
   achieve parity, work stops and the conflict is reported.
 
-## 9. Decisions required from second-mate / captain
+## 9. Decisions (resolved)
 
-1. **Scope of "full parity":** Is parity scoped to the **`spore-core` +
-   `spore-eval`** harness runtime (this plan's default), or does it also
-   require authoring TypeScript `@spore/mcp` and `@spore/sqlvec` packages
-   (G-L, E8, E9)? The Rust `VectorStore`/`EmbeddingModel` traits live in
-   `spore-core` itself — if in scope, G-L is required; if the extension crates
-   are out of scope, G-L is deferred and the trait absence is documented as an
-   explicit remaining gap.
-2. **`sandbox_petri` (S4):** Rust-only feature-gated Petri isolation backend.
-   Assume out of scope (opt-in backend, no TS equivalent) unless told
-   otherwise.
-3. **Docs scope (G-M):** confirm the three missing TS doc pages are in scope
-   for this parity pass (vs. a separate docs task).
+**Captain scope decision (incorporated):**
+
+- **IN SCOPE — implement to full parity:** the complete TypeScript
+  **`spore-core` + `spore-eval`** surface, including the full in-core
+  `VectorStore` / `EmbeddingModel` traits and their Ollama/OpenAI providers
+  (§5 G-L, with mocked-HTTP validation) and the three missing TypeScript doc
+  pages (§5 G-M).
+- **OUT OF SCOPE — document as known gaps, do NOT create:** the separate
+  `spore-mcp` MCP-client package (E8), the separate `spore-sqlvec`
+  sqlite-vec `VectorStore` backend package (E9), and the feature-gated Petri
+  isolation backend (S4). These remain explicitly documented as known gaps in
+  the final matrix (§10) with the rationale that they are separate Rust
+  extension crates / an opt-in backend, not part of the core harness runtime.
+  No TypeScript `@spore/mcp`, `@spore/sqlvec`, or Petri implementation will be
+  authored in this parity pass.
+
+The earlier open questions (D1 scope of extension crates, D2 Petri, D3 docs)
+are closed by this decision. Rust remains strictly read-only throughout.
 
 ## 10. Intended final evidence
 
 On completion, `docs/typescript/rust-parity-plan.md` will be updated to a final
 matrix mapping every capability in §4 to: implementation commit, passing
 test(s) name(s), and any explicitly remaining gap (with rationale). The final
-gates in §7 will be green and the PR will reference this document.
+gates in §7 will be green and the PR will reference this document. The known
+out-of-scope gaps (spore-mcp, spore-sqlvec, Petri) will be listed explicitly
+in the final matrix with the captain's rationale.
 
 ---
 
-needs-decision: plan ready for second-mate review at docs/typescript/rust-parity-plan.md; no implementation started
+needs-decision: revised plan ready for captain approval at docs/typescript/rust-parity-plan.md; captain scope decision incorporated (§9); §5.2 lifecycle/concurrency scenarios added; no implementation started
