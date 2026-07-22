@@ -3,7 +3,7 @@
 > **Status: IMPLEMENTATION COMPLETE — reviewed; review findings fixed.**
 > Authoritative Rust revision: `7058db115b4f05b6b7cde1a3f62ba345c202bcde`
 > (`git rev-parse HEAD` at task start, branch `fm/parity-python`).
-> Final evidence: 1733 passed, 8 skipped; `ruff check` + `ruff format --check`
+> Final evidence: 1735 passed, 8 skipped; `ruff check` + `ruff format --check`
 > clean; 12 `examples/python/*` import + tests pass. See §12 for the
 > capability→evidence matrix and the review/rereview-fix log.
 
@@ -681,7 +681,7 @@ change. The Go and TypeScript parity tasks are prohibited from editing
 ## 12. Final parity matrix (implementation complete)
 
 Rust authoritative revision: `7058db115b4f05b6b7cde1a3f62ba345c202bcde`.
-Python suite: **1733 passed, 8 skipped**; `ruff check` clean; `ruff format --check` clean; all 12 `examples/python/*` import + per-example tests pass.
+Python suite: **1735 passed, 8 skipped**; `ruff check` clean; `ruff format --check` clean; all 12 `examples/python/*` import + per-example tests pass.
 
 | Step | Capability | Implementation | Evidence |
 |---|---|---|---|
@@ -694,9 +694,9 @@ Python suite: **1733 passed, 8 skipped**; `ruff check` clean; `ruff format --che
 | §5.10/§5.11 | Tool-registry progress + search | `ToolProgressSink`/`ToolProgressUpdate`; `ToolNamespace`/`ToolSearchConfig`/`ToolSearchRegistry` (LRU, budget eviction, namespace collision drop, dispatch-not-gated); harness wraps only catalogue-backed registries and preserves injected custom `tool_registry` unchanged | `test_tool_search_registry.py` (13) |
 | §5.12 | `HarnessContextManagerExt` | `compaction_adapter.py` name-parity shim | re-export + `test_public_api.py` |
 | §5.13 | `CustomCondition` | `prompt_assembly.CustomCondition = CustomPredicate`; root re-export | `test_public_api.py` alias test |
-| §5.14 | `embedding` + `vector_store` (full provider impls) | new `embedding.py` (`cosine_similarity`/`EmbeddingModel`/`OllamaEmbeddingModel`/`OpenAIEmbeddingModel`); terminal OpenAI embedding 429s classify as `ProviderError`; new `vector_store.py` (`VectorStore`/`InMemoryVectorStore`/…) | `test_embedding.py` (22) |
+| §5.14 | `embedding` + `vector_store` (full provider impls) | new `embedding.py` (`cosine_similarity`/`EmbeddingModel`/`OllamaEmbeddingModel`/`OpenAIEmbeddingModel`); terminal OpenAI embedding 429s classify as `ProviderError`; new `vector_store.py` (`VectorStore`/`InMemoryVectorStore`/…); `VectorStoreError` inherits package-root `SporeError` | `test_embedding.py` (22); `test_public_api.py` root-error regression |
 | §5.15 | `image` module | new `image.py` (`media_type_for_extension`/`is_image_path`/`image_content`/`load_image_content`) | `test_image.py` (5) |
-| §5.16 | `set_plan` + `StandardTools` | new `spore_tools/tools/set_plan.py` + `StandardTools.set_plan()` preset; normal PlanExecute directive now requires authoring the plan ONLY via `set_plan` (retry path remains JSON/no-tools because `set_plan` is unavailable) | `test_set_plan.py` (6); `test_harness_instruction_delivery.py` directive regression; `test_harness_plan_execute.py` retry JSON/no-tools regression |
+| §5.16 | `set_plan` + `StandardTools` | new `spore_tools/tools/set_plan.py` + `StandardTools.set_plan()` preset; `StandardTools.coding_set()` includes `set_plan` and `full_set()` inherits it; `HarnessBuilder.coding_agent()` advertises `set_plan`; normal PlanExecute directive now requires authoring the plan ONLY via `set_plan` (retry path remains JSON/no-tools because `set_plan` is unavailable) | `test_set_plan.py` (7); `test_harness_presets.py` coding-agent schema regression; `test_harness_instruction_delivery.py` directive regression; `test_harness_plan_execute.py` retry JSON/no-tools regression |
 | §5.17 | Eval/CLI executable validation | `test_eval_cli_fixture.py` pins CLI to shared `core_suite.json` | `test_eval_cli_fixture.py` (7) |
 | rereview | PlanExecute empty-plan retry | `HarnessConfig.plan_empty_max_retries`/builder + PlanExecute re-ask loop; retry suppresses tools via reserved `__none__` toolset and forces canonical plan schema; default `0` preserves hard-fail | `test_harness_plan_execute.py` (18) |
 | §4.15 | Cancellation/timeout/retry/concurrency/cleanup/steering regression | `test_parity_lifecycle.py` (retryable set, backoff curve, `retryable()`, wall-time budget, `dispatch_all` concurrency, cleanup finalization success+failure, steering in-flight no-cancel) | `test_parity_lifecycle.py` (9) |
@@ -786,6 +786,22 @@ were fixed:
 - **Low — matrix freshness**: §12 evidence and counts updated to the final
   verification state.
 
+### Closure-review-fix log (closure review of PR #168)
+
+The two adjacent actionable findings in `data/parity-python-closure-review/report.md`
+were fixed:
+
+- **Medium — standard coding/full tool presets**: `StandardTools.coding_set()`
+  now includes `set_plan` next to `task_list`, and `full_set()` inherits it.
+  The coding-agent preset's active catalogue schemas now include `set_plan`, so
+  default PlanExecute runs advertise the tool the first-attempt directive
+  requires.
+- **Low — vector-store error base**: `VectorStoreError` now inherits
+  package-root `SporeError`, matching Python package error-base conventions;
+  public API coverage asserts the subclass relationship.
+- **Low — matrix freshness**: §12 evidence and counts updated to the closure
+  review state.
+
 ---
 
 resolved: plan review decisions incorporated (C1 full embedding/vector_store provider impls now; C5 image.rs confirmed public module, concrete plan; C6 eval/CLI parity pinned by executable validation against fixtures/task_suites/core_suite.json; §4.15 cancellation/timeout/retry/cleanup + async/concurrency matrix added with evidence and regression tests)
@@ -795,3 +811,5 @@ resolved: independent review findings fixed (NodeAttr wire compat, VectorStore d
 resolved: second independent rereview findings fixed (unified runtime prose detector, `tool_call_nudge`, `plan_empty_max_retries`, custom-registry `tool_search` fallback, terminal OpenAI embedding 429 classification, `CustomCondition` alias/export, final matrix refreshed) [key=parity-python-rereview]
 
 resolved: final independent verification findings fixed (PlanExecute first-attempt `set_plan` directive while preserving retry JSON/no-tools behavior; structural `tool_call_nudge` flips adaptive prompt-tool flag; final matrix refreshed) [key=parity-python-final-review]
+
+resolved: closure review findings fixed (`set_plan` added to `StandardTools.coding_set()` and inherited `full_set()`/coding-agent schemas; `VectorStoreError` now inherits package-root `SporeError`; final matrix refreshed) [key=parity-python-closure-review]

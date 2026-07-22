@@ -94,3 +94,7 @@ def test_prompt_assembly_custom_condition_alias_reexport() -> None:
     # original name and aliases/re-exports CustomCondition for root API parity.
     assert hasattr(sc, "CustomCondition")
     assert sc.CustomCondition is sc.CustomPredicate
+
+
+def test_vector_store_error_uses_root_spore_error() -> None:
+    assert issubclass(sc.VectorStoreError, sc.SporeError)

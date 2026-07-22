@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 from .embedding import cosine_similarity
+from .errors import SporeError
 
 __all__ = [
     "InMemoryVectorStore",
@@ -64,8 +65,13 @@ class MetadataFilter:
         return all(metadata.get(k) == v for k, v in self.equals)
 
 
-class VectorStoreError(Exception):
-    """Vector store failure."""
+class VectorStoreError(SporeError):
+    """Vector store failure.
+
+    Inherits the package root :class:`SporeError` so callers can catch vector
+    store failures through the common public error base, consistent with other
+    component errors.
+    """
 
     def __init__(self, kind: str, message: str) -> None:
         self.kind = kind

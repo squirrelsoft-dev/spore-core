@@ -90,6 +90,7 @@ def test_coding_agent_preset_wires_sandbox_tools_prompt_and_autocontinue(
         "edit_file",
         "bash_command",
         "send_message",
+        "set_plan",
     ):
         assert expected in names, f"coding_set must include {expected}; got {names}"
 

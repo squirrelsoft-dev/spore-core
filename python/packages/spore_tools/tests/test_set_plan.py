@@ -108,3 +108,15 @@ async def test_set_plan_preset_in_standard_tools() -> None:
     bundle = StandardTools.set_plan()
     assert bundle.schema.name == "set_plan"
     assert bundle.implementation.name() == "set_plan"
+
+
+def test_set_plan_in_standard_coding_and_full_sets() -> None:
+    from spore_tools import StandardTools
+
+    coding_names = [bundle.schema.name for bundle in StandardTools.coding_set()]
+    full_names = [bundle.schema.name for bundle in StandardTools.full_set()]
+
+    assert "set_plan" in coding_names
+    assert "set_plan" in full_names
+    # Full set inherits coding_set and should not duplicate the plan-authoring tool.
+    assert full_names.count("set_plan") == 1

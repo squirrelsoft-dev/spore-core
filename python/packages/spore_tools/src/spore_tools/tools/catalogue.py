@@ -241,7 +241,7 @@ class StandardTools:
     @staticmethod
     def coding_set() -> list[StandardTool]:
         """Coding set: everything in :meth:`readonly_set` plus the mutating
-        filesystem tools, shell, messaging, and the storage-backed todo/task
+        filesystem tools, shell, messaging, and the storage-backed todo/task/plan
         tools. Reuses EXISTING tool names on overlap (Q5)."""
         return [
             StandardTools.read_file(),
@@ -257,6 +257,7 @@ class StandardTools:
             StandardTools.web_search(),
             StandardTools.todo_write(),
             StandardTools.task_list(),
+            StandardTools.set_plan(),
             StandardTools.memory(),
         ]
 
