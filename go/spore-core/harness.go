@@ -3451,6 +3451,19 @@ type HarnessConfig struct {
 	// (empty Kind) is treated as EscalationSurfaceToHuman by EffectiveEscalationMode;
 	// set it explicitly to select AFK / autonomous behaviour.
 	EscalationMode EscalationMode // optional (defaults to surface_to_human)
+
+	// ToolCallRepair is the optional deterministic tool-argument repair
+	// provider. When set, recoverable tool-dispatch errors trigger an
+	// argument-coercion + re-dispatch attempt before falling back to error
+	// feedback. nil (the default) preserves today's behaviour byte-for-byte.
+	// See StandardToolCallRepair / CoerceToolArgs.
+	ToolCallRepair ToolCallRepair // optional
+	// MaxRepairAttempts bounds the repair-and-re-dispatch attempts per tool call.
+	// Pointer sentinel (mirrors ErrorLoopThreshold / OutputSchemaMaxRetries):
+	// nil => the cross-language default of 1; an explicit 0 is honored (no
+	// repair attempts even when a repair provider is set). Ignored when
+	// ToolCallRepair is nil. Read it via EffectiveMaxRepairAttempts.
+	MaxRepairAttempts *uint32 // optional
 }
 
 // EffectiveEscalationMode returns the configured EscalationMode, defaulting the
@@ -3462,6 +3475,34 @@ func (c HarnessConfig) EffectiveEscalationMode() EscalationMode {
 		return SurfaceToHumanEscalation()
 	}
 	return c.EscalationMode
+}
+
+// EffectiveMaxRepairAttempts returns the configured repair-attempt cap,
+// defaulting a nil pointer to the cross-language default of 1 (mirrors the
+// Rust reference's builder default). An explicit 0 is honored. Ignored when
+// ToolCallRepair is nil — the whole repair arm is skipped.
+func (c HarnessConfig) EffectiveMaxRepairAttempts() uint32 {
+	if c.MaxRepairAttempts == nil {
+		return 1
+	}
+	return *c.MaxRepairAttempts
+}
+
+// WithToolCallRepair installs a deterministic tool-argument repair provider.
+// Recoverable tool-dispatch errors trigger an argument-coercion + re-dispatch
+// attempt (bounded by MaxRepairAttempts, default 1) before falling back to
+// error feedback. nil preserves today's behaviour byte-for-byte.
+func (c HarnessConfig) WithToolCallRepair(repair ToolCallRepair) HarnessConfig {
+	c.ToolCallRepair = repair
+	return c
+}
+
+// WithMaxRepairAttempts sets the maximum number of repair-and-re-dispatch
+// attempts per tool call. Defaults to 1 (via EffectiveMaxRepairAttempts when
+// nil). Ignored when no repair provider is set (WithToolCallRepair).
+func (c HarnessConfig) WithMaxRepairAttempts(attempts uint32) HarnessConfig {
+	c.MaxRepairAttempts = &attempts
+	return c
 }
 
 // WithRegistry replaces the whole ExecutionRegistry (issue #120) and returns the
@@ -5583,7 +5624,8 @@ func (h *StandardHarness) runReActInner(
 				// for the call ACTUALLY dispatched, so a task's files_touched ledger is
 				// built from real tool calls — never a model-self-reported field.
 				h.observeWriteCall(call)
-				output := dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call)
+				effectiveCall, output := h.dispatchWithRepair(ctx, toolRegistry, call)
+				_ = effectiveCall // #126 AC2: the call ACTUALLY dispatched (repaired variant when repair fired)
 
 				// Tool-surfaced sandbox violation (issue #150): the HARNESS decides
 				// halt-vs-recoverable per SandboxViolationPolicy, not the tool. Under
@@ -6264,7 +6306,7 @@ func (h *StandardHarness) resumeConsultInner(
 			// to a recoverable error — there is no place to issue a typed halt
 			// here.
 			output := h.normalizeSandboxViolation(
-				dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call))
+				h.dispatchWithRepairOutput(ctx, toolRegistry, call))
 			rtr := HarnessToolResult{CallID: call.ID, Output: output}
 			h.config.ContextManager.AppendToolResult(ctx, &session, &rtr)
 		}
@@ -6361,7 +6403,7 @@ func (h *StandardHarness) resumeInner(
 					// Drain path (issue #150): flatten any sandbox violation to a
 					// recoverable error — no typed-halt site here.
 					output := h.normalizeSandboxViolation(
-						dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call))
+						h.dispatchWithRepairOutput(ctx, toolRegistry, call))
 					rtr := HarnessToolResult{CallID: call.ID, Output: output}
 					h.config.ContextManager.AppendToolResult(ctx, &session, &rtr)
 				}
@@ -6489,7 +6531,7 @@ func (h *StandardHarness) resumeInner(
 			// Resume path (issue #150): flatten any sandbox violation to a
 			// recoverable error — no typed-halt site here.
 			output := h.normalizeSandboxViolation(
-				dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call))
+				h.dispatchWithRepairOutput(ctx, toolRegistry, call))
 			tr := HarnessToolResult{CallID: call.ID, Output: output}
 			h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
 		}
@@ -6498,7 +6540,7 @@ func (h *StandardHarness) resumeInner(
 			// Resume path (issue #150): flatten any sandbox violation to a
 			// recoverable error — no typed-halt site here.
 			output := h.normalizeSandboxViolation(
-				dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call))
+				h.dispatchWithRepairOutput(ctx, toolRegistry, call))
 			tr := HarnessToolResult{CallID: call.ID, Output: output}
 			h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
 		}
@@ -6548,6 +6590,78 @@ var _ Harness = (*StandardHarness)(nil)
 // halt-vs-recoverable decision via SandboxViolationPolicy: the main loop sees
 // the variant and may issue a typed halt, while drain/resume sites flatten it
 // through normalizeSandboxViolation.
+// dispatchWithRepair dispatches a tool call, applying the configured
+// ToolCallRepair on a recoverable error: coerce the arguments and re-dispatch
+// up to EffectiveMaxRepairAttempts, enriching the error (schema+hint) when
+// repair gives up. Returns the call ACTUALLY dispatched (the repaired variant
+// when repair fired) and its final output. Mirrors the Rust reference's
+// dispatch_with_repair. When no repair provider is wired, this is equivalent to
+// dispatchAndUnwrap (byte-identical).
+func (h *StandardHarness) dispatchWithRepair(
+	ctx context.Context,
+	registry ToolRegistry,
+	call ToolCall,
+) (ToolCall, ToolOutput) {
+	effective := call
+	output := dispatchAndUnwrap(ctx, registry, h.config.Sandbox, effective)
+	if h.config.ToolCallRepair == nil {
+		return effective, output
+	}
+	attemptsLeft := h.config.EffectiveMaxRepairAttempts()
+	for attemptsLeft > 0 {
+		if output.Kind != ToolOutputError || !output.Recoverable {
+			break
+		}
+		schema := findSchema(registry, effective.Name)
+		repaired, ok := h.config.ToolCallRepair.Repair(effective, output.Message, schema)
+		if !ok {
+			// Repair gave up. Enrich with the schema+hint ONLY for a parameter-shaped
+			// error; a command/runtime failure is left raw.
+			if IsParamError(output.Message) {
+				output = enrichToolError(output.Message, schema)
+			}
+			break
+		}
+		attemptsLeft--
+		effective = repaired
+		output = dispatchAndUnwrap(ctx, registry, h.config.Sandbox, effective)
+		if output.Kind != ToolOutputError || !output.Recoverable {
+			break
+		}
+		if attemptsLeft == 0 && IsParamError(output.Message) {
+			schema := findSchema(registry, effective.Name)
+			output = enrichToolError(output.Message, schema)
+		}
+	}
+	return effective, output
+}
+
+// dispatchWithRepairOutput is the drain/resume-path convenience that returns
+// only the final output (the effective call is irrelevant where there is no
+// place to stamp spans/history from it). Mirrors the Rust shared repair path.
+func (h *StandardHarness) dispatchWithRepairOutput(
+	ctx context.Context,
+	registry ToolRegistry,
+	call ToolCall,
+) ToolOutput {
+	_, output := h.dispatchWithRepair(ctx, registry, call)
+	return output
+}
+
+// findSchema returns the registry's model schema for the named tool, or nil.
+func findSchema(registry ToolRegistry, name string) *ToolSchema {
+	for _, s := range registry.ActiveSchemas(nil) {
+		if s.Name == name {
+			ms := s.ToModelSchema()
+			return &ms
+		}
+	}
+	return nil
+}
+
+// enrichToolError (the rich schema+hint enrichment) is defined near the
+// recoverable-error breaker path below; dispatchWithRepair reuses it.
+
 func dispatchAndUnwrap(
 	ctx context.Context,
 	registry ToolRegistry,
