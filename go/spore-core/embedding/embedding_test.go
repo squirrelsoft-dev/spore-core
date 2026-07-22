@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
 )
@@ -106,6 +107,51 @@ func TestOpenAIMapsErrorEnvelope(t *testing.T) {
 	}
 	if pe.Code != 400 || pe.Message != "bad model" {
 		t.Fatalf("ProviderError = {code:%d msg:%q}, want {400, bad model}", pe.Code, pe.Message)
+	}
+}
+
+type embeddingRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f embeddingRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestSendWithRetryTimeoutBackoffHonorsCancellation(t *testing.T) {
+	client := &http.Client{Transport: embeddingRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, context.DeadlineExceeded
+	})}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	_, err := sendWithRetry(ctx, client, func() (*http.Request, error) {
+		return http.NewRequest(http.MethodPost, "http://example.test", nil)
+	}, 1, 0, func(int) bool { return false }, func(resp *http.Response) error { return nil })
+	if err == nil {
+		t.Fatal("expected cancellation/timeout error")
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("cancelled retry slept through backoff: %s", elapsed)
+	}
+}
+
+func TestSendWithRetrySuccessfulResponseCancelsOnBodyClose(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"data":[]}`)
+	}))
+	defer server.Close()
+	resp, err := sendWithRetry(context.Background(), server.Client(), func() (*http.Request, error) {
+		return http.NewRequest(http.MethodGet, server.URL, nil)
+	}, 0, time.Second, func(int) bool { return false }, func(resp *http.Response) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, ok := resp.Body.(*cancelOnCloseBody)
+	if !ok {
+		t.Fatalf("response body type=%T, want cancelOnCloseBody", resp.Body)
+	}
+	if err := body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if body.cancel != nil {
+		t.Fatal("body close did not clear per-attempt cancel")
 	}
 }
 

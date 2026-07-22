@@ -797,12 +797,15 @@ func (c *ReactConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 	// no validation). The schema is canonicalized to compact key-sorted JSON so its
 	// delivered/reported bytes are identical across the four language ports.
 	var outputSchema json.RawMessage
-	if executor.EnforceOutputSchemas() && c.Output != nil {
+	if cx.Scratch.ForcedOutputSchema != nil {
+		outputSchema = append(json.RawMessage(nil), cx.Scratch.ForcedOutputSchema...)
+	} else if executor.EnforceOutputSchemas() && c.Output != nil {
 		if resolved, ok := cx.Registry.ResolveSchema(*c.Output); ok {
 			outputSchema = resolved
 		}
 	}
 	outputSchemaMaxRetries := executor.OutputSchemaMaxRetries()
+	suppressTools := cx.Scratch.SuppressTools
 	if outputSchema != nil {
 		// AC1: append the resolved schema to the leaf's directive/system context as a
 		// USER message, key-sorted via canonicalizeSchema so the seeded bytes are
@@ -835,7 +838,7 @@ func (c *ReactConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 	// so the window validates the terminal.
 	// SC-10: thread THIS leaf's per-node system-prompt override (nil ⇒ the window
 	// keeps using the global config.SystemPrompt). Mirrors c.Toolset.
-	result := executor.ReactWindow(ctx, task, c.MaxIterations(), session, budget, onStream, agent, c.Toolset, outputSchema, outputSchemaMaxRetries, c.SystemPrompt, executeStep)
+	result := executor.ReactWindow(ctx, task, c.MaxIterations(), session, budget, onStream, agent, c.Toolset, outputSchema, outputSchemaMaxRetries, c.SystemPrompt, executeStep, suppressTools)
 	executor.Finalize(ctx, result)
 
 	// #125: charge the window's turns against this leaf's OWN scope. The leaf
@@ -929,15 +932,10 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 	// The incoming shared execute session ( [user: task.instruction] ).
 	baseSession := cx.takeSession()
 	budget := cx.Scratch.RunBudget
-	// PlanExecute suppresses the run's stream sink for its phases (parent-visible
-	// step boundaries are re-emitted on the caller's sink). Take it now and keep
-	// it OUT of cx.Stream so the recursive children run with a suppressed sink.
+	// PlanExecute installs a node wrapper and threads it through recursive plan and
+	// execute children, matching Rust's inherited stream attribution: every child
+	// event flows upward with the plan_execute hop prepended.
 	onStream := cx.takeStream()
-	// §E1: wrap the re-emission sink so step-boundary events this combinator
-	// re-emits carry a `plan_execute` node hop. The recursive children run
-	// suppressed (cx.Stream is nil), so leaf events do not flow out — only the
-	// re-emitted boundaries gain the stamp (documented Go adapter mapping; Rust
-	// flows child events through the wrapper chain, Go suppresses them).
 	nodeStream := wrapNodeSink(onStream, "plan_execute", "")
 
 	// #131/#138: the phase-agnostic resume seed (the stalled worker conversation
@@ -1006,6 +1004,7 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 		// seed here so the execute-phase re-attach below does not also fire.
 		planEmptyRetries := executor.PlanEmptyMaxRetries()
 		var planEmptyAttempts uint32
+		var discardedUsage AggregateUsage
 	retryPlan:
 		planResume := resumeSeedSession != nil && !preexistingHasInProgress(preexisting)
 		directive := executor.PlanDirective(task.Instruction)
@@ -1025,7 +1024,13 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 			Budget:       planBudget,
 			LoopStrategy: *c.Plan,
 		}
-		planResult := executor.RunPlanSubtree(ctx, c.Plan, planTask, planSession, budget)
+		var forcedPlanSchema json.RawMessage
+		var suppressPlanTools bool
+		if planEmptyAttempts > 0 {
+			forcedPlanSchema = planOutputSchema()
+			suppressPlanTools = true
+		}
+		planResult := executor.RunPlanSubtree(ctx, c.Plan, planTask, planSession, budget, nodeStream, forcedPlanSchema, suppressPlanTools)
 		if planResult == nil {
 			result := RunResult{
 				Kind: RunFailure,
@@ -1080,22 +1085,24 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 		if len(taskList.Tasks) == 0 {
 			if planEmptyAttempts < planEmptyRetries {
 				planEmptyAttempts++
+				addAggregateUsage(&discardedUsage, outcome.Usage)
 				retryContent := planResult.Output
 				if retryContent == "" {
 					retryContent = `{"tasks":[]}`
 				}
 				baseSession = planResult.SessionState
-				executor.SeedUserMessage(ctx, &baseSession, retryContent)
+				executor.SeedUserMessage(ctx, &baseSession, emptyPlanRetryNudge(retryContent))
 				budget.Turns = outcome.Turns
 				budget.InputTokens += uint64(outcome.Usage.InputTokens)
 				budget.OutputTokens += uint64(outcome.Usage.OutputTokens)
 				goto retryPlan
 			}
+			usage := sumAggregateUsage(outcome.Usage, discardedUsage)
 			result := RunResult{
 				Kind:      RunFailure,
 				Reason:    HaltReason{Kind: HaltEmptyPlan},
 				SessionID: sessionID,
-				Usage:     outcome.Usage,
+				Usage:     usage,
 				Turns:     outcome.Turns,
 			}
 			return cx.finish(ctx, executor, task, result)
@@ -1112,7 +1119,7 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 					Reason: "persisted task graph contains a directed cycle",
 				},
 				SessionID: sessionID,
-				Usage:     outcome.Usage,
+				Usage:     sumAggregateUsage(outcome.Usage, discardedUsage),
 				Turns:     outcome.Turns,
 			}
 			return cx.finish(ctx, executor, task, result)
@@ -1129,7 +1136,7 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 		// already-Completed tasks are not re-run.
 		executor.ReconcileCompletedTasks(ctx, sessionID, &taskList)
 
-		totalUsage = outcome.Usage
+		totalUsage = sumAggregateUsage(outcome.Usage, discardedUsage)
 	}
 
 	// ── Phase 2: execute (dispatch c.Execute PER TASK). ─────────────────────
@@ -1164,6 +1171,29 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 // InProgress task in the durable list; this resets it to Pending so NextReady
 // re-schedules it and seeds its step from the carried session instead of a fresh
 // one — the worker continues mid-loop and its evaluator still runs.
+func addAggregateUsage(dst *AggregateUsage, src AggregateUsage) {
+	dst.InputTokens += src.InputTokens
+	dst.OutputTokens += src.OutputTokens
+	dst.CacheReadTokens += src.CacheReadTokens
+	dst.CacheWriteTokens += src.CacheWriteTokens
+	dst.CostUSD += src.CostUSD
+}
+
+func sumAggregateUsage(a, b AggregateUsage) AggregateUsage {
+	addAggregateUsage(&a, b)
+	return a
+}
+
+func planOutputSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"string"}},"rationale":{"type":"string"}},"required":["tasks"]}`)
+}
+
+func emptyPlanRetryNudge(previous string) string {
+	return "The previous planning response did not produce any executable tasks. " +
+		"Retry now with a non-empty JSON plan matching the required schema. Do not call tools; " +
+		"respond only with the corrected plan JSON. Previous response:\n" + previous
+}
+
 func (c *PlanExecuteConfig) runExecuteLoop(
 	ctx context.Context,
 	cx *ExecutionContext,
@@ -1356,6 +1386,8 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 		// #125: absolute turn count BEFORE this step, so the success path can
 		// charge only the DELTA against the PlanExecute scope.
 		carriedBefore := carried.Turns
+		cx.Stream = onStream
+		cx.Scratch.streamTaken = false
 		cx.Scratch.InExecuteStep = true
 		stepOutcome := c.Execute.Run(ctx, cx)
 		// #125 rule 4/7: a child's BudgetExhausted reaches THIS parent as a

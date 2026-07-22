@@ -4378,8 +4378,8 @@ func (h *StandardHarness) driveStrategyWithResumeSeed(
 // resolved toolset handle is threaded down alongside the agent so the window
 // dispatches the per-node scoped catalogue (empty handle ⇒ global-catalogue
 // fallback).
-func (h *StandardHarness) ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef, outputSchema json.RawMessage, outputSchemaMaxRetries uint32, systemPrompt *string, executeStep bool) RunResult {
-	return h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, toolset, outputSchema, outputSchemaMaxRetries, systemPrompt, executeStep)
+func (h *StandardHarness) ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef, outputSchema json.RawMessage, outputSchemaMaxRetries uint32, systemPrompt *string, executeStep bool, suppressTools bool) RunResult {
+	return h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, toolset, outputSchema, outputSchemaMaxRetries, systemPrompt, executeStep, suppressTools)
 }
 
 // ResolveWorkerAgent resolves the worker agent for a LoopStrategy tree from the
@@ -4467,14 +4467,17 @@ func (h *StandardHarness) PlanDirective(instruction string) string {
 // the registry via the plan child's leaf ReactConfig.Agent (Q1 — the separate
 // planner_agent concept is dropped). Returns nil if the child produced no
 // terminal.
-func (h *StandardHarness) RunPlanSubtree(ctx context.Context, plan *LoopStrategy, planTask Task, planSession SessionState, budget BudgetSnapshot) *RunResult {
+func (h *StandardHarness) RunPlanSubtree(ctx context.Context, plan *LoopStrategy, planTask Task, planSession SessionState, budget BudgetSnapshot, onStream StreamSink, forcedOutputSchema json.RawMessage, suppressTools bool) *RunResult {
 	// #124 Q1: the separate planner_agent concept is DROPPED — the plan child's
 	// leaf ReactConfig.Agent is authoritative and the plan child resolves its own
 	// worker agent from the registry via plan.Run.
 	cx := NewExecutionContext(&h.config.Registry)
 	cx.Executor = h
+	cx.Stream = onStream
 	cx.Scratch.RunSession = planSession
 	cx.Scratch.RunBudget = budget
+	cx.Scratch.ForcedOutputSchema = forcedOutputSchema
+	cx.Scratch.SuppressTools = suppressTools
 	pt := planTask
 	cx.Scratch.Task = &pt
 	_ = plan.Run(ctx, cx)
@@ -4944,7 +4947,7 @@ func (h *StandardHarness) runReAct(
 	// SC-10: the legacy runReAct wrapper carries no per-leaf system-prompt override
 	// (only the recursive ReactConfig.Run does) ⇒ the window uses the global
 	// config.SystemPrompt, byte-identical.
-	result := h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, ToolsetRef(""), nil, 0, nil, false)
+	result := h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, ToolsetRef(""), nil, 0, nil, false, false)
 	switch result.Kind {
 	case RunSuccess:
 		h.finalizeObservability(ctx, result.SessionID, TerminalSuccess, "")
@@ -5285,6 +5288,9 @@ func (h *StandardHarness) runReActInner(
 	// executeStep is the PlanExecute execute-phase one-shot marker used by the
 	// opt-in tool-call nudge. False for bare ReAct and non-execute phases.
 	executeStep bool,
+	// suppressTools hides every tool schema and routes any attempted tool call to
+	// the empty-registry error path (used by forced-schema empty-plan re-asks).
+	suppressTools bool,
 ) (out RunResult) {
 	// Issue #102 part 1: stamp the post-run conversation history onto the
 	// terminal Success/Failure result. The loop mutates `session` in place
@@ -5304,6 +5310,9 @@ func (h *StandardHarness) runReActInner(
 	// empty) per-run (re-injects its ToolContext with this run's SessionID +
 	// storage); otherwise returns the injected ToolRegistry seam.
 	toolRegistry := h.effectiveToolRegistryWithProgress(sessionID, toolset, onStream)
+	if suppressTools {
+		toolRegistry = NewStandardToolRegistry()
+	}
 	startedAt := time.Now()
 	usage := AggregateUsage{}
 

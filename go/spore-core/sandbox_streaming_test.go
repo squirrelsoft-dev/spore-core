@@ -4,7 +4,58 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestSanitizeCommandOutputStripsAnsiAndCollapsesCR(t *testing.T) {
+	got := sanitizeCommandOutput("\x1b[31mred\x1b[0m\nprogress 10%\rprogress 99%\rdone\n")
+	want := "red\ndone\n"
+	if got != want {
+		t.Fatalf("sanitize=%q, want %q", got, want)
+	}
+}
+
+func TestExecuteCommandSanitizesFinalAndProgressOutput(t *testing.T) {
+	dir := t.TempDir()
+	sb, err := NewWorkspaceScopedSandbox(cfg(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var previews []string
+	out, v := sb.ExecuteCommandStreaming(context.Background(), "/bin/sh", []string{"-c", "printf '\\033[31mred\\033[0m\\n'; printf 'a\\rb\\n'; sleep 0.2"}, "", 0, func(p string) {
+		previews = append(previews, p)
+	})
+	if v != nil {
+		t.Fatalf("violation: %+v", v)
+	}
+	if out.Stdout != "red\nb\n" {
+		t.Fatalf("stdout=%q, want sanitized red/b", out.Stdout)
+	}
+	for _, p := range previews {
+		if strings.Contains(p, "\x1b") || strings.Contains(p, "\r") {
+			t.Fatalf("preview not sanitized: %#v", previews)
+		}
+	}
+}
+
+func TestExecuteCommandBackgroundPipeDoesNotHang(t *testing.T) {
+	dir := t.TempDir()
+	sb, err := NewWorkspaceScopedSandbox(cfg(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	out, v := sb.ExecuteCommand(context.Background(), "/bin/sh", []string{"-c", "sleep 1 & echo done"}, "", 0)
+	if v != nil {
+		t.Fatalf("violation: %+v", v)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("background pipe held command open for %s", time.Since(start))
+	}
+	if strings.TrimSpace(out.Stdout) != "done" {
+		t.Fatalf("stdout=%q, want done", out.Stdout)
+	}
+}
 
 func TestExecuteCommandStreamingEmitsTailPreviews(t *testing.T) {
 	dir := t.TempDir()

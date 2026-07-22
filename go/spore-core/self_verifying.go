@@ -33,7 +33,6 @@ package sporecore
 
 import (
 	"context"
-	"fmt"
 	"reflect"
 	"time"
 )
@@ -100,23 +99,23 @@ type harnessPromptChunk struct {
 
 func (emptyChunkProvider) Load(context.Context) ([]harnessPromptChunk, error) { return nil, nil }
 
-func (h *StandardHarness) roleEvaluatorChunk(ctx context.Context) string {
+func (h *StandardHarness) roleEvaluatorChunk(ctx context.Context) (string, bool) {
 	if h.config.ChunkProvider == nil {
-		return RoleEvaluatorChunk
+		return "", false
 	}
 	loaded, ok := loadChunkProvider(ctx, h.config.ChunkProvider)
 	if !ok {
-		return RoleEvaluatorChunk
+		return "", false
 	}
 	for _, chunk := range loaded {
 		if chunk.ID == "role-evaluator" {
-			return chunk.Content
+			return chunk.Content, true
 		}
 	}
-	return RoleEvaluatorChunk
+	return "", false
 }
 
-func loadChunkProvider(ctx context.Context, provider any) ([]harnessPromptChunk, bool) {
+func loadChunkProvider(ctx context.Context, provider any) (chunks []harnessPromptChunk, ok bool) {
 	v := reflect.ValueOf(provider)
 	if !v.IsValid() {
 		return nil, false
@@ -129,6 +128,15 @@ func loadChunkProvider(ctx context.Context, provider any) ([]harnessPromptChunk,
 	if !m.Type().In(0).AssignableTo(ctxType) {
 		return nil, false
 	}
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	if !m.Type().Out(1).Implements(errorType) {
+		return nil, false
+	}
+	defer func() {
+		if recover() != nil {
+			chunks, ok = nil, false
+		}
+	}()
 	outs := m.Call([]reflect.Value{reflect.ValueOf(ctx)})
 	if errVal := outs[1]; !errVal.IsNil() {
 		return nil, false
@@ -137,7 +145,7 @@ func loadChunkProvider(ctx context.Context, provider any) ([]harnessPromptChunk,
 	if chunksVal.Kind() != reflect.Slice && chunksVal.Kind() != reflect.Array {
 		return nil, false
 	}
-	chunks := make([]harnessPromptChunk, 0, chunksVal.Len())
+	chunks = make([]harnessPromptChunk, 0, chunksVal.Len())
 	for i := 0; i < chunksVal.Len(); i++ {
 		item := chunksVal.Index(i)
 		if item.Kind() == reflect.Pointer {
@@ -265,15 +273,16 @@ func (h *StandardHarness) EvaluatePhase(
 	carried *BudgetSnapshot,
 	totalUsage *AggregateUsage,
 ) RunResult {
-	// R4 (presence-only): prepend the role-evaluator chunk content to the review
-	// directive. §F1: load it from HarnessConfig.ChunkProvider when present;
-	// default empty provider falls back to the byte-identical built-in constant.
-	directive := fmt.Sprintf(
-		"%s\n\nReview the work produced for the following task and report whether "+
-			"it is correct. You did NOT write this code; default to FAIL unless you "+
-			"can confirm it is right.\n\nTask:\n%s",
-		h.roleEvaluatorChunk(ctx), task.Instruction,
-	)
+	// R4 (presence-only): prepend the role-evaluator chunk content only when the
+	// configured provider supplies it. Missing/invalid/error providers do not add
+	// fallback prose, matching Rust's Option contract.
+	reviewDirective := "Review the work produced for the following task and report whether " +
+		"it is correct. You did NOT write this code; default to FAIL unless you " +
+		"can confirm it is right.\n\nTask:\n" + task.Instruction
+	if chunk, ok := h.roleEvaluatorChunk(ctx); ok {
+		reviewDirective = chunk + "\n\n" + reviewDirective
+	}
+	directive := reviewDirective
 
 	// R2/R9: fresh, never-shared session id for the evaluate run.
 	evalSessionID := NewSessionID()
@@ -354,7 +363,7 @@ func (h *StandardHarness) EvaluatePhase(
 	// recursive ReactConfig.Run is the enforcement seam). nil/0 ⇒ pre-#139.
 	// SC-10: the evaluate phase carries no per-leaf system-prompt override ⇒ the
 	// window uses the global config.SystemPrompt, byte-identical.
-	evalResult := evalHarness.runReActInner(ctx, evalTask, cap, evalState, BudgetSnapshot{}, nil, evalAgent, evalToolset, nil, 0, nil, false)
+	evalResult := evalHarness.runReActInner(ctx, evalTask, cap, evalState, BudgetSnapshot{}, nil, evalAgent, evalToolset, nil, 0, nil, false, false)
 	foldSelfVerifyUsage(totalUsage, carried, evalResult)
 	return evalResult
 }

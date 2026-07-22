@@ -29,6 +29,6 @@ Command-running tools can report live previews through `ToolContext.CommandProgr
 Several parity features are opt-in so default-constructed Go configs remain stable:
 
 - `WithToolCallNudge(true)`: nudge execute-step models to use tools before claiming completion.
-- `WithPlanEmptyMaxRetries(n)`: re-ask an empty planner up to `n` times before `HaltEmptyPlan`.
-- `WithToolSearch(config)`: advertise only core tools plus `tool_search`, with real dispatch delegated to the wrapped registry.
-- `WithChunkProvider(provider)`: override prompt chunks such as the SelfVerifying role-evaluator chunk.
+- `WithPlanEmptyMaxRetries(n)`: re-ask an empty planner up to `n` times before `HaltEmptyPlan`; retries force the plan JSON schema, suppress tools, and carry discarded-attempt usage forward.
+- `WithToolSearch(config)`: advertise core tools plus namespace/search headers, then statefully load searched/opened tools with description-budget LRU eviction.
+- `WithChunkProvider(provider)`: presence-only prompt chunks such as the SelfVerifying role-evaluator chunk.

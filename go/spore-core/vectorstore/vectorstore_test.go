@@ -88,6 +88,35 @@ func TestSearchFilterPushdown(t *testing.T) {
 	}
 }
 
+func TestSearchNegativeTopKReturnsEmpty(t *testing.T) {
+	store := NewInMemoryVectorStore(2)
+	_ = store.Add(context.Background(), []VectorRecord{{ID: "a", Vector: []float32{1, 0}}})
+	hits, err := store.Search(context.Background(), []float32{1, 0}, -1, MetadataFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("hits=%v, want empty for negative topK", hits)
+	}
+}
+
+func TestMetadataFilterUsesSemanticJSONEquality(t *testing.T) {
+	store := NewInMemoryVectorStore(2)
+	_ = store.Add(context.Background(), []VectorRecord{{
+		ID:       "a",
+		Vector:   []float32{1, 0},
+		Metadata: rawJSON(`{"attrs":{"b":2,"a":1}}`),
+	}})
+	filter := NewMetadataFilter().Eq("attrs", rawJSON(`{"a":1, "b":2}`))
+	hits, err := store.Search(context.Background(), []float32{1, 0}, 1, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].ID != "a" {
+		t.Fatalf("hits=%v, want semantic JSON object match", hits)
+	}
+}
+
 func TestDeleteByFilterReturnsCount(t *testing.T) {
 	store := NewInMemoryVectorStore(3)
 	_ = store.Add(context.Background(), []VectorRecord{

@@ -160,6 +160,34 @@ func errorParts(resp *http.Response) (code int, ra *time.Duration, message strin
 	return
 }
 
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnCloseBody) Close() error {
+	err := b.ReadCloser.Close()
+	if b.cancel != nil {
+		b.cancel()
+		b.cancel = nil
+	}
+	return err
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
+		return true
+	}
+	t := time.NewTimer(delay)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // sendWithRetry is the retrying HTTP sender shared by the hosted providers.
 // requestFn builds a fresh request each attempt; retryable decides per-status;
 // mapError converts a terminal non-retryable response into a ModelError.
@@ -194,7 +222,9 @@ func sendWithRetry(
 			}
 			// Transport error: retry on timeout up to maxRetries, else Transport.
 			if isTimeoutErr(err) && attempt < maxRetries {
-				time.Sleep(backoffDelay(attempt))
+				if !sleepWithContext(ctx, backoffDelay(attempt)) {
+					return nil, sporecore.NewTimeout()
+				}
 				attempt++
 				continue
 			}
@@ -205,13 +235,7 @@ func sendWithRetry(
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			if cancel != nil {
-				// Attach cancel so the caller can release the body; we hand off
-				// ownership of the body but keep the cancel alive via the resp.
-				_ = cancel
-				cancel = nil
-			}
-			if cancel != nil {
-				cancel()
+				resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}
 			}
 			return resp, nil
 		}
@@ -225,9 +249,7 @@ func sendWithRetry(
 			if ra != nil {
 				delay = *ra
 			}
-			select {
-			case <-time.After(delay):
-			case <-ctx.Done():
+			if !sleepWithContext(ctx, delay) {
 				return nil, ctx.Err()
 			}
 			attempt++

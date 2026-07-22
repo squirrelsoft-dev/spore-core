@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"reflect"
 	"sort"
 	"sync"
 )
@@ -88,11 +89,22 @@ func (f MetadataFilter) Matches(metadata json.RawMessage) bool {
 		if !ok {
 			return false
 		}
-		if string(got) != string(p.Value) {
+		if !jsonValueEqual(got, p.Value) {
 			return false
 		}
 	}
 	return true
+}
+
+func jsonValueEqual(a, b json.RawMessage) bool {
+	var av, bv any
+	if err := json.Unmarshal(a, &av); err != nil {
+		return false
+	}
+	if err := json.Unmarshal(b, &bv); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(av, bv)
 }
 
 // VectorStoreErrorKind discriminates VectorStoreError variants.
@@ -213,6 +225,9 @@ func (s *InMemoryVectorStore) Search(_ context.Context, query []float32, topK in
 	defer s.mu.Unlock()
 	if s.dimensions > 0 && len(query) != s.dimensions {
 		return nil, NewDimensionMismatchError(s.dimensions, len(query))
+	}
+	if topK <= 0 {
+		return []VectorHit{}, nil
 	}
 	type scored struct {
 		hit VectorHit

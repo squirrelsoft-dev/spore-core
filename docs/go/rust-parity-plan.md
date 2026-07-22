@@ -499,14 +499,15 @@ validation, compatibility, risks, intended final evidence.
 - **Go gap:** `tool_registry.go` has no `ToolNamespace`/`ToolSearchRegistry`/
   `ToolSearchConfig`; no `HarnessConfig.ToolSearch`. (Go's `ProjectNamespace`
   is the *storage* namespace — different concept.)
-- **Steps:** `tool_registry.go` add `ToolNamespace` (name + tool set), wire
-  `StandardToolRegistry` grouping; `ToolSearchConfig` (core set + description
-  budget) + `ToolSearchRegistry` (advertises `tool_search` meta-tool);
-  `HarnessConfig.ToolSearch *ToolSearchConfig` + `WithToolSearch`; wire
-  advertisement path.
+- **Steps:** `tool_registry.go` add `ToolNamespace` (name + description + member
+  names), `ToolSearchConfig` (core set, namespaces, description budget,
+  search_top_k, custom search name) + stateful `ToolSearchRegistry` (core +
+  namespace headers + search meta-tool + MRU loaded tools with LRU budget
+  eviction); `HarnessConfig.ToolSearch *ToolSearchConfig` + `WithToolSearch`;
+  wire advertisement path.
 - **E2E:** port namespace + tool-search tests; harness test asserting
-  `tool_search` advertises core set + meta-tool and a `tool_search` call
-  surfaces a deferred tool.
+  `tool_search` advertises core/header/meta, a search/open loads deferred tools
+  into subsequent schemas, and real dispatch delegates to the inner registry.
 - **Compat:** additive (nil ⇒ byte-identical). **Risks:** medium — deferred
   exposure changes which tools the model sees; guard default path.
 - **Final evidence:** `go test .` (tool_registry) green; harness tool-search
@@ -806,10 +807,10 @@ validation, compatibility, risks, intended final evidence.
   hardcodes `RoleEvaluatorChunk` as a constant because "HarnessConfig carries
   no chunk-provider field." Go consumers cannot plug conditional prompt chunks
   into the harness.
-- **Steps:** `harness.go` add `ChunkProvider promptassembly.ChunkProvider`
-  (default empty `InMemoryChunkProvider`) + `WithChunkProvider`; `self_verifying.go`
-  load the role-evaluator chunk from the provider when set (fall back to the
-  constant for byte-identical default).
+- **Steps:** `harness.go` add a structural chunk-provider adapter (root cannot
+  import `promptassembly` without a cycle), default empty provider +
+  `WithChunkProvider`; `self_verifying.go` prepends the role-evaluator chunk
+  only when the provider supplies it (presence-only, no built-in fallback).
 - **E2E:** port `harness/tests.rs:1459 default_chunk_provider_empty_and_chunks_setter_round_trips`
   + a self-verifying test that the chunk comes from the provider.
 - **Compat:** additive (default empty ⇒ byte-identical). **Risks:** low —
@@ -975,16 +976,16 @@ needs-decision: revised plan-review checkpoint — §B1 expanded to full OpenAI 
 | §B3 extended sampling | Complete: model params and OpenAI wire support. |
 | §B4 Ollama thinking/reasoning | Complete. |
 | §C1 tool-call repair | Complete: provider/config/default-attempt behavior and harness wiring. |
-| §C2 tool search | Complete: `ToolNamespace`, `ToolSearchConfig`, `ToolSearchRegistry`, harness opt-in wiring. |
+| §C2 tool search | Complete: full stateful `ToolNamespace`, `ToolSearchConfig`, `ToolSearchRegistry`, custom search name, `SearchTopK`, namespace opening, MRU loaded state, description-budget LRU eviction, and harness opt-in wiring. |
 | §D1 vector store | Complete: `vectorstore` package and tests. |
 | §E1 `NodeAttr` | Complete: event field, JSON emission, and nested stamping wrappers. |
 | §E2 `ToolProgress` | Complete: stream event, progress sink, optional streaming sandbox seam. |
 | §E3/§E4/§E7/§E9 | Complete: revised/steered/steering source, `SignalPlanRecorded`, turn-end usage. |
 | §E5 tool-call nudge | Complete: default-off structural/behavioral execute-step nudge. |
-| §E6 empty-plan retries | Complete: default-0 `PlanEmptyMaxRetries` and retry loop. Go adapter documents the lack of one-shot schema/no-tools override in the current plan subtree seam. |
+| §E6 empty-plan retries | Complete: default-0 `PlanEmptyMaxRetries`, forced-schema/no-tools retry subtree, corrective nudge, inherited stream sink, and cumulative usage accounting for discarded empty attempts. |
 | §E8 narration refund | Complete: ReAct window-gate behavior ported and tested. |
 | §E10 repeated tool-call breaker | Complete: `HaltRepeatedToolCall`. |
-| §F1 chunk provider | Complete: harness-level structural provider adapter and SelfVerifying role chunk override. |
+| §F1 chunk provider | Complete: harness-level structural provider adapter and SelfVerifying presence-only role chunk override with malformed-provider fallback/no-panic behavior. |
 | §G1 Go docs | Complete: quickstart, building tools, conversation/events, custom harness. |
 | §H known gaps | Complete: MCP, sqlite-vec, and Petri documented as known gaps, not implemented. |
 

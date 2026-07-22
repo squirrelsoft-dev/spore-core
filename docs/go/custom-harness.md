@@ -14,15 +14,17 @@
 
 `WithChunkProvider(provider)` lets harness sub-phases load prompt chunks. Because the root Go package cannot import `promptassembly` without a package cycle, this setter accepts a structural provider: any value with `Load(context.Context)` returning a slice/array of structs with `ID` and `Content` string fields plus an error.
 
-SelfVerifying reads the chunk with ID `role-evaluator`; if missing or loading fails, it falls back to the built-in `RoleEvaluatorChunk`.
+SelfVerifying reads the chunk with ID `role-evaluator`; if missing, malformed, or loading fails, no role-evaluator chunk is prepended. This is a presence-only contract.
 
 ## Deferred tool exposure
 
 `WithToolSearch(ToolSearchConfig{...})` wraps the effective registry with `ToolSearchRegistry`:
 
-- only `CoreTools` and the `tool_search` meta-tool are advertised up front;
-- `tool_search` searches non-core tool schemas by name/description;
-- real tool calls still dispatch to the inner registry by name.
+- `Core` tools, namespace headers, and the search meta-tool are advertised up front;
+- `tool_search` (or `SearchToolName`) searches non-core tool schemas by name/description and loads up to `SearchTopK` matches;
+- calling a `ToolNamespace` header opens that namespace and loads up to `SearchTopK` members;
+- loaded tools stay advertised across turns until the MRU/LRU description budget evicts older loaded tools;
+- real tool calls still dispatch to the inner registry by name, even if a tool is currently hidden or was evicted.
 
 This is useful for large catalogues where advertising every schema would waste prompt budget.
 

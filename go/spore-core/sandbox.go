@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -373,8 +374,8 @@ func (b *sharedOutputBuffer) String() string {
 }
 
 func progressPreview(stdout, stderr *sharedOutputBuffer) string {
-	combined := stdout.String()
-	if err := stderr.String(); err != "" {
+	combined := sanitizeCommandOutput(stdout.String())
+	if err := sanitizeCommandOutput(stderr.String()); err != "" {
 		if combined != "" && !strings.HasSuffix(combined, "\n") {
 			combined += "\n"
 		}
@@ -390,6 +391,91 @@ func progressPreview(stdout, stderr *sharedOutputBuffer) string {
 	}
 	return trimmed[start:]
 }
+
+func drainCommandPipe(r io.Reader, buf *sharedOutputBuffer, done chan<- struct{}) {
+	defer close(done)
+	_, _ = io.Copy(buf, r)
+}
+
+func waitCommandDrains(done ...<-chan struct{}) {
+	const drainGrace = 500 * time.Millisecond
+	for _, ch := range done {
+		if ch == nil {
+			continue
+		}
+		select {
+		case <-ch:
+		case <-time.After(drainGrace):
+		}
+	}
+}
+
+func sanitizeCommandOutput(s string) string {
+	return strings.Join(strings.Split(stripANSIAndControls(s), "\n"), "\n")
+}
+
+func stripANSIAndControls(s string) string {
+	var out strings.Builder
+	out.Grow(len(s))
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			i++
+			continue
+		}
+		if r == '\x1b' {
+			i += size
+			if i >= len(s) {
+				continue
+			}
+			next, nsize := utf8.DecodeRuneInString(s[i:])
+			i += nsize
+			switch next {
+			case '[':
+				for i < len(s) {
+					r2, sz := utf8.DecodeRuneInString(s[i:])
+					i += sz
+					if r2 >= '\u0040' && r2 <= '\u007e' {
+						break
+					}
+				}
+			case ']':
+				for i < len(s) {
+					r2, sz := utf8.DecodeRuneInString(s[i:])
+					i += sz
+					if r2 == '\a' {
+						break
+					}
+					if r2 == '\x1b' && i < len(s) {
+						r3, sz3 := utf8.DecodeRuneInString(s[i:])
+						if r3 == '\\' {
+							i += sz3
+						}
+						break
+					}
+				}
+			default:
+				// Two-byte escape consumed.
+			}
+			continue
+		}
+		if r == '\n' || r == '\t' || r == '\r' || !isControlRune(r) {
+			out.WriteRune(r)
+		}
+		i += size
+	}
+	lines := strings.Split(out.String(), "\n")
+	for i, line := range lines {
+		line = strings.TrimSuffix(line, "\r")
+		if idx := strings.LastIndex(line, "\r"); idx >= 0 {
+			line = line[idx+1:]
+		}
+		lines[i] = line
+	}
+	return strings.Join(lines, "\n")
+}
+
+func isControlRune(r rune) bool { return r >= 0 && r < 0x20 || r == 0x7f }
 
 // ExecuteCommandStreaming runs a subprocess and, when progress is non-nil,
 // emits sanitized tail previews while it is still running. Final stdout/stderr
@@ -468,12 +554,19 @@ func (s *WorkspaceScopedSandbox) ExecuteCommandStreaming(
 		}
 	}
 
-	// Drain stdout/stderr into shared buffers so the pipes don't fill and block
-	// the child, and so bytes captured so far remain reachable after a group-kill
-	// and while the progress ticker snapshots the tail.
+	// Drain stdout/stderr through explicit pipes so cmd.Wait only waits for the
+	// direct child; bounded post-wait drain joins prevent a background grandchild
+	// that inherited a pipe from holding the harness forever.
 	stdoutBuf, stderrBuf := &sharedOutputBuffer{}, &sharedOutputBuffer{}
-	cmd.Stdout = stdoutBuf
-	cmd.Stderr = stderrBuf
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return CommandOutput{}, &SandboxViolation{Kind: SandboxExecSpawnFailed, Command: command, Message: err.Error()}
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return CommandOutput{}, &SandboxViolation{Kind: SandboxExecSpawnFailed, Command: command, Message: err.Error()}
+	}
+	stdoutDone, stderrDone := make(chan struct{}), make(chan struct{})
 	if err := cmd.Start(); err != nil {
 		// SC-15: a failed spawn is a typed violation, not a fake
 		// CommandOutput{ExitCode: -1}.
@@ -483,6 +576,8 @@ func (s *WorkspaceScopedSandbox) ExecuteCommandStreaming(
 			Message: err.Error(),
 		}
 	}
+	go drainCommandPipe(stdoutPipe, stdoutBuf, stdoutDone)
+	go drainCommandPipe(stderrPipe, stderrBuf, stderrDone)
 	pgid := processGroupID(cmd)
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
@@ -500,6 +595,7 @@ func (s *WorkspaceScopedSandbox) ExecuteCommandStreaming(
 		select {
 		case err := <-waitCh:
 			// Normal exit. The group guard is disarmed (nothing to reap).
+			waitCommandDrains(stdoutDone, stderrDone)
 			exitCode := 0
 			if err != nil {
 				if ee, ok := err.(*exec.ExitError); ok {
@@ -514,8 +610,8 @@ func (s *WorkspaceScopedSandbox) ExecuteCommandStreaming(
 				}
 			}
 			return CommandOutput{
-				Stdout:   stdoutBuf.String(),
-				Stderr:   stderrBuf.String(),
+				Stdout:   sanitizeCommandOutput(stdoutBuf.String()),
+				Stderr:   sanitizeCommandOutput(stderrBuf.String()),
 				ExitCode: exitCode,
 			}, nil
 		case <-tick:
@@ -529,10 +625,16 @@ func (s *WorkspaceScopedSandbox) ExecuteCommandStreaming(
 			// then reap the child so it doesn't zombie.
 			killProcessGroup(pgid)
 			<-waitCh
+			waitCommandDrains(stdoutDone, stderrDone)
 			if runCtx.Err() == context.DeadlineExceeded {
+				stderr := sanitizeCommandOutput(stderrBuf.String())
+				if stderr != "" {
+					stderr += "\n"
+				}
+				stderr += fmt.Sprintf("command timed out after %s", effectiveTimeout)
 				return CommandOutput{
-					Stdout:   stdoutBuf.String(),
-					Stderr:   fmt.Sprintf("command timed out after %s", effectiveTimeout),
+					Stdout:   sanitizeCommandOutput(stdoutBuf.String()),
+					Stderr:   stderr,
 					ExitCode: -1,
 					TimedOut: true,
 				}, nil
@@ -541,7 +643,7 @@ func (s *WorkspaceScopedSandbox) ExecuteCommandStreaming(
 			// CommandOutput — not TimedOut — so callers can distinguish cancel vs
 			// timeout. The group has been reaped.
 			return CommandOutput{
-				Stdout:   stdoutBuf.String(),
+				Stdout:   sanitizeCommandOutput(stdoutBuf.String()),
 				Stderr:   "command cancelled",
 				ExitCode: -1,
 			}, nil

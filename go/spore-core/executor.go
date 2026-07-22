@@ -128,7 +128,7 @@ type StrategyExecutor interface {
 	// the global config.SystemPrompt (byte-identical to pre-SC-10). Non-nil ⇒
 	// this prompt REPLACES the global one for every turn of this window, so the
 	// leaf sees ONLY its own prompt. Mirrors toolset.
-	ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef, outputSchema json.RawMessage, outputSchemaMaxRetries uint32, systemPrompt *string, executeStep bool) RunResult
+	ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef, outputSchema json.RawMessage, outputSchemaMaxRetries uint32, systemPrompt *string, executeStep bool, suppressTools bool) RunResult
 
 	// ResolveWorkerAgent resolves the worker agent for a LoopStrategy tree from
 	// the ExecutionRegistry (#124): the agent on the LEAF reached by descending
@@ -231,7 +231,7 @@ type StrategyExecutor interface {
 	// (R5/R6) by running the child against an agent-swapped child harness when one
 	// is set; otherwise the default agent runs the plan turn. Returns nil only if
 	// the child produced no terminal.
-	RunPlanSubtree(ctx context.Context, plan *LoopStrategy, planTask Task, planSession SessionState, budget BudgetSnapshot) *RunResult
+	RunPlanSubtree(ctx context.Context, plan *LoopStrategy, planTask Task, planSession SessionState, budget BudgetSnapshot, onStream StreamSink, forcedOutputSchema json.RawMessage, suppressTools bool) *RunResult
 
 	// CapturePlanArtifact captures + persists a PlanArtifact from the plan
 	// sub-strategy's final output text (#124): R3 (parse), R11 (fire OnPlanCreated,
@@ -338,6 +338,12 @@ type RunScratch struct {
 	// window so opt-in tool-call nudges scope to execute steps only (Rust
 	// scratch.in_execute_step).
 	InExecuteStep bool
+	// ForcedOutputSchema, when non-nil, overrides a leaf's authored output schema
+	// for one recursive subtree (used by empty-plan re-ask parity).
+	ForcedOutputSchema json.RawMessage
+	// SuppressTools hides all tool schemas and rejects tool dispatch for one
+	// recursive subtree (used by empty-plan re-ask parity).
+	SuppressTools bool
 }
 
 // ResumeContinueSeed is the cross-process Continue checkpoint seed (#129):

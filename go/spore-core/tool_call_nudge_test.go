@@ -36,7 +36,7 @@ func TestToolCallNudgeDefaultOffDoesNotForceAnotherTurn(t *testing.T) {
 	cfg.CatalogueRegistry = nudgeRegistry(t)
 	h := NewStandardHarness(cfg)
 
-	r := h.ReactWindow(context.Background(), reactTask(5), 5, SessionState{}, BudgetSnapshot{}, nil, a, ToolsetRef(""), nil, 0, nil, true)
+	r := h.ReactWindow(context.Background(), reactTask(5), 5, SessionState{}, BudgetSnapshot{}, nil, a, ToolsetRef(""), nil, 0, nil, true, false)
 	if r.Kind != RunSuccess || r.Output != "I looked already" {
 		t.Fatalf("result=%+v, want first final success when nudge is default-off", r)
 	}
@@ -54,7 +54,7 @@ func TestToolCallNudgeBehavioralExecuteStepForcesToolUse(t *testing.T) {
 	cfg.CatalogueRegistry = nudgeRegistry(t)
 	h := NewStandardHarness(cfg)
 
-	r := h.ReactWindow(context.Background(), reactTask(5), 5, SessionState{}, BudgetSnapshot{}, nil, a, ToolsetRef(""), nil, 0, nil, true)
+	r := h.ReactWindow(context.Background(), reactTask(5), 5, SessionState{}, BudgetSnapshot{}, nil, a, ToolsetRef(""), nil, 0, nil, true, false)
 	if r.Kind != RunSuccess || r.Output != "done" {
 		t.Fatalf("result=%+v, want success after nudged tool use", r)
 	}
@@ -74,7 +74,7 @@ func TestToolCallNudgeStructuralFlipsPromptFlag(t *testing.T) {
 	cfg.CatalogueRegistry = nudgeRegistry(t)
 	h := NewStandardHarness(cfg)
 
-	r := h.ReactWindow(context.Background(), reactTask(5), 5, SessionState{}, BudgetSnapshot{}, nil, a, ToolsetRef(""), nil, 0, nil, true)
+	r := h.ReactWindow(context.Background(), reactTask(5), 5, SessionState{}, BudgetSnapshot{}, nil, a, ToolsetRef(""), nil, 0, nil, true, false)
 	if r.Kind != RunSuccess {
 		t.Fatalf("result=%+v, want success after structural nudge", r)
 	}
