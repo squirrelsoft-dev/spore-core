@@ -3550,6 +3550,12 @@ type HarnessConfig struct {
 	// the loop never reads or writes it.
 	PromptToolCallFlag *atomic.Bool // optional (set by the conversational preset)
 
+	// ToolCallNudge enables opt-in behavioral/structural nudges that ask an
+	// execute-step model to use an advertised tool before reporting completion.
+	// Default false preserves byte-identical behavior; PromptToolCallFlag's
+	// phrase-based prose escalation remains independent.
+	ToolCallNudge bool
+
 	// ConsultHandlers is the per-kind consult-handler map (issue #114), keyed by
 	// ConsultRequest.Kind. Per go/CONVENTIONS.md this is a struct FIELD, not a
 	// builder setter — matching the established PlannerAgent / Verifier /
@@ -3651,6 +3657,12 @@ func (c HarnessConfig) WithMaxRepairAttempts(attempts uint32) HarnessConfig {
 // behaviour byte-for-byte.
 func (c HarnessConfig) WithSteeringSource(source func() []string) HarnessConfig {
 	c.SteeringSource = source
+	return c
+}
+
+// WithToolCallNudge enables/disables opt-in tool-call nudges for execute steps.
+func (c HarnessConfig) WithToolCallNudge(on bool) HarnessConfig {
+	c.ToolCallNudge = on
 	return c
 }
 
@@ -4321,8 +4333,8 @@ func (h *StandardHarness) driveStrategyWithResumeSeed(
 // resolved toolset handle is threaded down alongside the agent so the window
 // dispatches the per-node scoped catalogue (empty handle ⇒ global-catalogue
 // fallback).
-func (h *StandardHarness) ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef, outputSchema json.RawMessage, outputSchemaMaxRetries uint32, systemPrompt *string) RunResult {
-	return h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, toolset, outputSchema, outputSchemaMaxRetries, systemPrompt)
+func (h *StandardHarness) ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef, outputSchema json.RawMessage, outputSchemaMaxRetries uint32, systemPrompt *string, executeStep bool) RunResult {
+	return h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, toolset, outputSchema, outputSchemaMaxRetries, systemPrompt, executeStep)
 }
 
 // ResolveWorkerAgent resolves the worker agent for a LoopStrategy tree from the
@@ -4880,7 +4892,7 @@ func (h *StandardHarness) runReAct(
 	// SC-10: the legacy runReAct wrapper carries no per-leaf system-prompt override
 	// (only the recursive ReactConfig.Run does) ⇒ the window uses the global
 	// config.SystemPrompt, byte-identical.
-	result := h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, ToolsetRef(""), nil, 0, nil)
+	result := h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, ToolsetRef(""), nil, 0, nil, false)
 	switch result.Kind {
 	case RunSuccess:
 		h.finalizeObservability(ctx, result.SessionID, TerminalSuccess, "")
@@ -5218,6 +5230,9 @@ func (h *StandardHarness) runReActInner(
 	// ONLY its own prompt (the per-leaf prompt half of SC-10; the toolset half is
 	// the toolset arg above).
 	systemPrompt *string,
+	// executeStep is the PlanExecute execute-phase one-shot marker used by the
+	// opt-in tool-call nudge. False for bare ReAct and non-execute phases.
+	executeStep bool,
 ) (out RunResult) {
 	// Issue #102 part 1: stamp the post-run conversation history onto the
 	// terminal Success/Failure result. The loop mutates `session` in place
@@ -5266,6 +5281,13 @@ func (h *StandardHarness) runReActInner(
 	// 2*N.
 	errorLoopN := h.config.effectiveErrorLoopThreshold()
 	errorRuns := map[string]*errorRun{}
+	// Tool-call nudge state (§E5, opt-in via HarnessConfig.ToolCallNudge). Scoped
+	// to execute-step windows and bounded so a model that refuses to act cannot
+	// loop indefinitely.
+	const maxToolCallNudges uint32 = 2
+	var toolCallNudgesUsed uint32
+	var toolsCalledThisWindow uint32
+
 	// Repeated-identical-successful-call breaker state (#137, the no-progress
 	// twin of the error breaker). lastSuccessSig is the (name, args) of the last
 	// SUCCESS; repeatCount is the consecutive identical-success run; repeatInjected
@@ -5554,14 +5576,29 @@ func (h *StandardHarness) runReActInner(
 			// flag is only flipped while still unset, bounding this to exactly one
 			// extra turn per window.
 			if h.config.PromptToolCallFlag != nil && !h.config.PromptToolCallFlag.Load() {
-				if prose, ok := DetectProseResponse(result.Content, toolsAdvertised); ok {
+				prose, phrase := DetectProseResponse(result.Content, toolsAdvertised)
+				structural := h.config.ToolCallNudge && executeStep && toolsAdvertised && toolsCalledThisWindow == 0 && outputSchema == nil
+				if phrase || structural {
 					h.config.PromptToolCallFlag.Store(true)
+					assistantText := result.Content
+					if phrase {
+						assistantText = prose
+					}
 					if a, ok := h.config.ContextManager.(AssistantMessageAppender); ok {
-						a.AppendAssistantMessage(ctx, &session, Message{Role: RoleAssistant, Content: NewTextContent(prose)})
+						a.AppendAssistantMessage(ctx, &session, Message{Role: RoleAssistant, Content: NewTextContent(assistantText)})
 					}
 					h.config.ContextManager.AppendUserMessage(ctx, &session, PromptToolCallNudge)
 					continue
 				}
+			}
+
+			if h.config.ToolCallNudge && executeStep && toolsAdvertised && toolsCalledThisWindow == 0 && outputSchema == nil && toolCallNudgesUsed < maxToolCallNudges {
+				toolCallNudgesUsed++
+				if a, ok := h.config.ContextManager.(AssistantMessageAppender); ok {
+					a.AppendAssistantMessage(ctx, &session, Message{Role: RoleAssistant, Content: NewTextContent(result.Content)})
+				}
+				h.config.ContextManager.AppendUserMessage(ctx, &session, BehavioralToolCallNudge)
+				continue
 			}
 
 			if h.config.Middleware != nil {
@@ -5717,6 +5754,7 @@ func (h *StandardHarness) runReActInner(
 			}
 
 		case TurnToolCallRequested:
+			toolsCalledThisWindow += uint32(len(result.Calls))
 			u := *result.Usage
 			usage.AddTurn(u)
 			budget.InputTokens += uint64(u.InputTokens)

@@ -128,7 +128,7 @@ type StrategyExecutor interface {
 	// the global config.SystemPrompt (byte-identical to pre-SC-10). Non-nil ⇒
 	// this prompt REPLACES the global one for every turn of this window, so the
 	// leaf sees ONLY its own prompt. Mirrors toolset.
-	ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef, outputSchema json.RawMessage, outputSchemaMaxRetries uint32, systemPrompt *string) RunResult
+	ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef, outputSchema json.RawMessage, outputSchemaMaxRetries uint32, systemPrompt *string, executeStep bool) RunResult
 
 	// ResolveWorkerAgent resolves the worker agent for a LoopStrategy tree from
 	// the ExecutionRegistry (#124): the agent on the LEAF reached by descending
@@ -330,6 +330,11 @@ type RunScratch struct {
 	// ContinueWithBudget resume arm (#138 budget). Nil on a fresh run / after the
 	// seed is consumed.
 	ResumeSeed *SessionState
+	// InExecuteStep is a one-shot marker set by PlanExecute immediately before
+	// dispatching an execute-phase child. A ReAct leaf consumes it before its
+	// window so opt-in tool-call nudges scope to execute steps only (Rust
+	// scratch.in_execute_step).
+	InExecuteStep bool
 }
 
 // ResumeContinueSeed is the cross-process Continue checkpoint seed (#129):

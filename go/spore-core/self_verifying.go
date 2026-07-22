@@ -285,7 +285,7 @@ func (h *StandardHarness) EvaluatePhase(
 	// recursive ReactConfig.Run is the enforcement seam). nil/0 ⇒ pre-#139.
 	// SC-10: the evaluate phase carries no per-leaf system-prompt override ⇒ the
 	// window uses the global config.SystemPrompt, byte-identical.
-	evalResult := evalHarness.runReActInner(ctx, evalTask, cap, evalState, BudgetSnapshot{}, nil, evalAgent, evalToolset, nil, 0, nil)
+	evalResult := evalHarness.runReActInner(ctx, evalTask, cap, evalState, BudgetSnapshot{}, nil, evalAgent, evalToolset, nil, 0, nil, false)
 	foldSelfVerifyUsage(totalUsage, carried, evalResult)
 	return evalResult
 }

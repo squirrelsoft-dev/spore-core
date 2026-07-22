@@ -822,6 +822,12 @@ func (c *ReactConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 	// The leaf takes the run's stream sink for the window; combinators that
 	// recurse per-phase suppress it (they take it before recursing).
 	onStream := wrapNodeSink(cx.takeStream(), "react", string(c.Agent))
+	// Consume the one-shot execute-step marker (set by PlanExecute before the
+	// execute child) so opt-in tool-call nudges scope to execute steps only and
+	// never leak into a nested leaf.
+	executeStep := cx.Scratch.InExecuteStep
+	cx.Scratch.InExecuteStep = false
+
 	// Issue 2: thread THIS leaf's toolset handle down so the window dispatches the
 	// per-node scoped catalogue (empty handle ⇒ global-catalogue fallback).
 	// Mirrors agent resolution.
@@ -829,7 +835,7 @@ func (c *ReactConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 	// so the window validates the terminal.
 	// SC-10: thread THIS leaf's per-node system-prompt override (nil ⇒ the window
 	// keeps using the global config.SystemPrompt). Mirrors c.Toolset.
-	result := executor.ReactWindow(ctx, task, c.MaxIterations(), session, budget, onStream, agent, c.Toolset, outputSchema, outputSchemaMaxRetries, c.SystemPrompt)
+	result := executor.ReactWindow(ctx, task, c.MaxIterations(), session, budget, onStream, agent, c.Toolset, outputSchema, outputSchemaMaxRetries, c.SystemPrompt, executeStep)
 	executor.Finalize(ctx, result)
 
 	// #125: charge the window's turns against this leaf's OWN scope. The leaf
@@ -1334,6 +1340,7 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 		// #125: absolute turn count BEFORE this step, so the success path can
 		// charge only the DELTA against the PlanExecute scope.
 		carriedBefore := carried.Turns
+		cx.Scratch.InExecuteStep = true
 		stepOutcome := c.Execute.Run(ctx, cx)
 		// #125 rule 4/7: a child's BudgetExhausted reaches THIS parent as a
 		// StrategyOutcome. #126 AC4: a budget-Fail resolution cascades IDENTICALLY
