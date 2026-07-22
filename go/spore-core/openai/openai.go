@@ -243,13 +243,22 @@ type wireRequest struct {
 	// model is treated as reasoning-capable AND OpenAICompat.SupportsReasoningEffort
 	// is set. Absent (omitempty) otherwise, so non-reasoning requests stay
 	// byte-identical.
-	ReasoningEffort *string        `json:"reasoning_effort,omitempty"`
-	Temperature     *float32       `json:"temperature,omitempty"`
-	TopP            *float32       `json:"top_p,omitempty"`
-	Stop            []string       `json:"stop,omitempty"`
-	Tools           []wireTool     `json:"tools,omitempty"`
-	Stream          bool           `json:"stream,omitempty"`
-	StreamOptions   *streamOptions `json:"stream_options,omitempty"`
+	ReasoningEffort *string  `json:"reasoning_effort,omitempty"`
+	Temperature     *float32 `json:"temperature,omitempty"`
+	TopP            *float32 `json:"top_p,omitempty"`
+	// Extended sampling controls. vLLM / local OpenAI-compatible servers accept
+	// top_k/min_p/repetition_penalty as request fields; presence_penalty is
+	// standard OpenAI. All skipped when unset so existing requests stay
+	// byte-identical. Dropped for o-series reasoning models (which reject
+	// sampling-control params), exactly like temperature/top_p/stop.
+	TopK              *uint32        `json:"top_k,omitempty"`
+	MinP              *float32       `json:"min_p,omitempty"`
+	PresencePenalty   *float32       `json:"presence_penalty,omitempty"`
+	RepetitionPenalty *float32       `json:"repetition_penalty,omitempty"`
+	Stop              []string       `json:"stop,omitempty"`
+	Tools             []wireTool     `json:"tools,omitempty"`
+	Stream            bool           `json:"stream,omitempty"`
+	StreamOptions     *streamOptions `json:"stream_options,omitempty"`
 }
 
 type streamOptions struct {
@@ -369,10 +378,20 @@ func buildRequest(modelID string, req sporecore.ModelRequest, stream bool, compa
 	temperature := req.Params.Temperature
 	topP := req.Params.TopP
 	stop := req.Params.StopSequences
+	// Extended sampling controls — dropped for o-series reasoning models (which
+	// reject sampling-control params), exactly like temperature/top_p/stop.
+	topK := req.Params.TopK
+	minP := req.Params.MinP
+	presencePenalty := req.Params.PresencePenalty
+	repetitionPenalty := req.Params.RepetitionPenalty
 	if reasoning {
 		temperature = nil
 		topP = nil
 		stop = nil
+		topK = nil
+		minP = nil
+		presencePenalty = nil
+		repetitionPenalty = nil
 	}
 
 	// SC-27: emit reasoning_effort only for a reasoning model whose compat opted
@@ -392,6 +411,10 @@ func buildRequest(modelID string, req sporecore.ModelRequest, stream bool, compa
 		ReasoningEffort:     reasoningEffort,
 		Temperature:         temperature,
 		TopP:                topP,
+		TopK:                topK,
+		MinP:                minP,
+		PresencePenalty:     presencePenalty,
+		RepetitionPenalty:   repetitionPenalty,
 		Stop:                stop,
 		Tools:               tools,
 		Stream:              stream,

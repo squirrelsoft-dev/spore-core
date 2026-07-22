@@ -43,6 +43,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -343,7 +344,26 @@ type ToolContext struct {
 	ProjectNamespace SessionID
 	RunStore         ToolRunStore
 	MemoryStore      ToolMemoryStore
+	// Optional run-level live-progress sink. Set by the harness bridge when a
+	// stream sink is attached; tools derive per-call command emitters via
+	// CommandProgress. nil means no consumer is listening.
+	Progress ToolProgressSink
 }
+
+// ToolProgressUpdate is one live-progress update from a RUNNING tool, labeled
+// with the call it belongs to. The harness maps it to tool_progress stream
+// events; Preview is a sanitized tail snapshot that REPLACES the previous UI
+// preview for the call.
+type ToolProgressUpdate struct {
+	Tool    string
+	CallID  string
+	Preview string
+}
+
+// ToolProgressSink consumes run-level live-progress updates. It should not
+// block; WorkspaceScopedSandbox calls command progress from its ~100ms wait
+// loop while the process is running.
+type ToolProgressSink func(ToolProgressUpdate)
 
 // NewToolContext builds a ToolContext from the run's session id and the storage
 // seams. A nil runStore yields a context whose RunStore reads empty and discards
@@ -365,6 +385,32 @@ func NewToolContextWithProject(sessionID, projectNamespace SessionID, runStore T
 		ProjectNamespace: projectNamespace,
 		RunStore:         runStore,
 		MemoryStore:      memStore,
+	}
+}
+
+// WithProgress returns a copy of c carrying the run-level live-progress sink.
+// Passing nil clears progress. A nil receiver yields a minimal no-op context
+// with the supplied sink.
+func (c *ToolContext) WithProgress(sink ToolProgressSink) *ToolContext {
+	if c == nil {
+		return &ToolContext{Progress: sink}
+	}
+	cp := *c
+	cp.Progress = sink
+	return &cp
+}
+
+// CommandProgress derives the per-call command-progress emitter for call. It
+// wraps the run-level sink with the tool name and call id so command executors
+// only emit plain preview strings. nil means no consumer is listening.
+func (c *ToolContext) CommandProgress(call ToolCall) CommandProgressSink {
+	if c == nil || c.Progress == nil {
+		return nil
+	}
+	tool := call.Name
+	callID := call.ID
+	return func(preview string) {
+		c.Progress(ToolProgressUpdate{Tool: tool, CallID: callID, Preview: preview})
 	}
 }
 
@@ -511,6 +557,51 @@ type Tool interface {
 // ToolRegistry interface
 // ============================================================================
 
+// ToolNamespace is a logical group of deferred tools (e.g. one MCP server). The
+// namespace itself is advertised as a cheap zero-arg header; calling it loads its
+// member tools into the active advertised set.
+type ToolNamespace struct {
+	Name        string
+	Description string
+	Tools       []string
+}
+
+func NewToolNamespace(name, description string, tools ...string) ToolNamespace {
+	return ToolNamespace{Name: name, Description: description, Tools: append([]string(nil), tools...)}
+}
+
+// ToolSearchConfig configures deferred tool exposure. Core names are always
+// advertised. Non-core tools start hidden and are loaded by the search meta-tool
+// or by opening a namespace. CoreTools is kept as a compatibility alias for Core.
+type ToolSearchConfig struct {
+	Core              []string
+	CoreTools         []string
+	Namespaces        []ToolNamespace
+	DescriptionBudget uint32
+	SearchTopK        uint32
+	SearchToolName    string
+}
+
+func NewToolSearchConfig(core ...string) ToolSearchConfig {
+	return ToolSearchConfig{Core: append([]string(nil), core...), DescriptionBudget: 4096, SearchTopK: 5, SearchToolName: ToolSearchToolName}
+}
+
+func (c ToolSearchConfig) normalized() ToolSearchConfig {
+	if len(c.Core) == 0 && len(c.CoreTools) > 0 {
+		c.Core = append([]string(nil), c.CoreTools...)
+	}
+	if c.DescriptionBudget == 0 {
+		c.DescriptionBudget = 4096
+	}
+	if c.SearchTopK == 0 {
+		c.SearchTopK = 5
+	}
+	if c.SearchToolName == "" {
+		c.SearchToolName = ToolSearchToolName
+	}
+	return c
+}
+
 // ToolRegistry is the canonical issue-#4 interface. Implementations maintain
 // the catalog and dispatch incoming tool calls.
 type ToolRegistry interface {
@@ -543,6 +634,315 @@ type ToolRegistry interface {
 	// Layer-1 always-halt tool. Kept for the harness loop's pre-dispatch
 	// short circuit.
 	IsAlwaysHalt(toolName string) bool
+}
+
+const ToolSearchToolName = "tool_search"
+
+// ToolSearchRegistry wraps another registry with a stateful active advertised
+// set. Search/opened tools become visible on later ActiveSchemas calls, real
+// dispatch always delegates to the full inner catalogue, and loaded tools are
+// LRU-evicted to keep advertised description prose under budget.
+type ToolSearchRegistry struct {
+	inner            ToolRegistry
+	cfg              ToolSearchConfig
+	catalogue        []RegistryToolSchema
+	core             []string
+	namespaces       []ToolNamespace
+	namespaceHeaders []RegistryToolSchema
+	searchSchema     RegistryToolSchema
+	mu               sync.Mutex
+	loaded           []string // MRU first
+}
+
+func NewToolSearchRegistry(inner ToolRegistry, cfg ToolSearchConfig) *ToolSearchRegistry {
+	cfg = cfg.normalized()
+	catalogue := inner.ActiveSchemas(nil)
+	inCatalogue := func(name string) bool {
+		for _, s := range catalogue {
+			if s.Name == name {
+				return true
+			}
+		}
+		return false
+	}
+	var core []string
+	for _, s := range catalogue {
+		if stringIn(s.Name, cfg.Core) && !stringIn(s.Name, core) {
+			core = append(core, s.Name)
+		}
+	}
+	var namespaces []ToolNamespace
+	for _, ns := range cfg.Namespaces {
+		if inCatalogue(ns.Name) || namespaceExists(ns.Name, namespaces) {
+			continue
+		}
+		var tools []string
+		for _, name := range ns.Tools {
+			if inCatalogue(name) && !stringIn(name, core) && !stringIn(name, tools) {
+				tools = append(tools, name)
+			}
+		}
+		if len(tools) == 0 {
+			continue
+		}
+		namespaces = append(namespaces, ToolNamespace{Name: ns.Name, Description: ns.Description, Tools: tools})
+	}
+	r := &ToolSearchRegistry{inner: inner, cfg: cfg, catalogue: catalogue, core: core, namespaces: namespaces, searchSchema: toolSearchSchema(cfg.SearchToolName)}
+	for _, ns := range namespaces {
+		r.namespaceHeaders = append(r.namespaceHeaders, namespaceHeaderSchema(ns))
+	}
+	return r
+}
+
+func stringIn(s string, values []string) bool {
+	for _, v := range values {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+func namespaceExists(name string, values []ToolNamespace) bool {
+	for _, v := range values {
+		if v.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *ToolSearchRegistry) Register(tool Tool, schema RegistryToolSchema) error {
+	return r.inner.Register(tool, schema)
+}
+
+func (r *ToolSearchRegistry) RegisterSet(set ToolSet) error { return r.inner.RegisterSet(set) }
+
+func namespaceHeaderSchema(ns ToolNamespace) RegistryToolSchema {
+	return RegistryToolSchema{
+		Name:        ns.Name,
+		Description: ns.Description + " (call to load this group's tools)",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+		Annotations: ToolAnnotations{ReadOnly: true},
+	}
+}
+
+func toolSearchSchema(name string) RegistryToolSchema {
+	return RegistryToolSchema{
+		Name:        name,
+		Description: "Load more tools by keyword when you need a capability you don't currently have (e.g. run command, web search, task list).",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"query":{"type":"string","description":"Keywords for the capability you need."}},"required":["query"]}`),
+		Annotations: ToolAnnotations{ReadOnly: true},
+	}
+}
+
+func (r *ToolSearchRegistry) schemaByName(name string) (RegistryToolSchema, bool) {
+	for _, s := range r.catalogue {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return RegistryToolSchema{}, false
+}
+
+func (r *ToolSearchRegistry) isCore(name string) bool { return stringIn(name, r.core) }
+
+func (r *ToolSearchRegistry) touch(name string) {
+	if name == r.cfg.SearchToolName || r.isCore(name) {
+		return
+	}
+	if _, ok := r.schemaByName(name); !ok {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.loaded = removeString(r.loaded, name)
+	r.loaded = append([]string{name}, r.loaded...)
+}
+
+func removeString(values []string, target string) []string {
+	out := values[:0]
+	for _, v := range values {
+		if v != target {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func (r *ToolSearchRegistry) search(query string) []string {
+	var terms []string
+	for _, term := range strings.FieldsFunc(strings.ToLower(query), func(r rune) bool { return !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')) }) {
+		if len(term) >= 2 {
+			terms = append(terms, term)
+		}
+	}
+	if len(terms) == 0 {
+		return nil
+	}
+	type scored struct {
+		name  string
+		score int
+	}
+	var hits []scored
+	for _, s := range r.catalogue {
+		if s.Name == r.cfg.SearchToolName || r.isCore(s.Name) {
+			continue
+		}
+		name, desc := strings.ToLower(s.Name), strings.ToLower(s.Description)
+		score := 0
+		for _, term := range terms {
+			if strings.Contains(name, term) {
+				score += 3
+			}
+			if strings.Contains(desc, term) {
+				score++
+			}
+		}
+		if score > 0 {
+			hits = append(hits, scored{name: s.Name, score: score})
+		}
+	}
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].score != hits[j].score {
+			return hits[i].score > hits[j].score
+		}
+		return hits[i].name < hits[j].name
+	})
+	limit := int(r.cfg.SearchTopK)
+	if len(hits) < limit {
+		limit = len(hits)
+	}
+	out := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		out = append(out, hits[i].name)
+	}
+	return out
+}
+
+func (r *ToolSearchRegistry) ActiveSchemas(_ *TaskPhase) []RegistryToolSchema {
+	var out []RegistryToolSchema
+	used := uint32(0)
+	for _, name := range r.core {
+		if s, ok := r.schemaByName(name); ok {
+			used += uint32(len(s.Description))
+			out = append(out, s)
+		}
+	}
+	for _, header := range r.namespaceHeaders {
+		used += uint32(len(header.Description))
+		out = append(out, header)
+	}
+	used += uint32(len(r.searchSchema.Description))
+	out = append(out, r.searchSchema)
+	r.mu.Lock()
+	kept := r.loaded[:0]
+	for _, name := range r.loaded {
+		if r.isCore(name) {
+			continue
+		}
+		s, ok := r.schemaByName(name)
+		if !ok {
+			continue
+		}
+		next := used + uint32(len(s.Description))
+		if next > r.cfg.DescriptionBudget {
+			break
+		}
+		used = next
+		kept = append(kept, name)
+		out = append(out, s)
+	}
+	r.loaded = append([]string(nil), kept...)
+	r.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func (r *ToolSearchRegistry) Dispatch(ctx context.Context, call ToolCall, sandbox SandboxProvider) (HarnessToolResult, error) {
+	if call.Name == r.cfg.SearchToolName {
+		return HarnessToolResult{CallID: call.ID, Output: r.runSearch(call.Input)}, nil
+	}
+	for _, ns := range r.namespaces {
+		if ns.Name == call.Name {
+			return HarnessToolResult{CallID: call.ID, Output: r.openNamespace(ns)}, nil
+		}
+	}
+	r.touch(call.Name)
+	return r.inner.Dispatch(ctx, call, sandbox)
+}
+
+func (r *ToolSearchRegistry) runSearch(input json.RawMessage) ToolOutput {
+	var params struct {
+		Query string `json:"query"`
+	}
+	if err := json.Unmarshal(input, &params); err != nil || strings.TrimSpace(params.Query) == "" {
+		return ToolOutput{Kind: ToolOutputError, Message: r.cfg.SearchToolName + ": provide a non-empty `query` string describing the capability you need.", Recoverable: true}
+	}
+	hits := r.search(params.Query)
+	if len(hits) == 0 {
+		return NewToolOutputSuccess("No tools matched \"" + params.Query + "\". Try different keywords — the tools you already have are in your current tool list.")
+	}
+	return r.loadAndList(hits, fmt.Sprintf("Loaded %d tool(s) for \"%s\". You can now call them directly:", len(hits), params.Query))
+}
+
+func (r *ToolSearchRegistry) openNamespace(ns ToolNamespace) ToolOutput {
+	limit := int(r.cfg.SearchTopK)
+	if len(ns.Tools) < limit {
+		limit = len(ns.Tools)
+	}
+	if limit == 0 {
+		return NewToolOutputSuccess("Namespace \"" + ns.Name + "\" has no available tools.")
+	}
+	members := append([]string(nil), ns.Tools[:limit]...)
+	return r.loadAndList(members, fmt.Sprintf("Opened namespace \"%s\" — loaded %d tool(s). You can now call them directly:", ns.Name, len(members)))
+}
+
+func (r *ToolSearchRegistry) loadAndList(names []string, header string) ToolOutput {
+	for i := len(names) - 1; i >= 0; i-- {
+		r.touch(names[i])
+	}
+	lines := []string{header}
+	for _, name := range names {
+		if s, ok := r.schemaByName(name); ok {
+			lines = append(lines, fmt.Sprintf("- %s: %s", s.Name, s.Description))
+			lines = append(lines, "  parameters: "+string(s.Parameters))
+		}
+	}
+	return NewToolOutputSuccess(strings.Join(lines, "\n"))
+}
+
+func (r *ToolSearchRegistry) AdvertisedDescriptionBytes() uint32 {
+	var total uint32
+	for _, s := range r.ActiveSchemas(nil) {
+		total += uint32(len(s.Description))
+	}
+	return total
+}
+
+func (r *ToolSearchRegistry) DispatchAll(ctx context.Context, calls []ToolCall, sandbox SandboxProvider) []DispatchOutcome {
+	out := make([]DispatchOutcome, len(calls))
+	for i, call := range calls {
+		res, err := r.Dispatch(ctx, call, sandbox)
+		if err != nil {
+			if de, ok := err.(*DispatchError); ok {
+				out[i].Err = de
+			} else {
+				out[i].Err = &DispatchError{Kind: DispatchErrUnregisteredTool, Name: call.Name}
+			}
+		} else {
+			out[i].Result = res
+		}
+	}
+	return out
+}
+
+func (r *ToolSearchRegistry) HasSubagentTools() bool { return r.inner.HasSubagentTools() }
+func (r *ToolSearchRegistry) IsAlwaysHalt(toolName string) bool {
+	if toolName == r.cfg.SearchToolName || namespaceExists(toolName, r.namespaces) {
+		return false
+	}
+	return r.inner.IsAlwaysHalt(toolName)
 }
 
 // DispatchOutcome is the per-slot result of DispatchAll. Exactly one of

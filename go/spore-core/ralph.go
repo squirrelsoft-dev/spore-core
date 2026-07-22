@@ -300,3 +300,9 @@ func (h *StandardHarness) EnforceOutputSchemas() bool {
 func (h *StandardHarness) OutputSchemaMaxRetries() uint32 {
 	return h.config.effectiveOutputSchemaMaxRetries()
 }
+
+// PlanEmptyMaxRetries returns N, the number of empty-plan re-asks before
+// HaltEmptyPlan (nil/default 0 preserves immediate empty_plan).
+func (h *StandardHarness) PlanEmptyMaxRetries() uint32 {
+	return h.config.effectivePlanEmptyMaxRetries()
+}

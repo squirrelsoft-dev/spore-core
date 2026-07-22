@@ -12,12 +12,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // ============================================================================
@@ -174,16 +177,44 @@ func (s *WorkspaceScopedSandbox) ResolvePath(_ context.Context, raw string, op O
 	// path that resolves *outside* the root is still a PathEscape.
 	canonical, err := canonicalize(joined)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			parent := filepath.Dir(joined)
-			leaf := filepath.Base(joined)
-			cp, parentErr := canonicalize(parent)
-			if parentErr != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", &SandboxViolation{Kind: SandboxPathEscape, Path: raw}
+		}
+		// Walk up to the nearest EXISTING ancestor, canonicalize it, and re-join
+		// the missing components — so a target several levels inside a
+		// not-yet-created subtree still resolves (write_file / create_dir then
+		// materialize the directories). Mirrors the Rust reference's ancestor
+		// walk. Symlinks can only live in the existing prefix (a missing path
+		// contains none), so canonicalizing that prefix is as strong as
+		// canonicalizing a direct parent. A `..`-terminated ancestor aborts
+		// the walk: a lexical re-join across `..` cannot be trusted once the
+		// directories exist.
+		ancestor := joined
+		var missing []string
+		for {
+			name := filepath.Base(ancestor)
+			if name == string(filepath.Separator) || name == "." || name == "" {
 				return "", &SandboxViolation{Kind: SandboxPathEscape, Path: raw}
 			}
-			canonical = filepath.Join(cp, leaf)
-		} else {
-			return "", &SandboxViolation{Kind: SandboxPathEscape, Path: raw}
+			missing = append(missing, name)
+			parent := filepath.Dir(ancestor)
+			if parent == ancestor {
+				return "", &SandboxViolation{Kind: SandboxPathEscape, Path: raw}
+			}
+			cp, parentErr := canonicalize(parent)
+			if parentErr == nil {
+				// Re-join the missing components (in reverse — outermost first)
+				// onto the canonicalized existing ancestor.
+				canonical = cp
+				for i := len(missing) - 1; i >= 0; i-- {
+					canonical = filepath.Join(canonical, missing[i])
+				}
+				break
+			}
+			if !errors.Is(parentErr, os.ErrNotExist) {
+				return "", &SandboxViolation{Kind: SandboxPathEscape, Path: raw}
+			}
+			ancestor = parent
 		}
 	}
 
@@ -319,6 +350,149 @@ func (s *WorkspaceScopedSandbox) ExecuteCommand(
 	workingDir string,
 	timeout time.Duration,
 ) (CommandOutput, *SandboxViolation) {
+	return s.ExecuteCommandStreaming(ctx, command, args, workingDir, timeout, nil)
+}
+
+const progressInterval = 100 * time.Millisecond
+const progressTailBytes = 2048
+
+type sharedOutputBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *sharedOutputBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *sharedOutputBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func progressPreview(stdout, stderr *sharedOutputBuffer) string {
+	combined := sanitizeCommandOutput(stdout.String())
+	if err := sanitizeCommandOutput(stderr.String()); err != "" {
+		if combined != "" && !strings.HasSuffix(combined, "\n") {
+			combined += "\n"
+		}
+		combined += err
+	}
+	trimmed := strings.TrimRight(combined, "\r\n\t ")
+	if len(trimmed) <= progressTailBytes {
+		return trimmed
+	}
+	start := len(trimmed) - progressTailBytes
+	for start < len(trimmed) && !utf8.RuneStart(trimmed[start]) {
+		start++
+	}
+	return trimmed[start:]
+}
+
+func drainCommandPipe(r io.Reader, buf *sharedOutputBuffer, done chan<- struct{}) {
+	defer close(done)
+	defer func() {
+		if c, ok := r.(io.Closer); ok {
+			_ = c.Close()
+		}
+	}()
+	_, _ = io.Copy(buf, r)
+}
+
+func waitCommandDrains(done ...<-chan struct{}) {
+	const drainGrace = 500 * time.Millisecond
+	for _, ch := range done {
+		if ch == nil {
+			continue
+		}
+		select {
+		case <-ch:
+		case <-time.After(drainGrace):
+		}
+	}
+}
+
+func sanitizeCommandOutput(s string) string {
+	return strings.Join(strings.Split(stripANSIAndControls(s), "\n"), "\n")
+}
+
+func stripANSIAndControls(s string) string {
+	var out strings.Builder
+	out.Grow(len(s))
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			i++
+			continue
+		}
+		if r == '\x1b' {
+			i += size
+			if i >= len(s) {
+				continue
+			}
+			next, nsize := utf8.DecodeRuneInString(s[i:])
+			i += nsize
+			switch next {
+			case '[':
+				for i < len(s) {
+					r2, sz := utf8.DecodeRuneInString(s[i:])
+					i += sz
+					if r2 >= '\u0040' && r2 <= '\u007e' {
+						break
+					}
+				}
+			case ']':
+				for i < len(s) {
+					r2, sz := utf8.DecodeRuneInString(s[i:])
+					i += sz
+					if r2 == '\a' {
+						break
+					}
+					if r2 == '\x1b' && i < len(s) {
+						r3, sz3 := utf8.DecodeRuneInString(s[i:])
+						if r3 == '\\' {
+							i += sz3
+						}
+						break
+					}
+				}
+			default:
+				// Two-byte escape consumed.
+			}
+			continue
+		}
+		if r == '\n' || r == '\t' || r == '\r' || !isControlRune(r) {
+			out.WriteRune(r)
+		}
+		i += size
+	}
+	lines := strings.Split(out.String(), "\n")
+	for i, line := range lines {
+		line = strings.TrimSuffix(line, "\r")
+		if idx := strings.LastIndex(line, "\r"); idx >= 0 {
+			line = line[idx+1:]
+		}
+		lines[i] = line
+	}
+	return strings.Join(lines, "\n")
+}
+
+func isControlRune(r rune) bool { return r >= 0 && r < 0x20 || r == 0x7f }
+
+// ExecuteCommandStreaming runs a subprocess and, when progress is non-nil,
+// emits sanitized tail previews while it is still running. Final stdout/stderr
+// are identical to ExecuteCommand.
+func (s *WorkspaceScopedSandbox) ExecuteCommandStreaming(
+	ctx context.Context,
+	command string,
+	args []string,
+	workingDir string,
+	timeout time.Duration,
+	progress CommandProgressSink,
+) (CommandOutput, *SandboxViolation) {
 	switch s.isolationMode.(type) {
 	case IsolationBubblewrap:
 		return CommandOutput{}, &SandboxViolation{
@@ -348,10 +522,13 @@ func (s *WorkspaceScopedSandbox) ExecuteCommand(
 		runCtx, cancel = context.WithTimeout(ctx, effectiveTimeout)
 		defer cancel()
 	}
-	// KillOnDrop is satisfied by construction: exec.CommandContext kills the
-	// child when runCtx is cancelled (the timeout firing, or an outer cancel),
-	// which is Go's native kill-on-drop. No extra wiring is needed.
+	// Process-group reap parity (Rust `cmd.process_group(0)` + GroupKillGuard):
+	// make the child a group leader so a cancel/timeout can kill the WHOLE
+	// group, not just the direct child. Without this, a grandchild holding the
+	// stdout pipe open (e.g. `sh -c "echo x; sleep 30"`) would block cmd.Output()
+	// until it exits naturally — orphaning work on cancel/timeout.
 	cmd := exec.CommandContext(runCtx, command, args...)
+	setProcessGroup(cmd)
 	if workingDir != "" {
 		cmd.Dir = workingDir
 	} else {
@@ -382,41 +559,113 @@ func (s *WorkspaceScopedSandbox) ExecuteCommand(
 		}
 	}
 
-	stdout, err := cmd.Output()
-	stderr := ""
-	if ee, ok := err.(*exec.ExitError); ok {
-		stderr = string(ee.Stderr)
-	}
-	exitCode := 0
+	// Drain stdout/stderr through parent-owned pipes so cmd.Wait only waits for
+	// the direct child and cannot close the read side before our drains capture
+	// short output. The child receives the write ends; the parent closes its write
+	// descriptors immediately after Start, then bounded post-wait joins prevent a
+	// background grandchild that inherited a pipe from holding the harness forever.
+	stdoutBuf, stderrBuf := &sharedOutputBuffer{}, &sharedOutputBuffer{}
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
-		if runCtx.Err() == context.DeadlineExceeded {
+		return CommandOutput{}, &SandboxViolation{Kind: SandboxExecSpawnFailed, Command: command, Message: err.Error()}
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		return CommandOutput{}, &SandboxViolation{Kind: SandboxExecSpawnFailed, Command: command, Message: err.Error()}
+	}
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
+	stdoutDone, stderrDone := make(chan struct{}), make(chan struct{})
+	if err := cmd.Start(); err != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		_ = stderrR.Close()
+		_ = stderrW.Close()
+		// SC-15: a failed spawn is a typed violation, not a fake
+		// CommandOutput{ExitCode: -1}.
+		return CommandOutput{}, &SandboxViolation{
+			Kind:    SandboxExecSpawnFailed,
+			Command: command,
+			Message: err.Error(),
+		}
+	}
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
+	go drainCommandPipe(stdoutR, stdoutBuf, stdoutDone)
+	go drainCommandPipe(stderrR, stderrBuf, stderrDone)
+	pgid := processGroupID(cmd)
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+
+	var ticker *time.Ticker
+	var tick <-chan time.Time
+	if progress != nil {
+		ticker = time.NewTicker(progressInterval)
+		defer ticker.Stop()
+		tick = ticker.C
+	}
+	lastPreview := ""
+
+	for {
+		select {
+		case err := <-waitCh:
+			// Normal exit. The group guard is disarmed (nothing to reap).
+			waitCommandDrains(stdoutDone, stderrDone)
+			exitCode := 0
+			if err != nil {
+				if ee, ok := err.(*exec.ExitError); ok {
+					exitCode = ee.ExitCode()
+				} else {
+					// Should not happen after a successful Start, but stay safe.
+					return CommandOutput{}, &SandboxViolation{
+						Kind:    SandboxExecSpawnFailed,
+						Command: command,
+						Message: err.Error(),
+					}
+				}
+			}
 			return CommandOutput{
-				Stdout:   "",
-				Stderr:   fmt.Sprintf("command timed out after %s", effectiveTimeout),
+				Stdout:   sanitizeCommandOutput(stdoutBuf.String()),
+				Stderr:   sanitizeCommandOutput(stderrBuf.String()),
+				ExitCode: exitCode,
+			}, nil
+		case <-tick:
+			preview := progressPreview(stdoutBuf, stderrBuf)
+			if preview != "" && preview != lastPreview {
+				progress(preview)
+				lastPreview = preview
+			}
+		case <-runCtx.Done():
+			// Cancel/timeout: kill the WHOLE process group (child + grandchildren),
+			// then reap the child so it doesn't zombie.
+			killProcessGroup(pgid)
+			<-waitCh
+			waitCommandDrains(stdoutDone, stderrDone)
+			if runCtx.Err() == context.DeadlineExceeded {
+				stderr := sanitizeCommandOutput(stderrBuf.String())
+				if stderr != "" {
+					stderr += "\n"
+				}
+				stderr += fmt.Sprintf("command timed out after %s", effectiveTimeout)
+				return CommandOutput{
+					Stdout:   sanitizeCommandOutput(stdoutBuf.String()),
+					Stderr:   stderr,
+					ExitCode: -1,
+					TimedOut: true,
+				}, nil
+			}
+			// Outer context cancelled (not a deadline). Surface as a signal-killed
+			// CommandOutput — not TimedOut — so callers can distinguish cancel vs
+			// timeout. The group has been reaped.
+			return CommandOutput{
+				Stdout:   sanitizeCommandOutput(stdoutBuf.String()),
+				Stderr:   "command cancelled",
 				ExitCode: -1,
-				TimedOut: true,
 			}, nil
 		}
-		if ee, ok := err.(*exec.ExitError); ok {
-			exitCode = ee.ExitCode()
-		} else {
-			// SC-15: a failed spawn is a typed violation, not a fake
-			// CommandOutput{ExitCode: -1}. Callers already handle the
-			// *SandboxViolation arm. Timeout (handled above) keeps its
-			// CommandOutput{ExitCode: -1, TimedOut: true} — a real run that
-			// exceeded the clock, not a spawn failure.
-			return CommandOutput{}, &SandboxViolation{
-				Kind:    SandboxExecSpawnFailed,
-				Command: command,
-				Message: err.Error(),
-			}
-		}
 	}
-	return CommandOutput{
-		Stdout:   string(stdout),
-		Stderr:   stderr,
-		ExitCode: exitCode,
-	}, nil
 }
 
 // ============================================================================

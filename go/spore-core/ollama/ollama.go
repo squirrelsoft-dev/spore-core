@@ -53,6 +53,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -110,6 +111,10 @@ type ModelInterface struct {
 	checkErr  error
 	checkMeta modelMeta
 	metaReady atomic.Bool
+	// thinkingUnsupportedWarned guards the one-time warning when a requested
+	// `think` flag was dropped because the model lacks the "thinking"
+	// capability (SC-16). Fires once per client, not every turn.
+	thinkingUnsupportedWarned atomic.Bool
 }
 
 // modelMeta is the /api/show-discovered metadata for the model. Populated once,
@@ -126,6 +131,19 @@ type modelMeta struct {
 func (m modelMeta) supportsTools() bool {
 	for _, c := range m.capabilities {
 		if c == "tools" {
+			return true
+		}
+	}
+	return false
+}
+
+// supportsThinking reports whether the model advertises the "thinking"
+// capability (the sole authority for reasoning support, per /api/show). Used to
+// gate the request-side `think` flag: sending `think` to a non-thinking model
+// returns an Ollama 400.
+func (m modelMeta) supportsThinking() bool {
+	for _, c := range m.capabilities {
+		if c == "thinking" {
 			return true
 		}
 	}
@@ -284,6 +302,50 @@ type wireRequest struct {
 	// channel (which Ollama does not parse, causing the call to leak into
 	// message.content).
 	Format json.RawMessage `json:"format,omitempty"`
+	// Think is Ollama's reasoning pass. Either a boolean (from a positive
+	// reasoning_budget) or a categorical level string (from reasoning_effort:
+	// "low"/"medium"/"high"/"max"). Serialized UNTAGGED so it lands on the wire as
+	// a bare boolean or a bare level string. nil (the default) is omitted, keeping
+	// non-reasoning requests byte-identical. Dropped in Call/CallStreaming when
+	// the model lacks the "thinking" capability.
+	Think *ollamaThink `json:"think,omitempty"`
+}
+
+// ollamaThink is Ollama's `think` request parameter, serialized untagged so it
+// lands on the wire as a bare boolean (`true`) or a bare level string
+// (`"low"`/`"medium"`/`"high"`/`"max"`). Ollama rejects any other string with
+// `invalid think value`, so the level set is fixed by ReasoningEffort.
+type ollamaThink struct {
+	// level is the categorical level string; when non-empty it is emitted as a
+	// bare string. When empty, `enabled` is emitted as a bare boolean.
+	level   string
+	enabled bool
+}
+
+// MarshalJSON emits a bare boolean (when level is empty) or a bare level
+// string (mirrors Rust's #[serde(untagged)]).
+func (t ollamaThink) MarshalJSON() ([]byte, error) {
+	if t.level != "" {
+		return json.Marshal(t.level)
+	}
+	return json.Marshal(t.enabled)
+}
+
+// ollamaThinkFromEffort maps an abstract ReasoningEffort to Ollama's accepted
+// level string.
+func ollamaThinkFromEffort(effort sporecore.ReasoningEffort) ollamaThink {
+	var level string
+	switch effort {
+	case sporecore.ReasoningEffortLow:
+		level = "low"
+	case sporecore.ReasoningEffortMedium:
+		level = "medium"
+	case sporecore.ReasoningEffortHigh:
+		level = "high"
+	case sporecore.ReasoningEffortMax:
+		level = "max"
+	}
+	return ollamaThink{level: level}
 }
 
 type wireOptions struct {
@@ -342,8 +404,12 @@ type wireResponse struct {
 }
 
 type wireResponseMessage struct {
-	Role      string                 `json:"role"`
-	Content   string                 `json:"content"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
+	// Thinking is Ollama's separate reasoning channel. Surfaced as a
+	// ContentBlockThinking (unary) / StreamThinkingDelta (streaming) ahead of
+	// the answer text, mirroring the Anthropic / OpenAI clients.
+	Thinking  string                 `json:"thinking,omitempty"`
 	ToolCalls []wireResponseToolCall `json:"tool_calls"`
 }
 
@@ -453,6 +519,20 @@ func buildRequest(modelID, keepAlive string, numCtx *uint32, req sporecore.Model
 		optsOut = opts
 	}
 
+	// Ollama's `think` request parameter. reasoning_effort (a categorical level)
+	// WINS when set; otherwise a positive reasoning_budget enables the boolean
+	// (`think: true`) — the budget magnitude has no Ollama analogue. nil / a zero
+	// budget with no effort leaves think unset. Capability gating (dropping
+	// `think` when the model can't reason) happens in Call / CallStreaming, which
+	// hold the /api/show metadata buildRequest lacks.
+	var think *ollamaThink
+	if req.Params.ReasoningEffort != nil {
+		t := ollamaThinkFromEffort(*req.Params.ReasoningEffort)
+		think = &t
+	} else if req.Params.ReasoningBudget != nil && *req.Params.ReasoningBudget > 0 {
+		think = &ollamaThink{enabled: true}
+	}
+
 	return wireRequest{
 		Model:     modelID,
 		Messages:  messages,
@@ -461,6 +541,7 @@ func buildRequest(modelID, keepAlive string, numCtx *uint32, req sporecore.Model
 		Options:   optsOut,
 		Tools:     tools,
 		Format:    format,
+		Think:     think,
 	}
 }
 
@@ -621,6 +702,12 @@ func parseResponse(body wireResponse, structured bool) sporecore.ModelResponse {
 	}
 
 	blocks := make([]sporecore.ContentBlock, 0, 1+len(body.Message.ToolCalls))
+	// Reasoning precedes the answer — mirror the Anthropic / OpenAI clients,
+	// which push the Thinking block ahead of Text. Ollama surfaces reasoning on
+	// the separate message.thinking channel.
+	if body.Message.Thinking != "" {
+		blocks = append(blocks, sporecore.NewThinkingBlock(body.Message.Thinking))
+	}
 	if body.Message.Content != "" {
 		blocks = append(blocks, sporecore.NewTextBlock(body.Message.Content))
 	}
@@ -900,6 +987,28 @@ func (c *ModelInterface) discoverMeta(ctx context.Context) modelMeta {
 // support tools. The /api/show capabilities array is the sole authority for
 // tool support: the model is tool-capable iff capabilities contains "tools".
 // Empty or unavailable /api/show metadata ⟹ NOT tool-capable (fail closed).
+// gateThinking drops the request-side `think` flag when the model can't
+// reason. Sending `think` to a non-thinking model returns an Ollama 400, so —
+// like the tool-support guard — the request is corrected before it is sent.
+// Returns true when a think flag was dropped (so the caller can warn once).
+// Mirrors the Rust reference's gate_thinking.
+func (c *ModelInterface) gateThinking(body *wireRequest) bool {
+	if body.Think != nil && !c.checkMeta.supportsThinking() {
+		body.Think = nil
+		return true
+	}
+	return false
+}
+
+// warnThinkingUnsupportedOnce surfaces a one-time warning when a requested
+// `think` flag was dropped because the model lacks the "thinking" capability
+// (SC-16). Guarded by an atomic so it fires once per client, not every turn.
+func (c *ModelInterface) warnThinkingUnsupportedOnce() {
+	if !c.thinkingUnsupportedWarned.Swap(true) {
+		fmt.Fprintf(os.Stderr, "[spore-core] reasoning requested but Ollama model '%s' lacks the 'thinking' capability — the think flag was dropped; the request proceeds without reasoning\n", c.modelID)
+	}
+}
+
 func (c *ModelInterface) guardToolSupport(req sporecore.ModelRequest) error {
 	if len(req.Tools) == 0 {
 		return nil
@@ -926,6 +1035,9 @@ func (c *ModelInterface) Call(ctx context.Context, req sporecore.ModelRequest) (
 		return sporecore.ModelResponse{}, err
 	}
 	body := buildRequest(c.modelID, c.keepAlive, c.numCtx, req, false)
+	if c.gateThinking(&body) {
+		c.warnThinkingUnsupportedOnce()
+	}
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return sporecore.ModelResponse{}, sporecore.NewProviderError(0, fmt.Sprintf("request encode failed: %v", err))
@@ -1026,6 +1138,9 @@ func (c *ModelInterface) CallStreaming(ctx context.Context, req sporecore.ModelR
 		return nil, err
 	}
 	body := buildRequest(c.modelID, c.keepAlive, c.numCtx, req, true)
+	if c.gateThinking(&body) {
+		c.warnThinkingUnsupportedOnce()
+	}
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, sporecore.NewProviderError(0, fmt.Sprintf("request encode failed: %v", err))
@@ -1079,6 +1194,13 @@ func parseNDJSONStream(ctx context.Context, r io.Reader, ch chan<- sporecore.Str
 		toolIndicesSeen    = map[uint32]bool{}
 		contentIndex       uint32
 		contentIndexActive bool
+		// Thinking (reasoning) arrives on Ollama's separate message.thinking
+		// channel, on a block index DISJOINT from text and tools so both survive
+		// accumulation. THINKING_INDEX is 0; when a thinking prefix precedes the
+		// answer, the first text delta closes the thinking block and moves text
+		// onto THINKING_INDEX+1. Mirrors the Rust reference.
+		thinkingIndex uint32 = 0
+		thinkingOpen  bool
 		// Structured mode: the constrained JSON object arrives as message.content
 		// text deltas spread across chunks. We must NOT surface that raw JSON to
 		// the user — instead buffer it for the whole response and parse it at the
@@ -1165,7 +1287,31 @@ func parseNDJSONStream(ctx context.Context, r io.Reader, ch chan<- sporecore.Str
 		}
 		message, _ := value["message"].(map[string]any)
 		if message != nil {
+			// Thinking deltas arrive on the separate `thinking` channel, on a disjoint
+			// block index so they survive accumulation alongside the answer text.
+			if think, ok := message["thinking"].(string); ok && think != "" {
+				thinkingOpen = true
+				if !sendEvent(ctx, ch, sporecore.StreamEvent{
+					Type:  sporecore.StreamThinkingDelta,
+					Index: thinkingIndex,
+					Delta: think,
+				}) {
+					return
+				}
+			}
 			if text, ok := message["content"].(string); ok && text != "" {
+				// First text after a reasoning prefix: close the thinking block and
+				// move text onto its own index so both survive accumulation.
+				if thinkingOpen {
+					if !sendEvent(ctx, ch, sporecore.StreamEvent{
+						Type:  sporecore.StreamContentBlockStop,
+						Index: thinkingIndex,
+					}) {
+						return
+					}
+					thinkingOpen = false
+					contentIndex = thinkingIndex + 1
+				}
 				contentIndexActive = true
 				if !sendEvent(ctx, ch, sporecore.StreamEvent{
 					Type:  sporecore.StreamContentBlockDelta,

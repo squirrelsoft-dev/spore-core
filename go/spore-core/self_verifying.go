@@ -33,7 +33,7 @@ package sporecore
 
 import (
 	"context"
-	"fmt"
+	"reflect"
 	"time"
 )
 
@@ -90,6 +90,82 @@ type Verifier interface {
 // duplicated here as the single source of truth for the harness loop.
 const RoleEvaluatorChunk = "You are a fresh evaluator. You did not write the code under review. Default to FAIL."
 
+type emptyChunkProvider struct{}
+
+type harnessPromptChunk struct {
+	ID      string
+	Content string
+}
+
+func (emptyChunkProvider) Load(context.Context) ([]harnessPromptChunk, error) { return nil, nil }
+
+func (h *StandardHarness) roleEvaluatorChunk(ctx context.Context) (string, bool) {
+	if h.config.ChunkProvider == nil {
+		return "", false
+	}
+	loaded, ok := loadChunkProvider(ctx, h.config.ChunkProvider)
+	if !ok {
+		return "", false
+	}
+	for _, chunk := range loaded {
+		if chunk.ID == "role-evaluator" {
+			return chunk.Content, true
+		}
+	}
+	return "", false
+}
+
+func loadChunkProvider(ctx context.Context, provider any) (chunks []harnessPromptChunk, ok bool) {
+	v := reflect.ValueOf(provider)
+	if !v.IsValid() {
+		return nil, false
+	}
+	m := v.MethodByName("Load")
+	if !m.IsValid() || m.Type().NumIn() != 1 || m.Type().NumOut() != 2 {
+		return nil, false
+	}
+	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()
+	if !m.Type().In(0).AssignableTo(ctxType) {
+		return nil, false
+	}
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	if !m.Type().Out(1).Implements(errorType) {
+		return nil, false
+	}
+	defer func() {
+		if recover() != nil {
+			chunks, ok = nil, false
+		}
+	}()
+	outs := m.Call([]reflect.Value{reflect.ValueOf(ctx)})
+	if errVal := outs[1]; !errVal.IsNil() {
+		return nil, false
+	}
+	chunksVal := outs[0]
+	if chunksVal.Kind() != reflect.Slice && chunksVal.Kind() != reflect.Array {
+		return nil, false
+	}
+	chunks = make([]harnessPromptChunk, 0, chunksVal.Len())
+	for i := 0; i < chunksVal.Len(); i++ {
+		item := chunksVal.Index(i)
+		if item.Kind() == reflect.Pointer {
+			if item.IsNil() {
+				continue
+			}
+			item = item.Elem()
+		}
+		if item.Kind() != reflect.Struct {
+			continue
+		}
+		id := item.FieldByName("ID")
+		content := item.FieldByName("Content")
+		if id.IsValid() && content.IsValid() && id.Kind() == reflect.String && content.Kind() == reflect.String {
+			chunks = append(chunks, harnessPromptChunk{ID: id.String(), Content: content.String()})
+		}
+	}
+	return chunks, true
+}
+
 // ============================================================================
 // ReadOnlySandbox decorator (R3)
 // ============================================================================
@@ -142,6 +218,12 @@ func (s *ReadOnlySandbox) ExecuteCommand(_ context.Context, command string, _ []
 	return CommandOutput{}, &SandboxViolation{Kind: SandboxReadOnly, Path: command}
 }
 
+// ExecuteCommandStreaming is also forbidden outright — subprocesses may have
+// arbitrary write side effects, progress or not.
+func (s *ReadOnlySandbox) ExecuteCommandStreaming(_ context.Context, command string, _ []string, _ string, _ time.Duration, _ CommandProgressSink) (CommandOutput, *SandboxViolation) {
+	return CommandOutput{}, &SandboxViolation{Kind: SandboxReadOnly, Path: command}
+}
+
 // HandleLargeOutput delegates (a read-side concern).
 func (s *ReadOnlySandbox) HandleLargeOutput(ctx context.Context, content string, callID string, headTokens uint32, tailTokens uint32) TruncatedOutput {
 	return s.inner.HandleLargeOutput(ctx, content, callID, headTokens, tailTokens)
@@ -191,14 +273,16 @@ func (h *StandardHarness) EvaluatePhase(
 	carried *BudgetSnapshot,
 	totalUsage *AggregateUsage,
 ) RunResult {
-	// R4 (presence-only): prepend the role-evaluator chunk content to the review
-	// directive.
-	directive := fmt.Sprintf(
-		"%s\n\nReview the work produced for the following task and report whether "+
-			"it is correct. You did NOT write this code; default to FAIL unless you "+
-			"can confirm it is right.\n\nTask:\n%s",
-		RoleEvaluatorChunk, task.Instruction,
-	)
+	// R4 (presence-only): prepend the role-evaluator chunk content only when the
+	// configured provider supplies it. Missing/invalid/error providers do not add
+	// fallback prose, matching Rust's Option contract.
+	reviewDirective := "Review the work produced for the following task and report whether " +
+		"it is correct. You did NOT write this code; default to FAIL unless you " +
+		"can confirm it is right.\n\nTask:\n" + task.Instruction
+	if chunk, ok := h.roleEvaluatorChunk(ctx); ok {
+		reviewDirective = chunk + "\n\n" + reviewDirective
+	}
+	directive := reviewDirective
 
 	// R2/R9: fresh, never-shared session id for the evaluate run.
 	evalSessionID := NewSessionID()
@@ -279,7 +363,7 @@ func (h *StandardHarness) EvaluatePhase(
 	// recursive ReactConfig.Run is the enforcement seam). nil/0 ⇒ pre-#139.
 	// SC-10: the evaluate phase carries no per-leaf system-prompt override ⇒ the
 	// window uses the global config.SystemPrompt, byte-identical.
-	evalResult := evalHarness.runReActInner(ctx, evalTask, cap, evalState, BudgetSnapshot{}, nil, evalAgent, evalToolset, nil, 0, nil)
+	evalResult := evalHarness.runReActInner(ctx, evalTask, cap, evalState, BudgetSnapshot{}, nil, evalAgent, evalToolset, nil, 0, nil, false, false)
 	foldSelfVerifyUsage(totalUsage, carried, evalResult)
 	return evalResult
 }

@@ -49,7 +49,7 @@ func (h *StandardHarness) runPlanPhase(
 		LoopStrategy: *cfg.Plan,
 	}
 
-	planResult := h.RunPlanSubtree(ctx, cfg.Plan, planTask, *planSession, budget)
+	planResult := h.RunPlanSubtree(ctx, cfg.Plan, planTask, *planSession, budget, nil, nil, false)
 	if planResult == nil {
 		return nil, &RunResult{
 			Kind: RunFailure,

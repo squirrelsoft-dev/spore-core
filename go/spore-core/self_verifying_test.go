@@ -230,7 +230,7 @@ func TestSelfVerifyingRoleEvaluatorChunkInSeed(t *testing.T) {
 	// evaluate seed still carries the role-evaluator chunk; the build seed (the
 	// first turn) must not.
 	build := newRecordingAgent("build", "built")
-	cfg := selfVerifyCfg(build, newSVVerifier(3, "pass"))
+	cfg := selfVerifyCfg(build, newSVVerifier(3, "pass")).WithChunkProvider(fakeChunkProvider{chunks: []harnessPromptChunk{{ID: "role-evaluator", Content: RoleEvaluatorChunk}}})
 	h := NewStandardHarness(cfg)
 	if r := h.Run(context.Background(), NewHarnessRunOptions(selfVerifyTask())); r.Kind != RunSuccess {
 		t.Fatalf("expected Success, got %+v", r)
@@ -497,7 +497,8 @@ func TestSelfVerifyingEvalAgentOverrideRunsDistinctReviewer(t *testing.T) {
 		}))
 
 	cfg := selfVerifyCfg(builder, newSVVerifier(3, "pass")).
-		WithRegistryAgent("reviewer", reviewer)
+		WithRegistryAgent("reviewer", reviewer).
+		WithChunkProvider(fakeChunkProvider{chunks: []harnessPromptChunk{{ID: "role-evaluator", Content: RoleEvaluatorChunk}}})
 	h := NewStandardHarness(cfg)
 	r := h.Run(context.Background(), NewHarnessRunOptions(task))
 	if r.Kind != RunSuccess {

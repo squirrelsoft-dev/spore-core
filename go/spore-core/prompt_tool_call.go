@@ -49,10 +49,15 @@ import (
 // block. Used to make InjectToolPrompt idempotent.
 const toolsBlockOpen = "<available_tools>"
 
-// PromptToolCallNudge is the user-facing nudge appended after a prose response
-// is detected, asking the model to use the tool-call format. Byte-identical to
-// the Rust reference.
-const PromptToolCallNudge = "You described an action but did not call a tool. Use the provided tool-call format to actually invoke the tool."
+// PromptToolCallNudge is the user-facing nudge appended after a prose/structural
+// no-tool response when the adaptive prompt-tool-call fallback is activated.
+// Mirrors the Rust nudge text so the next request switches to the prompt-based
+// tool-call format coherently.
+const PromptToolCallNudge = "No tool call was detected in your last response. The tools available to you and the exact tool-call format are described in the system prompt — use that format now to actually invoke a tool, not prose or a code block."
+
+// BehavioralToolCallNudge is the opt-in execute-step nudge for a terminal answer
+// that called zero tools while tools were advertised.
+const BehavioralToolCallNudge = "You have not called any tool yet, so you have not actually inspected anything — your answer would be guessed, not grounded. Use the available tools (list_dir, read_file, grep, …) to gather the real data NOW, then report only what the tools returned."
 
 // toolCallMarkerRe matches a <tool_call> marker in model text. Non-greedy, with
 // the `s` flag so `.` spans newlines (RE2 equivalent of Rust's `(?s)`).

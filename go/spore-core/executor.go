@@ -128,7 +128,7 @@ type StrategyExecutor interface {
 	// the global config.SystemPrompt (byte-identical to pre-SC-10). Non-nil ⇒
 	// this prompt REPLACES the global one for every turn of this window, so the
 	// leaf sees ONLY its own prompt. Mirrors toolset.
-	ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef, outputSchema json.RawMessage, outputSchemaMaxRetries uint32, systemPrompt *string) RunResult
+	ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef, outputSchema json.RawMessage, outputSchemaMaxRetries uint32, systemPrompt *string, executeStep bool, suppressTools bool) RunResult
 
 	// ResolveWorkerAgent resolves the worker agent for a LoopStrategy tree from
 	// the ExecutionRegistry (#124): the agent on the LEAF reached by descending
@@ -190,6 +190,9 @@ type StrategyExecutor interface {
 	// 1 + N). Read by ReactConfig.Run to thread into the window. Default 2.
 	OutputSchemaMaxRetries() uint32
 
+	// PlanEmptyMaxRetries is the number of empty-plan re-asks before HaltEmptyPlan.
+	PlanEmptyMaxRetries() uint32
+
 	// HillEvaluate runs one HillClimbing metric evaluation on the resolved
 	// evaluator over a fresh SessionState (#124). On success ok is true and
 	// (value, dur) carry the result; on failure ok is false and (errStatus,
@@ -228,7 +231,7 @@ type StrategyExecutor interface {
 	// (R5/R6) by running the child against an agent-swapped child harness when one
 	// is set; otherwise the default agent runs the plan turn. Returns nil only if
 	// the child produced no terminal.
-	RunPlanSubtree(ctx context.Context, plan *LoopStrategy, planTask Task, planSession SessionState, budget BudgetSnapshot) *RunResult
+	RunPlanSubtree(ctx context.Context, plan *LoopStrategy, planTask Task, planSession SessionState, budget BudgetSnapshot, onStream StreamSink, forcedOutputSchema json.RawMessage, suppressTools bool) *RunResult
 
 	// CapturePlanArtifact captures + persists a PlanArtifact from the plan
 	// sub-strategy's final output text (#124): R3 (parse), R11 (fire OnPlanCreated,
@@ -330,6 +333,17 @@ type RunScratch struct {
 	// ContinueWithBudget resume arm (#138 budget). Nil on a fresh run / after the
 	// seed is consumed.
 	ResumeSeed *SessionState
+	// InExecuteStep is a one-shot marker set by PlanExecute immediately before
+	// dispatching an execute-phase child. A ReAct leaf consumes it before its
+	// window so opt-in tool-call nudges scope to execute steps only (Rust
+	// scratch.in_execute_step).
+	InExecuteStep bool
+	// ForcedOutputSchema, when non-nil, overrides a leaf's authored output schema
+	// for one recursive subtree (used by empty-plan re-ask parity).
+	ForcedOutputSchema json.RawMessage
+	// SuppressTools hides all tool schemas and rejects tool dispatch for one
+	// recursive subtree (used by empty-plan re-ask parity).
+	SuppressTools bool
 }
 
 // ResumeContinueSeed is the cross-process Continue checkpoint seed (#129):

@@ -293,6 +293,7 @@ const (
 	HarnessStreamTurnEnd       HarnessStreamEventKind = "turn_end"
 	HarnessStreamToolCall      HarnessStreamEventKind = "tool_call"
 	HarnessStreamToolResult    HarnessStreamEventKind = "tool_result"
+	HarnessStreamToolProgress  HarnessStreamEventKind = "tool_progress"
 	HarnessStreamFinalResponse HarnessStreamEventKind = "final_response"
 	HarnessStreamBudgetWarning HarnessStreamEventKind = "budget_warning"
 	// HarnessStreamUserMessage — the send_message tool (#81) surfaces an
@@ -384,6 +385,8 @@ type HarnessStreamEvent struct {
 	IsError bool `json:"-"`
 	// final_response, user_message, text_delta, reasoning_delta
 	Content string `json:"-"`
+	// tool_progress: sanitized tail snapshot that REPLACES the previous preview.
+	Preview string `json:"-"`
 	// budget_warning
 	LimitType BudgetLimitType `json:"-"`
 	// tool_call (Q5): final, fully-accumulated tool-call arguments (parsed JSON
@@ -391,6 +394,21 @@ type HarnessStreamEvent struct {
 	Args json.RawMessage `json:"-"`
 	// tool_result (Q5): the tool result content. Defaults to "" on the wire.
 	ResultContent string `json:"-"`
+	// tool_result: true when this event REPLACES a prior ToolResult for the same
+	// call_id because an AfterTool middleware rewrote it in place
+	// (ContinueWithModification, SC-9). Emitted as "revised" (#[serde(default)]
+	// => present, false by default) so consumers correct the displayed result
+	// instead of double-counting it.
+	Revised bool `json:"-"`
+	// user_message: true when this is a USER-authored steering message injected
+	// at a turn boundary (rendered as user input), false for the agent's
+	// send_message narration. Emitted as "steered" (#[serde(default)] => present,
+	// false by default).
+	Steered bool `json:"-"`
+	// turn_end: this turn's token usage, so a live consumer updates the token
+	// chip PER-TURN. Emitted as "usage" (#[serde(default)] => present, zero by
+	// default). nil emits a zero TokenUsage.
+	Usage *TokenUsage `json:"-"`
 	// tool_args_delta
 	PartialJSON string `json:"-"`
 	// block_start, block_stop, tool_call_start
@@ -406,16 +424,63 @@ type HarnessStreamEvent struct {
 	// output_schema_violation (issue #139): the total attempt count (1 + N). The
 	// final frozen validator error rides the Content field above.
 	Attempts uint32 `json:"-"`
+	// Node is the emitting node's attribution (multi-agent routing, §E1). nil
+	// ⇒ the `node` key is omitted (byte-identical to pre-§E1). Stamped by
+	// wrapNodeSink as events flow up through combinator wrappers; the innermost
+	// leaf sets kind/agent_id and seeds path, each wrapper prepends its kind and
+	// bumps depth.
+	Node *NodeAttr `json:"-"`
 }
+
+// NodeAttr is the emitting node's attribution stamped on every stream event
+// (§E1, mirrors Rust harness/types.rs NodeAttr). Lets a multi-agent UI route a
+// frame to the emitting node. Serialized with conditional omission: agent_id
+// and path are omitted when absent/empty (byte-identical to Rust serde's
+// skip_serializing_if).
+type NodeAttr struct {
+	// Kind is the emitting node's kind: "react" (a leaf turn loop) or a
+	// combinator kind ("plan_execute", "self_verifying", "ralph",
+	// "hill_climbing"). The leaf's kind is the innermost (most specific).
+	Kind string `json:"kind"`
+	// AgentID is the leaf agent's handle (e.g. "planner"/"executor"), when the
+	// emitting node is a react leaf. Empty for combinator frames.
+	AgentID string `json:"agent_id,omitempty"`
+	// Depth is the nesting depth of the emitting leaf below the root,
+	// accumulated as the event passes through each combinator wrapper.
+	Depth uint32 `json:"depth"`
+	// Path is the root→leaf node-kind path, accumulated by the wrapper chain
+	// (outermost first). E.g. ["ralph", "plan_execute", "self_verifying", "react"].
+	Path []string `json:"path,omitempty"`
+}
+
+// NodeMut returns a pointer to the event's NodeAttr slot — the single seam the
+// node-wrapping sinks stamp through (mirrors Rust StreamEvent::node_mut).
+func (e *HarnessStreamEvent) NodeMut() **NodeAttr { return &e.Node }
+
+// Node returns the emitting node's attribution, or nil when unstamped (mirrors
+// Rust StreamEvent::node).
+func (e *HarnessStreamEvent) NodeAttr() *NodeAttr { return e.Node }
 
 // MarshalJSON serialises as a flat tagged object.
 func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
 	switch e.Kind {
-	case HarnessStreamTurnStart, HarnessStreamTurnEnd:
+	case HarnessStreamTurnStart:
 		return json.Marshal(struct {
 			Kind HarnessStreamEventKind `json:"kind"`
 			Turn uint32                 `json:"turn"`
-		}{e.Kind, e.Turn})
+			Node *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Turn, e.Node})
+	case HarnessStreamTurnEnd:
+		usage := e.Usage
+		if usage == nil {
+			usage = &TokenUsage{}
+		}
+		return json.Marshal(struct {
+			Kind  HarnessStreamEventKind `json:"kind"`
+			Turn  uint32                 `json:"turn"`
+			Usage TokenUsage             `json:"usage"`
+			Node  *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Turn, *usage, e.Node})
 	case HarnessStreamToolCall:
 		// Q5: carry the final args. Default to JSON null so pre-#103 consumers
 		// (and fixtures that omit it) round-trip.
@@ -428,71 +493,99 @@ func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
 			CallID string                 `json:"call_id"`
 			Name   string                 `json:"name"`
 			Args   json.RawMessage        `json:"args"`
-		}{e.Kind, e.CallID, e.Name, args})
+			Node   *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.CallID, e.Name, args, e.Node})
 	case HarnessStreamToolResult:
 		return json.Marshal(struct {
 			Kind    HarnessStreamEventKind `json:"kind"`
 			CallID  string                 `json:"call_id"`
 			IsError bool                   `json:"is_error"`
 			Content string                 `json:"content"`
-		}{e.Kind, e.CallID, e.IsError, e.ResultContent})
-	case HarnessStreamFinalResponse, HarnessStreamUserMessage:
+			Revised bool                   `json:"revised"`
+			Node    *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.CallID, e.IsError, e.ResultContent, e.Revised, e.Node})
+	case HarnessStreamToolProgress:
+		return json.Marshal(struct {
+			Kind    HarnessStreamEventKind `json:"kind"`
+			CallID  string                 `json:"call_id"`
+			Name    string                 `json:"name"`
+			Preview string                 `json:"preview"`
+			Node    *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.CallID, e.Name, e.Preview, e.Node})
+	case HarnessStreamFinalResponse:
 		return json.Marshal(struct {
 			Kind    HarnessStreamEventKind `json:"kind"`
 			Content string                 `json:"content"`
-		}{e.Kind, e.Content})
+			Node    *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Content, e.Node})
+	case HarnessStreamUserMessage:
+		return json.Marshal(struct {
+			Kind    HarnessStreamEventKind `json:"kind"`
+			Content string                 `json:"content"`
+			Steered bool                   `json:"steered"`
+			Node    *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Content, e.Steered, e.Node})
 	case HarnessStreamBudgetWarning:
 		return json.Marshal(struct {
 			Kind      HarnessStreamEventKind `json:"kind"`
 			LimitType BudgetLimitType        `json:"limit_type"`
-		}{e.Kind, e.LimitType})
+			Node      *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.LimitType, e.Node})
 	case HarnessStreamTextDelta, HarnessStreamReasoningDelta:
 		return json.Marshal(struct {
 			Kind    HarnessStreamEventKind `json:"kind"`
 			Content string                 `json:"content"`
-		}{e.Kind, e.Content})
+			Node    *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Content, e.Node})
 	case HarnessStreamToolArgsDelta:
 		return json.Marshal(struct {
 			Kind        HarnessStreamEventKind `json:"kind"`
 			CallID      string                 `json:"call_id"`
 			PartialJSON string                 `json:"partial_json"`
-		}{e.Kind, e.CallID, e.PartialJSON})
+			Node        *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.CallID, e.PartialJSON, e.Node})
 	case HarnessStreamBlockStart:
 		return json.Marshal(struct {
 			Kind  HarnessStreamEventKind `json:"kind"`
 			Index uint32                 `json:"index"`
 			Block BlockKind              `json:"block"`
-		}{e.Kind, e.Index, e.Block})
+			Node  *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Index, e.Block, e.Node})
 	case HarnessStreamBlockStop:
 		return json.Marshal(struct {
 			Kind  HarnessStreamEventKind `json:"kind"`
 			Index uint32                 `json:"index"`
-		}{e.Kind, e.Index})
+			Node  *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Index, e.Node})
 	case HarnessStreamToolCallStart:
 		return json.Marshal(struct {
 			Kind   HarnessStreamEventKind `json:"kind"`
 			Index  uint32                 `json:"index"`
 			CallID string                 `json:"call_id"`
 			Name   string                 `json:"name"`
-		}{e.Kind, e.Index, e.CallID, e.Name})
+			Node   *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Index, e.CallID, e.Name, e.Node})
 	case HarnessStreamToolErrorLoopDetected, HarnessStreamToolErrorLoopBroken:
 		return json.Marshal(struct {
 			Kind              HarnessStreamEventKind `json:"kind"`
 			Tool              string                 `json:"tool"`
 			ConsecutiveErrors uint32                 `json:"consecutive_errors"`
-		}{e.Kind, e.Tool, e.ConsecutiveErrors})
+			Node              *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Tool, e.ConsecutiveErrors, e.Node})
 	case HarnessStreamOutputSchemaRetry:
 		return json.Marshal(struct {
 			Kind    HarnessStreamEventKind `json:"kind"`
 			Attempt uint32                 `json:"attempt"`
 			Error   string                 `json:"error"`
-		}{e.Kind, e.Attempt, e.Content})
+			Node    *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Attempt, e.Content, e.Node})
 	case HarnessStreamOutputSchemaViolation:
 		return json.Marshal(struct {
 			Kind     HarnessStreamEventKind `json:"kind"`
 			Attempts uint32                 `json:"attempts"`
 			Error    string                 `json:"error"`
-		}{e.Kind, e.Attempts, e.Content})
+			Node     *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Attempts, e.Content, e.Node})
 	default:
 		return nil, fmt.Errorf("HarnessStreamEvent: unknown kind %q", e.Kind)
 	}
@@ -500,6 +593,11 @@ func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
 
 // StreamSink consumes harness stream events. May be nil.
 type StreamSink func(HarnessStreamEvent)
+
+// CommandProgressSink consumes sanitized tail previews for a running command.
+// Tools derive this from ToolContext.CommandProgress and pass it to
+// SandboxProvider.ExecuteCommandStreaming.
+type CommandProgressSink func(string)
 
 // turnStreamState is the per-turn mutable state threaded through
 // mapModelStreamEvent (issue #103). It correlates a block index to its
@@ -646,6 +744,13 @@ const (
 	SignalExitPlanMode  HarnessSignalKind = "exit_plan_mode"
 	SignalSwitchMode    HarnessSignalKind = "switch_mode"
 	SignalAbort         HarnessSignalKind = "abort"
+	// SignalPlanRecorded: the planner recorded its plan via set_plan and is
+	// done planning — END the PlanExecute plan phase (the plan-phase analogue of
+	// plan_completed) so the DAG walk proceeds to EXECUTE. Carries no artifact:
+	// the runnable plan is already in the durable task_list store the plan phase
+	// reads. Unlike Abort, it is CONSUMED inside PlanExecute and never ends the
+	// whole run.
+	SignalPlanRecorded HarnessSignalKind = "plan_recorded"
 )
 
 // HarnessSignal is the set of signals a tool can escalate to the harness's
@@ -1409,6 +1514,24 @@ type SandboxProvider interface {
 
 	// WorkspaceRoot returns the canonical workspace root path.
 	WorkspaceRoot() string
+}
+
+// StreamingSandboxProvider is the optional §E2 extension seam for live command
+// progress. It is intentionally NOT folded into SandboxProvider because Go
+// interfaces cannot provide Rust-style default method bodies; keeping this as a
+// sub-interface preserves existing custom sandboxes while canonical sandboxes
+// can opt in.
+type StreamingSandboxProvider interface {
+	ExecuteCommandStreaming(ctx context.Context, command string, args []string, workingDir string, timeout time.Duration, progress CommandProgressSink) (CommandOutput, *SandboxViolation)
+}
+
+// ExecuteCommandStreaming runs a command with progress when the sandbox opts
+// into StreamingSandboxProvider; otherwise it falls back to ExecuteCommand.
+func ExecuteCommandStreaming(ctx context.Context, sandbox SandboxProvider, command string, args []string, workingDir string, timeout time.Duration, progress CommandProgressSink) (CommandOutput, *SandboxViolation) {
+	if s, ok := sandbox.(StreamingSandboxProvider); ok {
+		return s.ExecuteCommandStreaming(ctx, command, args, workingDir, timeout, progress)
+	}
+	return sandbox.ExecuteCommand(ctx, command, args, workingDir, timeout)
 }
 
 // CommandOutput is the result of a subprocess executed via the sandbox.
@@ -2674,6 +2797,12 @@ const (
 	// detected error loop, not because the step budget ran out. Carries the
 	// offending Tool name and the ConsecutiveErrors count at the hard stop (2*N).
 	HaltToolErrorLoop HaltReasonKind = "tool_error_loop"
+	// HaltRepeatedToolCall (the no-progress twin of the error breaker, #137): the
+	// model called the SAME tool with identical args and SUCCEEDED 2*N times in a
+	// row, so the run hard-stops. The same N/2N error_loop_threshold drives both
+	// breakers; the offending tool name reuses the Tool field and the count reuses
+	// ConsecutiveErrors. send_message is exempt (benign narration).
+	HaltRepeatedToolCall HaltReasonKind = "repeated_tool_call"
 	// HaltOutputSchemaViolation (issue #139) is returned when output-schema
 	// enforcement is ON (HarnessConfig.EnforceOutputSchemas) for a ReactConfig
 	// leaf carrying Output != nil, and the leaf's terminal FinalResponse STILL
@@ -3252,6 +3381,10 @@ type HarnessConfig struct {
 	// violation). Read it via effectiveOutputSchemaMaxRetries.
 	OutputSchemaMaxRetries *uint32
 
+	// PlanEmptyMaxRetries is the N empty-plan re-asks before HaltEmptyPlan
+	// (nil/default 0 preserves immediate empty_plan).
+	PlanEmptyMaxRetries *uint32
+
 	// MaxResets is the outer-loop context-window reset cap for the Ralph loop
 	// strategy (issue #58, B3): the maximum number of context windows the
 	// multi-context-window continuation loop runs before halting with
@@ -3404,6 +3537,13 @@ type HarnessConfig struct {
 	// without sporecore importing the storage package (which would be a cycle).
 	SessionStore SessionStore // optional
 
+	// ChunkProvider supplies optional prompt chunks to harness sub-phases (§F1).
+	// It is kept as an adapter field (any) because promptassembly imports
+	// sporecore, so the root package cannot name promptassembly.ChunkProvider
+	// without an import cycle. Providers with a Load(context.Context) method that
+	// returns a slice of structs carrying ID/Content fields are supported.
+	ChunkProvider any
+
 	// AutoPersistSessions opts this harness into the issue #102 session-store
 	// auto-load + auto-persist contract above. Per-harness builder config (NOT a
 	// per-run flag). Defaults to false: when false there is ZERO session-store
@@ -3420,6 +3560,17 @@ type HarnessConfig struct {
 	// non-conversational construction) disables the escalation seam entirely —
 	// the loop never reads or writes it.
 	PromptToolCallFlag *atomic.Bool // optional (set by the conversational preset)
+
+	// ToolCallNudge enables opt-in behavioral/structural nudges that ask an
+	// execute-step model to use an advertised tool before reporting completion.
+	// Default false preserves byte-identical behavior; PromptToolCallFlag's
+	// phrase-based prose escalation remains independent.
+	ToolCallNudge bool
+
+	// ToolSearch enables deferred tool exposure (§C2): the model sees a core set
+	// plus the tool_search meta-tool; real tool dispatch still delegates to the
+	// underlying registry.
+	ToolSearch *ToolSearchConfig
 
 	// ConsultHandlers is the per-kind consult-handler map (issue #114), keyed by
 	// ConsultRequest.Kind. Per go/CONVENTIONS.md this is a struct FIELD, not a
@@ -3451,6 +3602,29 @@ type HarnessConfig struct {
 	// (empty Kind) is treated as EscalationSurfaceToHuman by EffectiveEscalationMode;
 	// set it explicitly to select AFK / autonomous behaviour.
 	EscalationMode EscalationMode // optional (defaults to surface_to_human)
+
+	// ToolCallRepair is the optional deterministic tool-argument repair
+	// provider. When set, recoverable tool-dispatch errors trigger an
+	// argument-coercion + re-dispatch attempt before falling back to error
+	// feedback. nil (the default) preserves today's behaviour byte-for-byte.
+	// See StandardToolCallRepair / CoerceToolArgs.
+	ToolCallRepair ToolCallRepair // optional
+	// MaxRepairAttempts bounds the repair-and-re-dispatch attempts per tool call.
+	// Pointer sentinel (mirrors ErrorLoopThreshold / OutputSchemaMaxRetries):
+	// nil => the cross-language default of 1; an explicit 0 is honored (no
+	// repair attempts even when a repair provider is set). Ignored when
+	// ToolCallRepair is nil. Read it via EffectiveMaxRepairAttempts.
+	MaxRepairAttempts *uint32 // optional
+
+	// SteeringSource is the mid-run steering seam (pi-style). When set, the
+	// ReAct turn loop polls this source at every TURN BOUNDARY — after the
+	// current assistant turn finishes executing its tool calls, before the next
+	// model call — and injects each returned string as a USER message (also
+	// emitted as a HarnessStreamUserMessage event with Steered=true so UIs render
+	// it). Steering never cancels in-flight work; it redirects the NEXT turn.
+	// The source must be non-blocking (drain a queue, don't wait on one). nil
+	// (the default) is byte-identical to the pre-steering loop.
+	SteeringSource func() []string // optional
 }
 
 // EffectiveEscalationMode returns the configured EscalationMode, defaulting the
@@ -3462,6 +3636,69 @@ func (c HarnessConfig) EffectiveEscalationMode() EscalationMode {
 		return SurfaceToHumanEscalation()
 	}
 	return c.EscalationMode
+}
+
+// EffectiveMaxRepairAttempts returns the configured repair-attempt cap,
+// defaulting a nil pointer to the cross-language default of 1 (mirrors the
+// Rust reference's builder default). An explicit 0 is honored. Ignored when
+// ToolCallRepair is nil — the whole repair arm is skipped.
+func (c HarnessConfig) EffectiveMaxRepairAttempts() uint32 {
+	if c.MaxRepairAttempts == nil {
+		return 1
+	}
+	return *c.MaxRepairAttempts
+}
+
+// WithToolCallRepair installs a deterministic tool-argument repair provider.
+// Recoverable tool-dispatch errors trigger an argument-coercion + re-dispatch
+// attempt (bounded by MaxRepairAttempts, default 1) before falling back to
+// error feedback. nil preserves today's behaviour byte-for-byte.
+func (c HarnessConfig) WithToolCallRepair(repair ToolCallRepair) HarnessConfig {
+	c.ToolCallRepair = repair
+	return c
+}
+
+// WithMaxRepairAttempts sets the maximum number of repair-and-re-dispatch
+// attempts per tool call. Defaults to 1 (via EffectiveMaxRepairAttempts when
+// nil). Ignored when no repair provider is set (WithToolCallRepair).
+func (c HarnessConfig) WithMaxRepairAttempts(attempts uint32) HarnessConfig {
+	c.MaxRepairAttempts = &attempts
+	return c
+}
+
+// WithSteeringSource installs a mid-run steering source: a non-blocking queue
+// drain the ReAct loop polls at every turn boundary. Each returned string is
+// injected as a USER message (emitted as a UserMessage stream event with
+// Steered=true) before the next model call. nil preserves the pre-steering
+// behaviour byte-for-byte.
+func (c HarnessConfig) WithSteeringSource(source func() []string) HarnessConfig {
+	c.SteeringSource = source
+	return c
+}
+
+// WithToolCallNudge enables/disables opt-in tool-call nudges for execute steps.
+func (c HarnessConfig) WithToolCallNudge(on bool) HarnessConfig {
+	c.ToolCallNudge = on
+	return c
+}
+
+// WithChunkProvider sets the prompt chunk provider used by harness sub-phases.
+// nil restores the never-nil default empty provider at harness construction.
+func (c HarnessConfig) WithChunkProvider(provider any) HarnessConfig {
+	c.ChunkProvider = provider
+	return c
+}
+
+// WithPlanEmptyMaxRetries sets the number of empty-plan re-asks before HaltEmptyPlan.
+func (c HarnessConfig) WithPlanEmptyMaxRetries(retries uint32) HarnessConfig {
+	c.PlanEmptyMaxRetries = &retries
+	return c
+}
+
+// WithToolSearch enables deferred tool exposure via ToolSearchRegistry.
+func (c HarnessConfig) WithToolSearch(config ToolSearchConfig) HarnessConfig {
+	c.ToolSearch = &config
+	return c
 }
 
 // WithRegistry replaces the whole ExecutionRegistry (issue #120) and returns the
@@ -3612,6 +3849,13 @@ func (c HarnessConfig) effectiveOutputSchemaMaxRetries() uint32 {
 	return *c.OutputSchemaMaxRetries
 }
 
+func (c HarnessConfig) effectivePlanEmptyMaxRetries() uint32 {
+	if c.PlanEmptyMaxRetries == nil {
+		return 0
+	}
+	return *c.PlanEmptyMaxRetries
+}
+
 // durableNamespace returns the key axis for DURABLE artifacts (#142): the pinned
 // stable ProjectNamespace when set, otherwise the per-window sessionID. The
 // sessionID param is intentionally retained (the namespace-reuse seam) so the
@@ -3657,6 +3901,9 @@ func NewStandardHarness(c HarnessConfig) *StandardHarness {
 	if c.Hooks == nil {
 		c.Hooks = NewStandardHookChain()
 	}
+	if c.ChunkProvider == nil {
+		c.ChunkProvider = emptyChunkProvider{}
+	}
 	// #124: the per-strategy single-collaborator fields are gone — collaborator
 	// resolution now goes through the ExecutionRegistry. Fold the default
 	// collaborators (the config's Agent / ToolRegistry) into the registry under
@@ -3700,6 +3947,33 @@ func NewStandardHarness(c HarnessConfig) *StandardHarness {
 func emit(sink StreamSink, event HarnessStreamEvent) {
 	if sink != nil {
 		sink(event)
+	}
+}
+
+// wrapNodeSink returns a sink that stamps each event with NodeAttr attribution
+// as it flows up through a node-wrapping sink (mirrors Rust
+// harness/types.rs::wrap_node_sink). The leaf sets kind/agent_id and seeds path
+// (depth 0); each combinator wrapper PREPENDS its kind to path and bumps depth.
+// The innermost leaf wins (set-once): a wrapper only fills an unstamped slot,
+// otherwise it prepends to the existing path. Returns nil when parent is nil so
+// an un-attributed run stays byte-identical.
+func wrapNodeSink(parent StreamSink, kind string, agentID string) StreamSink {
+	if parent == nil {
+		return nil
+	}
+	return func(ev HarnessStreamEvent) {
+		if ev.Node == nil {
+			ev.Node = &NodeAttr{
+				Kind:    kind,
+				AgentID: agentID,
+				Depth:   0,
+				Path:    []string{kind},
+			}
+		} else {
+			ev.Node.Path = append([]string{kind}, ev.Node.Path...)
+			ev.Node.Depth++
+		}
+		parent(ev)
 	}
 }
 
@@ -4104,8 +4378,8 @@ func (h *StandardHarness) driveStrategyWithResumeSeed(
 // resolved toolset handle is threaded down alongside the agent so the window
 // dispatches the per-node scoped catalogue (empty handle ⇒ global-catalogue
 // fallback).
-func (h *StandardHarness) ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef, outputSchema json.RawMessage, outputSchemaMaxRetries uint32, systemPrompt *string) RunResult {
-	return h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, toolset, outputSchema, outputSchemaMaxRetries, systemPrompt)
+func (h *StandardHarness) ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef, outputSchema json.RawMessage, outputSchemaMaxRetries uint32, systemPrompt *string, executeStep bool, suppressTools bool) RunResult {
+	return h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, toolset, outputSchema, outputSchemaMaxRetries, systemPrompt, executeStep, suppressTools)
 }
 
 // ResolveWorkerAgent resolves the worker agent for a LoopStrategy tree from the
@@ -4193,14 +4467,17 @@ func (h *StandardHarness) PlanDirective(instruction string) string {
 // the registry via the plan child's leaf ReactConfig.Agent (Q1 — the separate
 // planner_agent concept is dropped). Returns nil if the child produced no
 // terminal.
-func (h *StandardHarness) RunPlanSubtree(ctx context.Context, plan *LoopStrategy, planTask Task, planSession SessionState, budget BudgetSnapshot) *RunResult {
+func (h *StandardHarness) RunPlanSubtree(ctx context.Context, plan *LoopStrategy, planTask Task, planSession SessionState, budget BudgetSnapshot, onStream StreamSink, forcedOutputSchema json.RawMessage, suppressTools bool) *RunResult {
 	// #124 Q1: the separate planner_agent concept is DROPPED — the plan child's
 	// leaf ReactConfig.Agent is authoritative and the plan child resolves its own
 	// worker agent from the registry via plan.Run.
 	cx := NewExecutionContext(&h.config.Registry)
 	cx.Executor = h
+	cx.Stream = onStream
 	cx.Scratch.RunSession = planSession
 	cx.Scratch.RunBudget = budget
+	cx.Scratch.ForcedOutputSchema = forcedOutputSchema
+	cx.Scratch.SuppressTools = suppressTools
 	pt := planTask
 	cx.Scratch.Task = &pt
 	_ = plan.Run(ctx, cx)
@@ -4488,6 +4765,27 @@ func (h *StandardHarness) finalizeObservability(ctx context.Context, sessionID S
 // fallback applies, so examples 01–11 that use .Tools() keep working
 // byte-for-byte. Mirrors Rust effective_tool_registry.
 func (h *StandardHarness) effectiveToolRegistry(sessionID SessionID, toolset ToolsetRef) ToolRegistry {
+	return h.effectiveToolRegistryWithProgress(sessionID, toolset, nil)
+}
+
+// effectiveToolRegistryWithProgress is the run-loop variant of
+// effectiveToolRegistry: when a stream sink exists, catalogue ToolContexts get a
+// progress bridge that maps ToolProgressUpdate onto tool_progress stream events.
+// Existing tests and no-stream runs call effectiveToolRegistry and stay
+// byte-identical (nil progress).
+func (h *StandardHarness) effectiveToolRegistryWithProgress(sessionID SessionID, toolset ToolsetRef, onStream StreamSink) ToolRegistry {
+	baseCtx := NewToolContextWithProject(sessionID, h.config.ProjectNamespace, h.config.ToolRunStore, h.config.ToolMemoryStore)
+	if onStream != nil {
+		baseCtx = baseCtx.WithProgress(func(update ToolProgressUpdate) {
+			emit(onStream, HarnessStreamEvent{
+				Kind:    HarnessStreamToolProgress,
+				CallID:  update.CallID,
+				Name:    update.Tool,
+				Preview: update.Preview,
+			})
+		})
+	}
+
 	// Strict per-node scoping: a non-empty handle with its own catalogue.
 	if toolset != "" {
 		if catalogue, ok := h.config.ToolsetCatalogues[string(toolset)]; ok && catalogue != nil {
@@ -4495,19 +4793,24 @@ func (h *StandardHarness) effectiveToolRegistry(sessionID SessionID, toolset Too
 				// #142: pin the stable project namespace so the catalogue task_list
 				// tool keys its DURABLE blob by project_id (surviving Ralph window
 				// resets), while ephemeral session state stays on sessionID.
-				NewToolContextWithProject(sessionID, h.config.ProjectNamespace, h.config.ToolRunStore, h.config.ToolMemoryStore),
+				baseCtx,
 			)
-			return catalogue
+			return h.wrapToolSearch(catalogue)
 		}
 	}
 	// Fallback: empty handle (back-compat) or unregistered non-empty handle.
 	if h.config.CatalogueRegistry == nil {
-		return h.config.ToolRegistry
+		return h.wrapToolSearch(h.config.ToolRegistry)
 	}
-	h.config.CatalogueRegistry.SetToolContext(
-		NewToolContextWithProject(sessionID, h.config.ProjectNamespace, h.config.ToolRunStore, h.config.ToolMemoryStore),
-	)
-	return h.config.CatalogueRegistry
+	h.config.CatalogueRegistry.SetToolContext(baseCtx)
+	return h.wrapToolSearch(h.config.CatalogueRegistry)
+}
+
+func (h *StandardHarness) wrapToolSearch(registry ToolRegistry) ToolRegistry {
+	if h.config.ToolSearch == nil || registry == nil {
+		return registry
+	}
+	return NewToolSearchRegistry(registry, *h.config.ToolSearch)
 }
 
 // registrySchemas flattens a tool registry's active schemas (full catalogue —
@@ -4644,7 +4947,7 @@ func (h *StandardHarness) runReAct(
 	// SC-10: the legacy runReAct wrapper carries no per-leaf system-prompt override
 	// (only the recursive ReactConfig.Run does) ⇒ the window uses the global
 	// config.SystemPrompt, byte-identical.
-	result := h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, ToolsetRef(""), nil, 0, nil)
+	result := h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, ToolsetRef(""), nil, 0, nil, false, false)
 	switch result.Kind {
 	case RunSuccess:
 		h.finalizeObservability(ctx, result.SessionID, TerminalSuccess, "")
@@ -4982,6 +5285,12 @@ func (h *StandardHarness) runReActInner(
 	// ONLY its own prompt (the per-leaf prompt half of SC-10; the toolset half is
 	// the toolset arg above).
 	systemPrompt *string,
+	// executeStep is the PlanExecute execute-phase one-shot marker used by the
+	// opt-in tool-call nudge. False for bare ReAct and non-execute phases.
+	executeStep bool,
+	// suppressTools hides every tool schema and routes any attempted tool call to
+	// the empty-registry error path (used by forced-schema empty-plan re-asks).
+	suppressTools bool,
 ) (out RunResult) {
 	// Issue #102 part 1: stamp the post-run conversation history onto the
 	// terminal Success/Failure result. The loop mutates `session` in place
@@ -5000,7 +5309,10 @@ func (h *StandardHarness) runReActInner(
 	// per-node toolset catalogue (or the global catalogue when the handle is
 	// empty) per-run (re-injects its ToolContext with this run's SessionID +
 	// storage); otherwise returns the injected ToolRegistry seam.
-	toolRegistry := h.effectiveToolRegistry(sessionID, toolset)
+	toolRegistry := h.effectiveToolRegistryWithProgress(sessionID, toolset, onStream)
+	if suppressTools {
+		toolRegistry = NewStandardToolRegistry()
+	}
 	startedAt := time.Now()
 	usage := AggregateUsage{}
 
@@ -5030,6 +5342,21 @@ func (h *StandardHarness) runReActInner(
 	// 2*N.
 	errorLoopN := h.config.effectiveErrorLoopThreshold()
 	errorRuns := map[string]*errorRun{}
+	// Tool-call nudge state (§E5, opt-in via HarnessConfig.ToolCallNudge). Scoped
+	// to execute-step windows and bounded so a model that refuses to act cannot
+	// loop indefinitely.
+	const maxToolCallNudges uint32 = 2
+	var toolCallNudgesUsed uint32
+	var toolsCalledThisWindow uint32
+
+	// Repeated-identical-successful-call breaker state (#137, the no-progress
+	// twin of the error breaker). lastSuccessSig is the (name, args) of the last
+	// SUCCESS; repeatCount is the consecutive identical-success run; repeatInjected
+	// records whether the N-threshold nudge has fired for the current run. Driven
+	// by the SAME errorLoopN / 2N thresholds; send_message is exempt.
+	var lastSuccessSig string
+	var repeatCount uint32
+	var repeatInjected bool
 
 	// Output-schema enforcement state (issue #139), loop-local to this window.
 	// outputSchemaRetriesUsed counts the EXTRA retry turns spent on validation
@@ -5044,10 +5371,16 @@ func (h *StandardHarness) runReActInner(
 	if task.Budget.MaxTurns != nil && *task.Budget.MaxTurns < effectiveTurnCap {
 		effectiveTurnCap = *task.Budget.MaxTurns
 	}
+	// Narration refund (#81): a send_message-ONLY turn is pure narration and
+	// must not count against the productive-turn budget. The turn span still
+	// uses the incremented budget.Turns (ids stay unique); only the budget GATE
+	// discounts it. Bounded by effectiveTurnCap so narration alone cannot loop
+	// forever (the window runs at most ~2x budget). Mirrors the Rust reference.
+	var narrationRefund uint32
 
 	for {
 		// Layer-1 budget gates before the turn.
-		if budget.Turns >= effectiveTurnCap {
+		if budget.Turns >= saturatingAddU32(effectiveTurnCap, narrationRefund) {
 			return RunResult{
 				Kind:      RunFailure,
 				Reason:    HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns},
@@ -5195,11 +5528,39 @@ func (h *StandardHarness) runReActInner(
 		if outputSchema != nil {
 			c.Params.OutputSchema = outputSchema
 		}
+		// Mid-run steering (pi-style, HarnessConfig.SteeringSource): poll the
+		// non-blocking source at the turn boundary — after the previous turn's tool
+		// calls finished, before this turn's model call — and inject each queued
+		// string as a USER message (emitted as a UserMessage stream event with
+		// Steered=true so UIs render it as user input). Steering never cancels
+		// in-flight work; it redirects the NEXT turn. nil (the default) is
+		// byte-identical to the pre-steering loop.
+		if h.config.SteeringSource != nil {
+			for _, msg := range h.config.SteeringSource() {
+				h.config.ContextManager.AppendUserMessage(ctx, &session, msg)
+				emit(onStream, HarnessStreamEvent{Kind: HarnessStreamUserMessage, Content: msg, Steered: true})
+			}
+		}
 		emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnStart, Turn: budget.Turns + 1})
 		turnStartedAt := nowRFC3339()
 		turnClock := time.Now()
 		result := h.runStreamingTurn(ctx, agent, c, onStream)
 		budget.Turns++
+		// Refund a send_message-ONLY turn (pure narration, #81): it advanced no
+		// task work, so it must not count against the productive-turn budget.
+		// Bounded by effectiveTurnCap so narration alone cannot loop forever.
+		if result.Kind == TurnToolCallRequested && len(result.Calls) > 0 && narrationRefund < effectiveTurnCap {
+			allSendMsg := true
+			for _, c := range result.Calls {
+				if c.Name != sendMessageToolName {
+					allSendMsg = false
+					break
+				}
+			}
+			if allSendMsg {
+				narrationRefund++
+			}
+		}
 		// Emit a turn span for every model call (issue #12). Fire-and-forget;
 		// it never affects control flow. The span id is retained as the
 		// parent for any tool-call spans dispatched this turn. EmitMiddleware/
@@ -5250,7 +5611,15 @@ func (h *StandardHarness) runReActInner(
 			)
 		}
 		currentTurnSpanID = turnSpanID
-		emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnEnd, Turn: budget.Turns})
+		// TurnEnd carries this turn's token usage so a live consumer updates the
+		// token chip PER-TURN (not only at end-of-run). Re-derived from the turn
+		// result; a nil usage emits a zero TokenUsage on the wire.
+		var turnUsage *TokenUsage
+		if result.Usage != nil {
+			u := *result.Usage
+			turnUsage = &u
+		}
+		emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnEnd, Turn: budget.Turns, Usage: turnUsage})
 
 		switch result.Kind {
 		case TurnFinalResponse:
@@ -5268,14 +5637,29 @@ func (h *StandardHarness) runReActInner(
 			// flag is only flipped while still unset, bounding this to exactly one
 			// extra turn per window.
 			if h.config.PromptToolCallFlag != nil && !h.config.PromptToolCallFlag.Load() {
-				if prose, ok := DetectProseResponse(result.Content, toolsAdvertised); ok {
+				prose, phrase := DetectProseResponse(result.Content, toolsAdvertised)
+				structural := h.config.ToolCallNudge && executeStep && toolsAdvertised && toolsCalledThisWindow == 0 && outputSchema == nil
+				if phrase || structural {
 					h.config.PromptToolCallFlag.Store(true)
+					assistantText := result.Content
+					if phrase {
+						assistantText = prose
+					}
 					if a, ok := h.config.ContextManager.(AssistantMessageAppender); ok {
-						a.AppendAssistantMessage(ctx, &session, Message{Role: RoleAssistant, Content: NewTextContent(prose)})
+						a.AppendAssistantMessage(ctx, &session, Message{Role: RoleAssistant, Content: NewTextContent(assistantText)})
 					}
 					h.config.ContextManager.AppendUserMessage(ctx, &session, PromptToolCallNudge)
 					continue
 				}
+			}
+
+			if h.config.ToolCallNudge && executeStep && toolsAdvertised && toolsCalledThisWindow == 0 && outputSchema == nil && toolCallNudgesUsed < maxToolCallNudges {
+				toolCallNudgesUsed++
+				if a, ok := h.config.ContextManager.(AssistantMessageAppender); ok {
+					a.AppendAssistantMessage(ctx, &session, Message{Role: RoleAssistant, Content: NewTextContent(result.Content)})
+				}
+				h.config.ContextManager.AppendUserMessage(ctx, &session, BehavioralToolCallNudge)
+				continue
 			}
 
 			if h.config.Middleware != nil {
@@ -5431,6 +5815,7 @@ func (h *StandardHarness) runReActInner(
 			}
 
 		case TurnToolCallRequested:
+			toolsCalledThisWindow += uint32(len(result.Calls))
 			u := *result.Usage
 			usage.AddTurn(u)
 			budget.InputTokens += uint64(u.InputTokens)
@@ -5583,7 +5968,8 @@ func (h *StandardHarness) runReActInner(
 				// for the call ACTUALLY dispatched, so a task's files_touched ledger is
 				// built from real tool calls — never a model-self-reported field.
 				h.observeWriteCall(call)
-				output := dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call)
+				effectiveCall, output := h.dispatchWithRepair(ctx, toolRegistry, call)
+				_ = effectiveCall // #126 AC2: the call ACTUALLY dispatched (repaired variant when repair fired)
 
 				// Tool-surfaced sandbox violation (issue #150): the HARNESS decides
 				// halt-vs-recoverable per SandboxViolationPolicy, not the tool. Under
@@ -5841,8 +6227,52 @@ func (h *StandardHarness) runReActInner(
 						pendingCorrective = corrective
 					}
 				} else {
-					// AC1: ANY success for this tool resets its run.
+					// AC1: ANY success for this tool resets its error run.
 					delete(errorRuns, call.Name)
+
+					// ── Repeated-identical-successful-call breaker (#137, no-progress twin) ──
+					// A model that calls the SAME tool with the SAME args and keeps
+					// SUCCEEDING is spinning: it makes no progress and never reaches a
+					// terminal answer. Track consecutive identical successes; nudge once
+					// at N, hard-stop at 2N. send_message is exempt (benign narration a
+					// model may legitimately repeat). Mirrors the Rust reference.
+					if errorLoopN > 0 && call.Name != sendMessageToolName {
+						sig := call.Name + "\x00" + string(call.Input)
+						if lastSuccessSig == sig {
+							repeatCount++
+						} else {
+							lastSuccessSig = sig
+							repeatCount = 1
+							repeatInjected = false
+						}
+						twoN := errorLoopN * 2
+						// 2N: HARD STOP. Do NOT append this result or continue — end with a
+						// typed terminal so the caller/operator can redirect. No remaining
+						// budget is burned.
+						if repeatCount >= twoN {
+							return RunResult{
+								Kind: RunFailure,
+								Reason: HaltReason{
+									Kind:              HaltRepeatedToolCall,
+									Tool:              call.Name,
+									ConsecutiveErrors: repeatCount,
+								},
+								SessionID: sessionID, Usage: usage, Turns: budget.Turns,
+								SessionState: session,
+							}
+						}
+						// N: inject ONE corrective USER message (the same channel the error
+						// breaker uses), once per run, appended after this result.
+						if repeatCount >= errorLoopN && !repeatInjected {
+							repeatInjected = true
+							pendingCorrective = fmt.Sprintf(
+								"You have called the `%s` tool with the same arguments %d times in a row, "+
+									"each returning the same result. Repeating an identical call will not make "+
+									"progress. Take a DIFFERENT action now — or, if you already have what you "+
+									"need, produce your final response (finalize the plan / answer the task).",
+								call.Name, repeatCount)
+						}
+					}
 				}
 
 				// Tool-call span (issue #12), child of the current turn.
@@ -6248,7 +6678,7 @@ func (h *StandardHarness) resumeConsultInner(
 	// pending calls) through the pausing leaf's own toolset handle, restoring its
 	// scoped per-node catalogue. An empty handle (the default) still falls back to
 	// the global catalogue, so pre-#140 blobs behave unchanged.
-	toolRegistry := h.effectiveToolRegistry(state.SessionID, state.Toolset)
+	toolRegistry := h.effectiveToolRegistryWithProgress(state.SessionID, state.Toolset, onStream)
 
 	// Inject the consult answer as the RESULT of the head pending (consult)
 	// call, then dispatch the remaining pending calls in the same batch.
@@ -6264,7 +6694,7 @@ func (h *StandardHarness) resumeConsultInner(
 			// to a recoverable error — there is no place to issue a typed halt
 			// here.
 			output := h.normalizeSandboxViolation(
-				dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call))
+				h.dispatchWithRepairOutput(ctx, toolRegistry, call))
 			rtr := HarnessToolResult{CallID: call.ID, Output: output}
 			h.config.ContextManager.AppendToolResult(ctx, &session, &rtr)
 		}
@@ -6328,7 +6758,7 @@ func (h *StandardHarness) resumeInner(
 	// now routes through the pausing leaf's own toolset handle, restoring its
 	// scoped per-node catalogue. An empty handle (the default) still falls back to
 	// the global catalogue, so pre-#140 blobs and root pauses behave unchanged.
-	toolRegistry := h.effectiveToolRegistry(state.SessionID, state.Toolset)
+	toolRegistry := h.effectiveToolRegistryWithProgress(state.SessionID, state.Toolset, onStream)
 
 	// Subagent depth-1: a child state, if present, would be resumed via the
 	// caller-installed SubagentTool. Wiring lands with #4/#5. The harness
@@ -6361,7 +6791,7 @@ func (h *StandardHarness) resumeInner(
 					// Drain path (issue #150): flatten any sandbox violation to a
 					// recoverable error — no typed-halt site here.
 					output := h.normalizeSandboxViolation(
-						dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call))
+						h.dispatchWithRepairOutput(ctx, toolRegistry, call))
 					rtr := HarnessToolResult{CallID: call.ID, Output: output}
 					h.config.ContextManager.AppendToolResult(ctx, &session, &rtr)
 				}
@@ -6489,7 +6919,7 @@ func (h *StandardHarness) resumeInner(
 			// Resume path (issue #150): flatten any sandbox violation to a
 			// recoverable error — no typed-halt site here.
 			output := h.normalizeSandboxViolation(
-				dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call))
+				h.dispatchWithRepairOutput(ctx, toolRegistry, call))
 			tr := HarnessToolResult{CallID: call.ID, Output: output}
 			h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
 		}
@@ -6498,7 +6928,7 @@ func (h *StandardHarness) resumeInner(
 			// Resume path (issue #150): flatten any sandbox violation to a
 			// recoverable error — no typed-halt site here.
 			output := h.normalizeSandboxViolation(
-				dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call))
+				h.dispatchWithRepairOutput(ctx, toolRegistry, call))
 			tr := HarnessToolResult{CallID: call.ID, Output: output}
 			h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
 		}
@@ -6548,6 +6978,78 @@ var _ Harness = (*StandardHarness)(nil)
 // halt-vs-recoverable decision via SandboxViolationPolicy: the main loop sees
 // the variant and may issue a typed halt, while drain/resume sites flatten it
 // through normalizeSandboxViolation.
+// dispatchWithRepair dispatches a tool call, applying the configured
+// ToolCallRepair on a recoverable error: coerce the arguments and re-dispatch
+// up to EffectiveMaxRepairAttempts, enriching the error (schema+hint) when
+// repair gives up. Returns the call ACTUALLY dispatched (the repaired variant
+// when repair fired) and its final output. Mirrors the Rust reference's
+// dispatch_with_repair. When no repair provider is wired, this is equivalent to
+// dispatchAndUnwrap (byte-identical).
+func (h *StandardHarness) dispatchWithRepair(
+	ctx context.Context,
+	registry ToolRegistry,
+	call ToolCall,
+) (ToolCall, ToolOutput) {
+	effective := call
+	output := dispatchAndUnwrap(ctx, registry, h.config.Sandbox, effective)
+	if h.config.ToolCallRepair == nil {
+		return effective, output
+	}
+	attemptsLeft := h.config.EffectiveMaxRepairAttempts()
+	for attemptsLeft > 0 {
+		if output.Kind != ToolOutputError || !output.Recoverable {
+			break
+		}
+		schema := findSchema(registry, effective.Name)
+		repaired, ok := h.config.ToolCallRepair.Repair(effective, output.Message, schema)
+		if !ok {
+			// Repair gave up. Enrich with the schema+hint ONLY for a parameter-shaped
+			// error; a command/runtime failure is left raw.
+			if IsParamError(output.Message) {
+				output = enrichToolError(output.Message, schema)
+			}
+			break
+		}
+		attemptsLeft--
+		effective = repaired
+		output = dispatchAndUnwrap(ctx, registry, h.config.Sandbox, effective)
+		if output.Kind != ToolOutputError || !output.Recoverable {
+			break
+		}
+		if attemptsLeft == 0 && IsParamError(output.Message) {
+			schema := findSchema(registry, effective.Name)
+			output = enrichToolError(output.Message, schema)
+		}
+	}
+	return effective, output
+}
+
+// dispatchWithRepairOutput is the drain/resume-path convenience that returns
+// only the final output (the effective call is irrelevant where there is no
+// place to stamp spans/history from it). Mirrors the Rust shared repair path.
+func (h *StandardHarness) dispatchWithRepairOutput(
+	ctx context.Context,
+	registry ToolRegistry,
+	call ToolCall,
+) ToolOutput {
+	_, output := h.dispatchWithRepair(ctx, registry, call)
+	return output
+}
+
+// findSchema returns the registry's model schema for the named tool, or nil.
+func findSchema(registry ToolRegistry, name string) *ToolSchema {
+	for _, s := range registry.ActiveSchemas(nil) {
+		if s.Name == name {
+			ms := s.ToModelSchema()
+			return &ms
+		}
+	}
+	return nil
+}
+
+// enrichToolError (the rich schema+hint enrichment) is defined near the
+// recoverable-error breaker path below; dispatchWithRepair reuses it.
+
 func dispatchAndUnwrap(
 	ctx context.Context,
 	registry ToolRegistry,
@@ -6911,9 +7413,10 @@ var _ MiddlewareChain = (*ScriptedMiddleware)(nil)
 
 // MockAgent is a test Agent that yields queued TurnResults.
 type MockAgent struct {
-	id      AgentID
-	mu      sync.Mutex
-	results []TurnResult
+	id        AgentID
+	mu        sync.Mutex
+	results   []TurnResult
+	CallCount atomic.Int64
 }
 
 // NewMockAgent constructs a MockAgent.
@@ -6929,6 +7432,7 @@ func (m *MockAgent) Push(r TurnResult) *MockAgent {
 
 // Turn returns the next queued TurnResult, or an EmptyResponse error.
 func (m *MockAgent) Turn(context.Context, Context) TurnResult {
+	m.CallCount.Add(1)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if len(m.results) == 0 {
