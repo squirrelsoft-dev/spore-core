@@ -391,6 +391,21 @@ type HarnessStreamEvent struct {
 	Args json.RawMessage `json:"-"`
 	// tool_result (Q5): the tool result content. Defaults to "" on the wire.
 	ResultContent string `json:"-"`
+	// tool_result: true when this event REPLACES a prior ToolResult for the same
+	// call_id because an AfterTool middleware rewrote it in place
+	// (ContinueWithModification, SC-9). Emitted as "revised" (#[serde(default)]
+	// => present, false by default) so consumers correct the displayed result
+	// instead of double-counting it.
+	Revised bool `json:"-"`
+	// user_message: true when this is a USER-authored steering message injected
+	// at a turn boundary (rendered as user input), false for the agent's
+	// send_message narration. Emitted as "steered" (#[serde(default)] => present,
+	// false by default).
+	Steered bool `json:"-"`
+	// turn_end: this turn's token usage, so a live consumer updates the token
+	// chip PER-TURN. Emitted as "usage" (#[serde(default)] => present, zero by
+	// default). nil emits a zero TokenUsage.
+	Usage *TokenUsage `json:"-"`
 	// tool_args_delta
 	PartialJSON string `json:"-"`
 	// block_start, block_stop, tool_call_start
@@ -411,11 +426,21 @@ type HarnessStreamEvent struct {
 // MarshalJSON serialises as a flat tagged object.
 func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
 	switch e.Kind {
-	case HarnessStreamTurnStart, HarnessStreamTurnEnd:
+	case HarnessStreamTurnStart:
 		return json.Marshal(struct {
 			Kind HarnessStreamEventKind `json:"kind"`
 			Turn uint32                 `json:"turn"`
 		}{e.Kind, e.Turn})
+	case HarnessStreamTurnEnd:
+		usage := e.Usage
+		if usage == nil {
+			usage = &TokenUsage{}
+		}
+		return json.Marshal(struct {
+			Kind  HarnessStreamEventKind `json:"kind"`
+			Turn  uint32                 `json:"turn"`
+			Usage TokenUsage             `json:"usage"`
+		}{e.Kind, e.Turn, *usage})
 	case HarnessStreamToolCall:
 		// Q5: carry the final args. Default to JSON null so pre-#103 consumers
 		// (and fixtures that omit it) round-trip.
@@ -435,12 +460,19 @@ func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
 			CallID  string                 `json:"call_id"`
 			IsError bool                   `json:"is_error"`
 			Content string                 `json:"content"`
-		}{e.Kind, e.CallID, e.IsError, e.ResultContent})
-	case HarnessStreamFinalResponse, HarnessStreamUserMessage:
+			Revised bool                   `json:"revised"`
+		}{e.Kind, e.CallID, e.IsError, e.ResultContent, e.Revised})
+	case HarnessStreamFinalResponse:
 		return json.Marshal(struct {
 			Kind    HarnessStreamEventKind `json:"kind"`
 			Content string                 `json:"content"`
 		}{e.Kind, e.Content})
+	case HarnessStreamUserMessage:
+		return json.Marshal(struct {
+			Kind    HarnessStreamEventKind `json:"kind"`
+			Content string                 `json:"content"`
+			Steered bool                   `json:"steered"`
+		}{e.Kind, e.Content, e.Steered})
 	case HarnessStreamBudgetWarning:
 		return json.Marshal(struct {
 			Kind      HarnessStreamEventKind `json:"kind"`
@@ -646,6 +678,13 @@ const (
 	SignalExitPlanMode  HarnessSignalKind = "exit_plan_mode"
 	SignalSwitchMode    HarnessSignalKind = "switch_mode"
 	SignalAbort         HarnessSignalKind = "abort"
+	// SignalPlanRecorded: the planner recorded its plan via set_plan and is
+	// done planning — END the PlanExecute plan phase (the plan-phase analogue of
+	// plan_completed) so the DAG walk proceeds to EXECUTE. Carries no artifact:
+	// the runnable plan is already in the durable task_list store the plan phase
+	// reads. Unlike Abort, it is CONSUMED inside PlanExecute and never ends the
+	// whole run.
+	SignalPlanRecorded HarnessSignalKind = "plan_recorded"
 )
 
 // HarnessSignal is the set of signals a tool can escalate to the harness's
@@ -3464,6 +3503,16 @@ type HarnessConfig struct {
 	// repair attempts even when a repair provider is set). Ignored when
 	// ToolCallRepair is nil. Read it via EffectiveMaxRepairAttempts.
 	MaxRepairAttempts *uint32 // optional
+
+	// SteeringSource is the mid-run steering seam (pi-style). When set, the
+	// ReAct turn loop polls this source at every TURN BOUNDARY — after the
+	// current assistant turn finishes executing its tool calls, before the next
+	// model call — and injects each returned string as a USER message (also
+	// emitted as a HarnessStreamUserMessage event with Steered=true so UIs render
+	// it). Steering never cancels in-flight work; it redirects the NEXT turn.
+	// The source must be non-blocking (drain a queue, don't wait on one). nil
+	// (the default) is byte-identical to the pre-steering loop.
+	SteeringSource func() []string // optional
 }
 
 // EffectiveEscalationMode returns the configured EscalationMode, defaulting the
@@ -3502,6 +3551,16 @@ func (c HarnessConfig) WithToolCallRepair(repair ToolCallRepair) HarnessConfig {
 // nil). Ignored when no repair provider is set (WithToolCallRepair).
 func (c HarnessConfig) WithMaxRepairAttempts(attempts uint32) HarnessConfig {
 	c.MaxRepairAttempts = &attempts
+	return c
+}
+
+// WithSteeringSource installs a mid-run steering source: a non-blocking queue
+// drain the ReAct loop polls at every turn boundary. Each returned string is
+// injected as a USER message (emitted as a UserMessage stream event with
+// Steered=true) before the next model call. nil preserves the pre-steering
+// behaviour byte-for-byte.
+func (c HarnessConfig) WithSteeringSource(source func() []string) HarnessConfig {
+	c.SteeringSource = source
 	return c
 }
 
@@ -5236,6 +5295,19 @@ func (h *StandardHarness) runReActInner(
 		if outputSchema != nil {
 			c.Params.OutputSchema = outputSchema
 		}
+		// Mid-run steering (pi-style, HarnessConfig.SteeringSource): poll the
+		// non-blocking source at the turn boundary — after the previous turn's tool
+		// calls finished, before this turn's model call — and inject each queued
+		// string as a USER message (emitted as a UserMessage stream event with
+		// Steered=true so UIs render it as user input). Steering never cancels
+		// in-flight work; it redirects the NEXT turn. nil (the default) is
+		// byte-identical to the pre-steering loop.
+		if h.config.SteeringSource != nil {
+			for _, msg := range h.config.SteeringSource() {
+				h.config.ContextManager.AppendUserMessage(ctx, &session, msg)
+				emit(onStream, HarnessStreamEvent{Kind: HarnessStreamUserMessage, Content: msg, Steered: true})
+			}
+		}
 		emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnStart, Turn: budget.Turns + 1})
 		turnStartedAt := nowRFC3339()
 		turnClock := time.Now()
@@ -5291,7 +5363,15 @@ func (h *StandardHarness) runReActInner(
 			)
 		}
 		currentTurnSpanID = turnSpanID
-		emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnEnd, Turn: budget.Turns})
+		// TurnEnd carries this turn's token usage so a live consumer updates the
+		// token chip PER-TURN (not only at end-of-run). Re-derived from the turn
+		// result; a nil usage emits a zero TokenUsage on the wire.
+		var turnUsage *TokenUsage
+		if result.Usage != nil {
+			u := *result.Usage
+			turnUsage = &u
+		}
+		emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnEnd, Turn: budget.Turns, Usage: turnUsage})
 
 		switch result.Kind {
 		case TurnFinalResponse:

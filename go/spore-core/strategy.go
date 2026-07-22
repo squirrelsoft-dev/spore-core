@@ -1026,20 +1026,31 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 			}
 			return cx.finish(ctx, executor, task, result)
 		}
-		if planResult.Kind != RunSuccess {
+		// PlanRecorded (set_plan terminal): the planner recorded its plan in ONE
+		// atomic call and terminated with this signal. Proceed with an EMPTY
+		// planOutput — the SC-28 fallback (captureAndPersistPlan) loads the
+		// runnable plan from the durable task_list store set_plan already
+		// populated. Consumed here; never ends the whole run. Mirrors the Rust
+		// reference's plan_execute PlanRecorded arm.
+		var outcome PlanPhaseOutcome
+		if planResult.Kind == RunEscalate && planResult.Signal != nil && planResult.Signal.Kind == SignalPlanRecorded {
+			var failure *RunResult
+			outcome, failure = executor.CapturePlanArtifact(ctx, sessionID, "", planResult.Usage, planResult.Turns)
+			if failure != nil {
+				return cx.finish(ctx, executor, task, *failure)
+			}
+			// Fall through to the execute phase with the persisted task list.
+		} else if planResult.Kind != RunSuccess {
 			// A non-success plan terminal (budget / agent error / pause) propagates
 			// verbatim — the run never reaches execute.
 			return cx.finish(ctx, executor, task, *planResult)
-		}
-		planOutput := planResult.Output
-		planUsageAgg := planResult.Usage
-		planTurns := planResult.Turns
-
-		// Capture + persist the artifact from the plan child's output (R3/R4/R11) —
-		// the harness-side machinery, no model turn.
-		outcome, failure := executor.CapturePlanArtifact(ctx, sessionID, planOutput, planUsageAgg, planTurns)
-		if failure != nil {
-			return cx.finish(ctx, executor, task, *failure)
+		} else {
+			planOutput := planResult.Output
+			var failure *RunResult
+			outcome, failure = executor.CapturePlanArtifact(ctx, sessionID, planOutput, planResult.Usage, planResult.Turns)
+			if failure != nil {
+				return cx.finish(ctx, executor, task, *failure)
+			}
 		}
 
 		// #126 decision C: the runnable task list comes from the persisted task_list
