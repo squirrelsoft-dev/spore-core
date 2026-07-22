@@ -549,6 +549,22 @@ class HillClimbingConfig(_Model):
     behavior: BudgetExhaustedBehavior = Field(default_factory=default_budget_behavior)
 
 
+@dataclass
+class HillCandidate:
+    """Durable candidate pointers threaded through the HillClimbing climb
+    (mirrors Rust's ``HillCandidate``).
+
+    ``current_*`` is where the next neighbor branches from; ``best_*`` is the
+    best artifact ever accepted. Equal under strict greedy, tracked separately
+    from day one (D2). ``current_sha``/``best_sha`` are ``None`` when no usable
+    VCS is wired — the climb then degrades to its pre-fix score-only behaviour."""
+
+    current_sha: str | None
+    best_sha: str | None
+    current_best: float
+    best_score: float
+
+
 LoopStrategy = Annotated[
     ReactConfig | PlanExecuteConfig | SelfVerifyingConfig | RalphConfig | HillClimbingConfig,
     Field(discriminator="kind"),
@@ -1724,13 +1740,18 @@ def _self_verifying_partial_json(last_worker_output: str, last_verdict: str) -> 
     )
 
 
-def _hill_climbing_partial_json(best_score: float) -> str:
-    """HillClimbing partial: the best candidate value + its score (#125, fork
-    #2)."""
-    return json.dumps(
-        {"node": "hill_climbing", "best_candidate": best_score, "score": best_score},
-        separators=(",", ":"),
-    )
+def _hill_climbing_partial_json(best_score: float, best_sha: str | None = None) -> str:
+    """HillClimbing partial: the best candidate value + its score (+ SHA when a
+    usable VCS is wired) (#125, fork #2). Mirrors Rust's
+    ``hill_climbing_partial_json``."""
+    obj: dict[str, Any] = {
+        "node": "hill_climbing",
+        "best_candidate": best_score,
+        "score": best_score,
+    }
+    if best_sha:
+        obj["best_sha"] = best_sha
+    return json.dumps(obj, separators=(",", ":"))
 
 
 def _promote_budget_exhausted(
@@ -3227,6 +3248,15 @@ async def _run_hill_climbing_config(
         cx.stream = on_stream
         return await cx._finish(executor, task, baseline)
     current_best = baseline
+    # Resolve the workspace's start SHA (None when no usable VCS) and seed the
+    # durable candidate pointers (mirrors Rust's HillCandidate).
+    start_sha = await executor._hill_climbing_head_sha()
+    cand = HillCandidate(
+        current_sha=start_sha,
+        best_sha=start_sha,
+        current_best=baseline,
+        best_score=baseline,
+    )
 
     stagnation = 0
     iteration = 1
@@ -3253,7 +3283,7 @@ async def _run_hill_climbing_config(
             ):
                 continue
             await executor.hill_write_tsv(task_id, rows)
-            partial = _hill_climbing_partial_json(current_best)
+            partial = _hill_climbing_partial_json(cand.best_score, cand.best_sha)
             cx.pop_budget()
             cx.scratch.task = task
             cx.stream = on_stream
@@ -3288,6 +3318,9 @@ async def _run_hill_climbing_config(
         limit_type = executor.budget_exceeded(task.budget, carried, started_at)
         if limit_type is not None:
             await executor.hill_write_tsv(task_id, rows)
+            # Winner application (§4.6): a wall/cost/token budget halt is a
+            # terminal exit — leave the best accepted candidate on disk.
+            await executor._hill_apply_winner(cand.best_sha)
             cx.pop_budget()
             cx.stream = on_stream
             result: RunResult = RunResultFailure(
@@ -3318,7 +3351,7 @@ async def _run_hill_climbing_config(
         # BudgetExhausted (partial = best candidate + score).
         if isinstance(iter_outcome, StrategyOutcomeBudgetExhausted):
             await executor.hill_write_tsv(task_id, rows)
-            partial = _hill_climbing_partial_json(current_best)
+            partial = _hill_climbing_partial_json(cand.best_score, cand.best_sha)
             scope = cx.budgets.current()
             assert scope is not None, "hill_climbing scope pushed above"
             err = BudgetExhausted(
@@ -3362,11 +3395,19 @@ async def _run_hill_climbing_config(
             current_best,
             rows,
             span_seq,
+            cand,
         )
+        # ``hill_iteration`` mutates ``cand`` (commit-on-keep, reset-on-discard);
+        # mirror its ``current_best`` so the loop's budget partials stay in sync.
+        current_best = cand.current_best
+
         stagnation = stagnation + 1 if non_improvement else 0
 
         if max_stagnation is not None and stagnation >= max_stagnation:
             await executor.hill_write_tsv(task_id, rows)
+            # Winner application (§4.6): stagnation is the canonical HillClimbing
+            # termination — leave the best accepted candidate on disk.
+            await executor._hill_apply_winner(cand.best_sha)
             cx.pop_budget()
             cx.stream = on_stream
             result = RunResultFailure(
@@ -4734,6 +4775,28 @@ class VcsProvider(Protocol):
         climb."""
         return None
 
+    async def head(self) -> str:
+        """Return the SHA the workspace currently points at. The default returns
+        the empty string — a provider whose workspace has no commit concept
+        reports "no SHA", and the HillClimbing loop degrades to its no-VCS
+        fallback. Mirrors Rust's ``VcsProvider::head``."""
+        return ""
+
+    async def commit_checkpoint(self, label: str) -> str:
+        """Commit the current working tree as an accepted candidate and return
+        its SHA. The default returns the empty string (no-op providers cannot
+        checkpoint). Mirrors Rust's ``VcsProvider::commit_checkpoint``."""
+        _ = label
+        return ""
+
+    async def reset_to(self, sha: str) -> None:
+        """Reset the workspace to a SPECIFIC accepted candidate SHA — the
+        load-bearing fix: a no-improvement revert targets the last KEPT state,
+        not the original ``HEAD``. The default is a no-op. Mirrors Rust's
+        ``VcsProvider::reset_to``."""
+        _ = sha
+        return None
+
 
 class GitVcsProvider:
     """Real :class:`VcsProvider` that shells out to ``git`` THROUGH a
@@ -4781,6 +4844,23 @@ class GitVcsProvider:
         # directly. Relocated from the harness's hardcoded revert. ``_run``
         # raises :class:`VcsError` on a sandbox block or non-zero exit.
         await self._run(["reset", "--hard", "HEAD"])
+
+    async def head(self) -> str:
+        # ``git rev-parse HEAD`` THROUGH the sandbox. Raises :class:`VcsError`
+        # on a non-zero exit; the HillClimbing loop treats that as "no SHA".
+        return (await self._run(["rev-parse", "HEAD"])).strip()
+
+    async def commit_checkpoint(self, label: str) -> str:
+        # Stage everything EXCEPT the harness's own ``.spore/`` diagnostics: it
+        # must stay UNTRACKED so a later ``git reset --hard`` leaves the live
+        # results ledger on disk. Mirrors Rust's ``hill_climbing_commit_accepted``.
+        await self._run(["add", "-A"])
+        await self._run(["commit", "-m", label])
+        return (await self._run(["rev-parse", "HEAD"])).strip()
+
+    async def reset_to(self, sha: str) -> None:
+        # ``git reset --hard <sha>`` THROUGH the sandbox.
+        await self._run(["reset", "--hard", sha])
 
 
 class BaseSandboxProvider:
@@ -9127,14 +9207,86 @@ class StandardHarness:
         except Exception:  # noqa: BLE001 — revert is best-effort; never abort the loop
             pass
 
-    @staticmethod
-    def _hill_climbing_commit_hash() -> str | None:
-        """Resolve the ``commit_hash`` recorded on a HillClimbing TSV row (issue
-        #60, Decision 1). The harness never commits, so this is the EMPTY string
-        (``None`` serialized as empty in the TSV) unless a ``VcsProvider`` is
-        wired to supply a hash. v1 has no per-keep commit, so we always return
-        ``None``. Mirrors Rust's ``hill_climbing_commit_hash``."""
+    def _hill_climbing_commit_hash(self) -> str | None:
+        """Resolve the ``commit_hash`` recorded on a HillClimbing TSV row. The
+        harness never commits in the default path, so this is ``None`` unless a
+        ``VcsProvider`` is wired to supply a hash. Mirrors Rust's
+        ``hill_climbing_commit_hash``."""
         return None
+
+    async def _hill_climbing_head_sha(self) -> str | None:
+        """Resolve the workspace's current commit SHA (mirrors Rust's
+        ``hill_climbing_head_sha``). A wired :class:`VcsProvider` supplies it
+        via ``head()``; otherwise ``git rev-parse HEAD`` THROUGH the sandbox.
+        Returns ``None`` when there is no usable VCS — the loop then degrades
+        gracefully to its pre-fix score-only behaviour."""
+        vcs = self._config.vcs_provider
+        if vcs is not None:
+            try:
+                sha = (await vcs.head()).strip()
+            except Exception:  # noqa: BLE001
+                return None
+            return sha or None
+        try:
+            out = await self._config.sandbox.execute_command("git", ["rev-parse", "HEAD"])
+        except Exception:  # noqa: BLE001
+            return None
+        if out.exit_code != 0:
+            return None
+        sha = out.stdout.strip()
+        return sha or None
+
+    async def _hill_climbing_commit_accepted(self, label: str) -> str | None:
+        """Commit the current working tree as an accepted candidate and return
+        its SHA (mirrors Rust's ``hill_climbing_commit_accepted``). A wired
+        provider's ``commit_checkpoint`` wins; otherwise ``git add -A && git
+        commit`` THROUGH the sandbox, then ``_hill_climbing_head_sha``. Returns
+        ``None`` when no SHA could be obtained."""
+        vcs = self._config.vcs_provider
+        if vcs is not None:
+            try:
+                sha = (await vcs.commit_checkpoint(label)).strip()
+            except Exception:  # noqa: BLE001
+                return None
+            return sha or None
+        try:
+            await self._config.sandbox.execute_command("git", ["add", "-A"])
+            await self._config.sandbox.execute_command("git", ["commit", "-m", label])
+        except Exception:  # noqa: BLE001
+            return None
+        return await self._hill_climbing_head_sha()
+
+    async def _hill_climbing_reset_to(self, target_sha: str | None) -> None:
+        """Reset the working tree for a no-improvement iteration (mirrors Rust's
+        ``hill_climbing_reset_to``). Revert targets the last ACCEPTED candidate
+        (``target_sha``), NOT the original ``HEAD``. A wired :class:`VcsProvider`
+        owns the reset (``reset_to(sha)`` for a known SHA, else ``revert()``);
+        otherwise ``git reset --hard <sha>`` (or ``HEAD``) THROUGH the sandbox.
+        Best-effort."""
+        known = target_sha if target_sha else None
+        vcs = self._config.vcs_provider
+        if vcs is not None:
+            try:
+                if known:
+                    await vcs.reset_to(known)
+                else:
+                    await vcs.revert()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        target = known or "HEAD"
+        try:
+            await self._config.sandbox.execute_command("git", ["reset", "--hard", target])
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _hill_apply_winner(self, best_sha: str | None) -> None:
+        """Apply the best accepted candidate at loop exit (mirrors Rust's
+        ``hill_apply_winner``). A no-op when there is no usable VCS / no best
+        SHA — the best artifact is already on disk."""
+        if not best_sha:
+            return
+        await self._hill_climbing_reset_to(best_sha)
 
     def _emit_hill_climbing_span(
         self,
@@ -9369,11 +9521,16 @@ class StandardHarness:
         current_best: float,
         rows: list[Any],
         span_seq: list[int],
+        cand: HillCandidate | None = None,
     ) -> tuple[float, bool]:
         """HillClimbing per-iteration metric eval + keep/revert decision (#124):
         the agent turn already ran (recursively); this evaluates the metric,
         applies ``should_keep``, optionally reverts, records the row + span, and
-        returns ``(current_best, non_improvement)``. Mirrors Rust's
+        returns ``(current_best, non_improvement)``. When ``cand`` is provided,
+        a KEPT iteration commits the accepted candidate and mutates ``cand``
+        (``current_sha``/``best_sha``/``current_best``/``best_score``); a
+        DISCARDED iteration resets to ``cand.current_sha`` (the last accepted
+        state, NOT ``HEAD`` — the load-bearing fix). Mirrors Rust's
         ``hill_iteration``."""
         from .metric import MetricResult, ResultsEntry, iteration_status_from_error, should_keep
         from .termination import SessionStateSnapshot
@@ -9392,10 +9549,22 @@ class StandardHarness:
             kept = should_keep(value, current_best, direction, min_improvement_delta)
             delta = (current_best - value) if direction == "minimize" else (value - current_best)
             if kept:
+                # Commit-on-keep: when a HillCandidate is threaded, commit the
+                # accepted candidate and advance its durable pointers (mirrors
+                # Rust's commit-on-keep). The commit hash is recorded on the row.
+                commit_hash = self._hill_climbing_commit_hash()
+                if cand is not None:
+                    commit_hash = await self._hill_climbing_commit_accepted(
+                        f"hill-climbing-keep-{iteration}"
+                    )
+                    cand.current_sha = commit_hash
+                    cand.best_sha = commit_hash or cand.best_sha
+                    cand.current_best = value
+                    cand.best_score = value
                 rows.append(
                     ResultsEntry(
                         iteration=iteration,
-                        commit_hash=self._hill_climbing_commit_hash(),
+                        commit_hash=commit_hash,
                         metric_value=value,
                         direction=direction,
                         status="kept",
@@ -9410,7 +9579,13 @@ class StandardHarness:
                 return value, False
             reverted = revert_on_no_improvement
             if reverted:
-                await self._hill_climbing_revert()
+                # Reset to the last ACCEPTED candidate (``cand.current_sha``),
+                # NOT ``HEAD`` — the load-bearing fix. Falls back to the legacy
+                # ``_hill_climbing_revert`` when no candidate is threaded.
+                if cand is not None:
+                    await self._hill_climbing_reset_to(cand.current_sha)
+                else:
+                    await self._hill_climbing_revert()
             rows.append(
                 ResultsEntry(
                     iteration=iteration,
@@ -9431,7 +9606,10 @@ class StandardHarness:
         status = iteration_status_from_error(eval_result)
         reverted = revert_on_no_improvement
         if reverted:
-            await self._hill_climbing_revert()
+            if cand is not None:
+                await self._hill_climbing_reset_to(cand.current_sha)
+            else:
+                await self._hill_climbing_revert()
         rows.append(
             ResultsEntry(
                 iteration=iteration,
