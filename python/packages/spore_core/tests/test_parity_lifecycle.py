@@ -44,6 +44,7 @@ from spore_core import (
     TokenUsage,
     ToolAnnotations,
     ToolCall,
+    ToolUseBlock,
     ToolOutputSuccess,
 )
 from spore_core.anthropic import _RETRYABLE_STATUSES, _backoff_delay
@@ -53,6 +54,10 @@ from spore_core.model import (
     TimeoutError as ModelTimeoutError,
     Transport,
 )
+
+
+def _usage() -> TokenUsage:
+    return TokenUsage(input_tokens=1, output_tokens=1)
 
 
 # ---------------------------------------------------------------------------
@@ -181,3 +186,171 @@ async def test_dispatch_all_runs_read_only_concurrently_and_sequential_rest() ->
     assert abs(ro_a.calls[0] - ro_b.calls[0]) < 0.02, (
         f"read-only calls did not overlap: {ro_a.calls} {ro_b.calls}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Cleanup finalization (§review Low #8): terminal runs record the session
+# outcome via observability; a WaitingForHuman pause does NOT finalize.
+# ---------------------------------------------------------------------------
+
+
+async def test_cleanup_finalizes_success_outcome() -> None:
+    from spore_core import InMemoryObservabilityProvider, SessionOutcomeSuccess
+
+    obs = InMemoryObservabilityProvider()
+    agent = _replay_agent(
+        [
+            ModelResponse(
+                content=[TextBlock(text="done")],
+                usage=TokenUsage(input_tokens=1, output_tokens=1),
+                stop_reason=StopReason.END_TURN,
+            )
+        ]
+    )
+    cfg = HarnessConfig(
+        agent=agent,
+        tool_registry=ScriptedToolRegistry(),
+        sandbox=AllowAllSandbox(),
+        context_manager=NoopContextManager(),
+        termination_policy=AlwaysContinuePolicy(),
+        observability=obs,
+    )
+    h = StandardHarness(cfg)
+    sid = SessionId("cleanup-ok")
+    await h.run(HarnessRunOptions(Task.new("x", sid, ReactConfig.per_loop(3))))
+    assert obs._outcomes.get(sid) is not None
+    assert isinstance(obs._outcomes[sid], SessionOutcomeSuccess)
+
+
+async def test_cleanup_finalizes_failure_outcome() -> None:
+    from spore_core import InMemoryObservabilityProvider, SessionOutcomeFailure
+
+    obs = InMemoryObservabilityProvider()
+    agent = _replay_agent(
+        [
+            ModelResponse(
+                content=[TextBlock(text="done")],
+                usage=TokenUsage(input_tokens=1, output_tokens=1),
+                stop_reason=StopReason.END_TURN,
+            )
+        ]
+    )
+    task = Task.new("x", SessionId("cleanup-fail"), ReactConfig.per_loop(5))
+    task.budget.max_wall_time = 0  # immediate budget halt → Failure
+    cfg = HarnessConfig(
+        agent=agent,
+        tool_registry=ScriptedToolRegistry(),
+        sandbox=AllowAllSandbox(),
+        context_manager=NoopContextManager(),
+        termination_policy=AlwaysContinuePolicy(),
+        observability=obs,
+    )
+    h = StandardHarness(cfg)
+    await h.run(HarnessRunOptions(task))
+    assert isinstance(obs._outcomes[SessionId("cleanup-fail")], SessionOutcomeFailure)
+
+
+# ---------------------------------------------------------------------------
+# Steering in-flight cancellation (§review Low #8): steering injects at turn
+# boundaries AFTER tool execution — in-flight tool work is never cancelled.
+# ---------------------------------------------------------------------------
+
+
+async def test_steering_does_not_cancel_in_flight_tool_work() -> None:
+    from dataclasses import dataclass
+
+    from spore_core import (
+        HarnessBuilder,
+        RegistryToolSchema,
+        StreamToolResult,
+        StreamUserMessage,
+        ToolAnnotations,
+        ToolOutputSuccess,
+    )
+
+    @dataclass
+    class _Bundle:
+        implementation: Any
+        schema: Any
+
+    tool_started: list[float] = []
+    tool_finished: list[float] = []
+
+    class _SlowTool:
+        def name(self) -> str:
+            return "slow"
+
+        def is_subagent_tool(self) -> bool:
+            return False
+
+        def may_produce_large_output(self) -> bool:
+            return False
+
+        async def execute(self, call: Any, sandbox: Any, ctx: Any) -> Any:
+            import anyio
+
+            tool_started.append(time.monotonic())
+            await anyio.sleep(0.03)  # in-flight work
+            tool_finished.append(time.monotonic())
+            return ToolOutputSuccess(content="slow-done")
+
+    # Steering queue: empty on the first turn boundary (so the first turn runs
+    # the tool), then a message on the second boundary (after the tool result).
+    steer_calls = 0
+
+    def steering() -> list[str]:
+        nonlocal steer_calls
+        steer_calls += 1
+        return ["pivot"] if steer_calls == 2 else []
+
+    agent = _replay_agent(
+        [
+            ModelResponse(
+                content=[ToolUseBlock(id="toolu_1", name="slow", input={})],
+                usage=_usage(),
+                stop_reason=StopReason.TOOL_USE,
+            ),
+            ModelResponse(
+                content=[TextBlock(text="done")],
+                usage=_usage(),
+                stop_reason=StopReason.END_TURN,
+            ),
+        ]
+    )
+    events: list = []
+    builder = (
+        HarnessBuilder(
+            agent=agent,
+            tool_registry=ScriptedToolRegistry(),
+            sandbox=AllowAllSandbox(),
+            context_manager=NoopContextManager(),
+            termination_policy=AlwaysContinuePolicy(),
+        )
+        .tool(
+            _Bundle(
+                implementation=_SlowTool(),
+                schema=RegistryToolSchema(
+                    name="slow",
+                    description="slow tool",
+                    parameters={"type": "object", "properties": {}},
+                    annotations=ToolAnnotations(),
+                ),
+            )
+        )
+        .steering_source(steering)
+    )
+    h = builder.build()
+    await h.run(
+        HarnessRunOptions(
+            Task.new("x", SessionId("steer"), ReactConfig.per_loop(5)), on_stream=events.append
+        )
+    )
+    # The tool completed (in-flight work was NOT cancelled).
+    assert tool_finished, "in-flight tool work must complete"
+    # The steered user message was emitted AFTER the tool result.
+    tool_result_idx = next(i for i, e in enumerate(events) if isinstance(e, StreamToolResult))
+    steered_idx = next(
+        (i for i, e in enumerate(events) if isinstance(e, StreamUserMessage) and e.steered), None
+    )
+    assert steered_idx is not None, "expected a steered StreamUserMessage"
+    assert steered_idx > tool_result_idx, "steering must inject AFTER the tool result, not mid-turn"

@@ -82,6 +82,7 @@ from pydantic import (
     Field,
     SerializerFunctionWrapHandler,
     TypeAdapter,
+    field_serializer,
     model_serializer,
 )
 
@@ -3580,13 +3581,30 @@ class NodeAttr(_Model):
     Lets a multi-agent UI route a frame to the node that produced it.
     ``agent_id`` is ``None`` for combinator frames; ``path`` is the root→leaf
     node-kind path (outermost first). Serialized byte-identically to Rust:
-    ``agent_id`` and ``path`` are omitted when empty/``None``.
+    ``agent_id`` is omitted when ``None`` and ``path`` is omitted when empty
+    (Rust's ``skip_serializing_if = "Option::is_none"`` / ``"Vec::is_empty"``).
     """
 
     kind: str
     agent_id: str | None = None
     depth: int = 0
     path: list[str] = Field(default_factory=list)
+
+    def model_dump(self, **kwargs: object) -> dict[str, object]:  # type: ignore[override]
+        out = super().model_dump(**kwargs)
+        if self.agent_id is None and "agent_id" in out:
+            out.pop("agent_id", None)
+        if not self.path and "path" in out:
+            out.pop("path", None)
+        return out
+
+    def model_dump_json(self, **kwargs: object) -> str:  # type: ignore[override]
+        exclude: set[str] = set(kwargs.pop("exclude", set()))  # type: ignore[arg-type]
+        if self.agent_id is None:
+            exclude.add("agent_id")
+        if not self.path:
+            exclude.add("path")
+        return super().model_dump_json(exclude=exclude, **kwargs)  # type: ignore[arg-type]
 
 
 class _StreamEvent(_Model):
@@ -3598,6 +3616,17 @@ class _StreamEvent(_Model):
     existed."""
 
     node: NodeAttr | None = None
+
+    @field_serializer("node")
+    def _serialize_node(self, value: NodeAttr | None) -> dict[str, object] | None:
+        # Serialize ``NodeAttr`` with Rust's ``skip_serializing_if`` rules
+        # (``agent_id`` omitted when ``None``, ``path`` omitted when empty) so a
+        # nested node serializes byte-identically whether emitted standalone or
+        # inside an event. Returns ``None`` verbatim (pydantic omits the field
+        # via the parent ``model_dump_json`` exclude).
+        if value is None:
+            return None
+        return value.model_dump()
 
     def model_dump(self, **kwargs: object) -> dict[str, object]:  # type: ignore[override]
         out = super().model_dump(**kwargs)
@@ -6081,6 +6110,7 @@ class HarnessConfig:
         steering_source: Callable[[], list[str]] | None = None,
         tool_call_repair: Any | None = None,
         max_repair_attempts: int = 1,
+        tool_search: Any | None = None,
     ) -> None:
         # #124: the legacy single-collaborator fields (``agent`` / ``verifier`` /
         # ``planner_agent`` / ``evaluator_agent`` / ``metric_evaluator``) are GONE
@@ -6371,6 +6401,11 @@ class HarnessConfig:
         # bounds re-dispatch (default ``1``).
         self.tool_call_repair = tool_call_repair
         self.max_repair_attempts: int = max_repair_attempts
+        # Deferred-tool pattern (mirrors Rust's ``HarnessConfig::tool_search``):
+        # when set, the effective per-window registry is wrapped in a
+        # :class:`~spore_core.tool_registry.ToolSearchRegistry` so only a small,
+        # description-bounded ACTIVE set is advertised. ``None`` disables it.
+        self.tool_search = tool_search
 
     def with_sandbox(self, sandbox: SandboxProvider) -> HarnessConfig:
         """A full copy of this config with only ``sandbox`` swapped (#124). Every
@@ -6419,6 +6454,7 @@ class HarnessConfig:
             steering_source=self.steering_source,
             tool_call_repair=self.tool_call_repair,
             max_repair_attempts=self.max_repair_attempts,
+            tool_search=self.tool_search,
         )
 
 
@@ -6580,6 +6616,8 @@ class HarnessBuilder:
         # Tool-call repair (None disables; default 1 attempt).
         self._tool_call_repair: Any | None = None
         self._max_repair_attempts: int = 1
+        # Deferred-tool pattern (None disables).
+        self._tool_search: Any | None = None
         # Per-kind consult handlers (issue #114). Empty by default — consults
         # degrade gracefully (R6). Populated via :meth:`consult_handler`.
         self._consult_handlers: dict[str, ConsultHandlerEntry] = {}
@@ -7039,6 +7077,15 @@ class HarnessBuilder:
         self._max_repair_attempts = max_repair_attempts
         return self
 
+    def tool_search(self, config: Any) -> HarnessBuilder:
+        """Wire a :class:`~spore_core.tool_registry.ToolSearchConfig` so the
+        effective per-window registry is wrapped in a
+        :class:`~spore_core.tool_registry.ToolSearchRegistry` (deferred-tool
+        pattern for local models). Mirrors Rust's ``HarnessBuilder::tool_search``.
+        """
+        self._tool_search = config
+        return self
+
     def drain_tools_into_registry(self) -> StandardToolRegistry:
         """Drain the accumulated catalogue tools into a populated
         :class:`StandardToolRegistry`, registering each with last-wins upsert
@@ -7324,6 +7371,7 @@ class HarnessBuilder:
             steering_source=self._steering_source,
             tool_call_repair=self._tool_call_repair,
             max_repair_attempts=self._max_repair_attempts,
+            tool_search=self._tool_search,
         )
 
     def build(self) -> StandardHarness:
@@ -7726,26 +7774,41 @@ class StandardHarness:
         if toolset:
             scoped = self._config.toolset_catalogues.get(toolset)
             if scoped is not None:
-                return RealToolRegistry(
-                    scoped,
-                    self._config.sandbox,
-                    session_id,
-                    self._config.project_id,
-                    self._config.storage.run(),
-                    self._config.storage.memory(),
-                ).with_progress(progress)
+                return self._maybe_tool_search(
+                    RealToolRegistry(
+                        scoped,
+                        self._config.sandbox,
+                        session_id,
+                        self._config.project_id,
+                        self._config.storage.run(),
+                        self._config.storage.memory(),
+                    ).with_progress(progress)
+                )
         # Fallback: empty handle (back-compat) or unregistered non-empty handle.
         catalogue = self._config.catalogue_registry
         if catalogue is None:
-            return self._config.tool_registry
-        return RealToolRegistry(
-            catalogue,
-            self._config.sandbox,
-            session_id,
-            self._config.project_id,
-            self._config.storage.run(),
-            self._config.storage.memory(),
-        ).with_progress(progress)
+            return self._maybe_tool_search(self._config.tool_registry)
+        return self._maybe_tool_search(
+            RealToolRegistry(
+                catalogue,
+                self._config.sandbox,
+                session_id,
+                self._config.project_id,
+                self._config.storage.run(),
+                self._config.storage.memory(),
+            ).with_progress(progress)
+        )
+
+    def _maybe_tool_search(self, reg: ToolRegistry) -> ToolRegistry:
+        """Wrap ``reg`` in a :class:`~spore_core.tool_registry.ToolSearchRegistry`
+        when :attr:`HarnessConfig.tool_search` is configured; otherwise return it
+        unchanged. Mirrors Rust's ``StandardHarness::maybe_tool_search``."""
+        cfg = self._config.tool_search
+        if cfg is None:
+            return reg
+        from .tool_registry import ToolSearchRegistry
+
+        return ToolSearchRegistry(reg, cfg)
 
     # ---- helpers ----------------------------------------------------
 

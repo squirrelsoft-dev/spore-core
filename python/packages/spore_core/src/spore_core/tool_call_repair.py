@@ -27,6 +27,7 @@ Pieces:
 
 from __future__ import annotations
 
+import math
 from typing import Any, Protocol, runtime_checkable
 
 from .model import ToolCall, ToolSchema
@@ -150,9 +151,14 @@ def _parse_number(s: str) -> Any:
     except ValueError:
         pass
     try:
-        return float(s)
+        f = float(s)
     except ValueError:
         return None
+    # Reject NaN/Inf — they have no JSON number representation (mirrors Rust's
+    # ``serde_json::Number::from_f64`` returning ``None`` for non-finite).
+    if not math.isfinite(f):
+        return None
+    return f
 
 
 def _expects(expected: str | None, want: str) -> bool:

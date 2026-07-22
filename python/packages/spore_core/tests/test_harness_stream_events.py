@@ -232,6 +232,28 @@ def test_node_present_in_serialization_when_set() -> None:
     assert '"agent_id":"a1"' in blob
 
 
+def test_node_default_agent_omits_agent_id_and_empty_path() -> None:
+    # A default-agent leaf event (agent_id=None, path=[]) serializes WITHOUT
+    # `agent_id` or `path`, matching Rust's skip_serializing_if rules. This is
+    # the golden cross-language wire shape for an un-nested attributed event.
+    ev = StreamToolResult(
+        call_id="c1",
+        is_error=False,
+        content="ok",
+        node=NodeAttr(kind="react", agent_id=None, depth=0, path=[]),
+    )
+    blob = ev.model_dump_json()
+    assert '"node"' in blob
+    assert '"agent_id"' not in blob, blob
+    assert '"path"' not in blob, blob
+    assert '"kind":"react"' in blob
+    assert '"depth":0' in blob
+    # model_dump mirrors the omission.
+    d = ev.model_dump()
+    assert "agent_id" not in d["node"]
+    assert "path" not in d["node"]
+
+
 # ---------------------------------------------------------------------------
 # StreamUserMessage.steered default + StreamToolProgress shape
 # ---------------------------------------------------------------------------

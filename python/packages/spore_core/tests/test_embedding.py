@@ -167,6 +167,20 @@ async def test_openai_embed_429_is_rate_limited() -> None:
         await model.embed(["a"])
 
 
+@respx.mock
+async def test_openai_embed_error_envelope_unwrapped() -> None:
+    # Mirrors Rust: {"error":{"message":...}} is unwrapped to the inner
+    # message, not the raw envelope text.
+    respx.post("https://api.openai.com/v1/embeddings").mock(
+        return_value=httpx.Response(400, text='{"error":{"message":"bad model"}}')
+    )
+    model = OpenAIEmbeddingModel("sk-test", "text-embedding-3-small").with_max_retries(0)
+    with pytest.raises(ProviderError) as ei:
+        await model.embed(["a"])
+    assert ei.value.code == 400
+    assert ei.value.message == "bad model"
+
+
 def test_openai_default_dimensions_known_families() -> None:
     assert OpenAIEmbeddingModel("k", "text-embedding-3-large").dimensions() == 3072
     assert OpenAIEmbeddingModel("k", "text-embedding-3-small").dimensions() == 1536
@@ -219,3 +233,46 @@ async def test_in_memory_vector_store_dimension_mismatch() -> None:
     with pytest.raises(VectorStoreError) as ei:
         await store.add([VectorRecord(id="b", vector=[1.0, 0.0, 0.0])])
     assert ei.value.kind == "dimension_mismatch"
+
+
+# ---------------------------------------------------------------------------
+# InMemoryVectorStore: delete / len / is_empty (§review High #2)
+# ---------------------------------------------------------------------------
+
+
+async def test_in_memory_vector_store_delete_by_filter() -> None:
+    store = InMemoryVectorStore()
+    await store.add(
+        [
+            VectorRecord(id="a", vector=[1.0, 0.0], metadata={"kind": "chunk"}),
+            VectorRecord(id="b", vector=[0.0, 1.0], metadata={"kind": "summary"}),
+            VectorRecord(id="c", vector=[1.0, 0.1], metadata={"kind": "chunk"}),
+        ]
+    )
+    removed = await store.delete(MetadataFilter().eq("kind", "chunk"))
+    assert removed == 2
+    assert await store.len() == 1
+    assert {r.id for r in store._records.values()} == {"b"}
+
+
+async def test_in_memory_vector_store_delete_empty_filter_clears_all() -> None:
+    store = InMemoryVectorStore()
+    await store.add(
+        [
+            VectorRecord(id="a", vector=[1.0, 0.0], metadata={"k": "x"}),
+            VectorRecord(id="b", vector=[0.0, 1.0], metadata={"k": "y"}),
+        ]
+    )
+    removed = await store.delete(MetadataFilter())
+    assert removed == 2
+    assert await store.is_empty() is True
+    assert await store.len() == 0
+
+
+async def test_in_memory_vector_store_len_and_is_empty() -> None:
+    store = InMemoryVectorStore()
+    assert await store.is_empty() is True
+    assert await store.len() == 0
+    await store.add([VectorRecord(id="a", vector=[1.0, 0.0])])
+    assert await store.is_empty() is False
+    assert await store.len() == 1

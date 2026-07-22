@@ -831,7 +831,9 @@ class ToolSearchRegistry:
         return ToolOutputSuccess(content="\n".join(lines))
 
     def _run_search(self, input_: dict[str, Any]) -> ToolOutput:
-        query = str(input_.get("query", "")).strip()
+        raw = input_.get("query", "")
+        # Rust treats a missing/non-string `query` as empty (→ recoverable error).
+        query = raw.strip() if isinstance(raw, str) else ""
         if not query:
             return ToolOutputError(
                 message=(

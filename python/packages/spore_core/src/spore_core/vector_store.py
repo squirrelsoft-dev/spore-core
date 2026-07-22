@@ -89,6 +89,12 @@ class VectorStore(Protocol):
         self, query: list[float], top_k: int, filter: MetadataFilter | None = None
     ) -> list[VectorHit]: ...
 
+    async def delete(self, filter: MetadataFilter) -> int: ...
+
+    async def len(self) -> int: ...
+
+    async def is_empty(self) -> bool: ...
+
 
 class InMemoryVectorStore:
     """Reference in-memory cosine :class:`VectorStore`.
@@ -122,3 +128,21 @@ class InMemoryVectorStore:
             scored.append(VectorHit(id=rec.id, score=score, metadata=dict(rec.metadata)))
         scored.sort(key=lambda h: h.score, reverse=True)
         return scored[:top_k]
+
+    async def delete(self, filter: MetadataFilter) -> int:
+        """Delete every record whose metadata matches ``filter``. An empty
+        filter matches all records (a full clear). Returns the count removed."""
+        if filter.is_empty():
+            n = len(self._records)
+            self._records.clear()
+            return n
+        victims = [rid for rid, rec in self._records.items() if filter.matches(rec.metadata)]
+        for rid in victims:
+            del self._records[rid]
+        return len(victims)
+
+    async def len(self) -> int:
+        return len(self._records)
+
+    async def is_empty(self) -> bool:
+        return not self._records

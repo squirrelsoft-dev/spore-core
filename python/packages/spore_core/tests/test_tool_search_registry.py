@@ -81,6 +81,22 @@ async def test_tool_search_no_matches() -> None:
     assert "No tools matched" in out.content
 
 
+async def test_tool_search_rejects_non_string_query() -> None:
+    # A non-string `query` (e.g. a list) is treated as empty → recoverable error,
+    # and NO tools are loaded (mirrors Rust's string-only extraction).
+    from spore_core import ToolOutputError
+
+    tsr = ToolSearchRegistry(
+        _MockLoopReg(_catalogue()),
+        ToolSearchConfig.new(["read_file"]).with_description_budget(1000),
+    )
+    out = await tsr.dispatch(ToolCall(id="c1", name="tool_search", input={"query": ["shell"]}))
+    assert isinstance(out, ToolOutputError)
+    assert out.recoverable is True
+    # Nothing was loaded — advertised set unchanged (core + search only).
+    assert {s.name for s in tsr.schemas()} == {"read_file", "tool_search"}
+
+
 async def test_deferred_tool_dispatch_succeeds_even_when_not_advertised() -> None:
     inner = _MockLoopReg(_catalogue())
     tsr = ToolSearchRegistry(inner, ToolSearchConfig.new(["read_file"]))
@@ -151,3 +167,96 @@ async def test_is_always_halt_false_for_search_and_namespaces() -> None:
     tsr = ToolSearchRegistry(_MockLoopReg(_catalogue()), cfg)
     assert tsr.is_always_halt("tool_search") is False
     assert tsr.is_always_halt("fs_tools") is False
+
+
+# ---------------------------------------------------------------------------
+# Harness integration (§review Medium #3): tool_search wired through the
+# builder advertises only core + tool_search before a search runs.
+# ---------------------------------------------------------------------------
+
+
+async def test_harness_tool_search_advertises_only_core_before_search() -> None:
+    from dataclasses import dataclass
+    from typing import Any
+
+    from spore_core import (
+        AllowAllSandbox,
+        AlwaysContinuePolicy,
+        HarnessBuilder,
+        HarnessRunOptions,
+        NoopContextManager,
+        ReactConfig,
+        RunResultSuccess,
+        ScriptedToolRegistry,
+        SessionId,
+        Task,
+    )
+    from spore_core.agent import FinalResponse
+    from spore_core.model import TokenUsage
+
+    @dataclass
+    class _Bundle:
+        implementation: Any
+        schema: Any
+
+    class _RecTool:
+        def __init__(self, n: str) -> None:
+            self._n = n
+
+        def name(self) -> str:
+            return self._n
+
+        def is_subagent_tool(self) -> bool:
+            return False
+
+        def may_produce_large_output(self) -> bool:
+            return False
+
+        async def execute(self, call: Any, sandbox: Any, ctx: Any) -> Any:
+            from spore_core import ToolOutputSuccess
+
+            return ToolOutputSuccess(content=self._n)
+
+    from spore_core import RegistryToolSchema
+
+    bundles = [
+        _Bundle(
+            implementation=_RecTool(n),
+            schema=RegistryToolSchema(
+                name=n, description=d, parameters={"type": "object", "properties": {}}
+            ),
+        )
+        for n, d in [
+            ("read_file", "read a file"),
+            ("bash", "run a shell command"),
+            ("grep", "search files for a pattern"),
+        ]
+    ]
+
+    seen_tools: list[list[str]] = []
+
+    class _RecAgent:
+        async def turn(self, context: Any) -> Any:
+            seen_tools.append([t.name for t in context.tools])
+            return FinalResponse(content="done", usage=TokenUsage())
+
+        def id(self) -> Any:
+            from spore_core import AgentId
+
+            return AgentId("rec")
+
+    builder = HarnessBuilder(
+        agent=_RecAgent(),
+        tool_registry=ScriptedToolRegistry(),
+        sandbox=AllowAllSandbox(),
+        context_manager=NoopContextManager(),
+        termination_policy=AlwaysContinuePolicy(),
+    )
+    for b in bundles:
+        builder = builder.tool(b)
+    builder = builder.tool_search(ToolSearchConfig.new(["read_file"]).with_description_budget(1000))
+    h = builder.build()
+    r = await h.run(HarnessRunOptions(Task.new("do", SessionId("s1"), ReactConfig.per_loop(3))))
+    assert isinstance(r, RunResultSuccess)
+    # First turn advertises ONLY core + tool_search (deferred tools hidden).
+    assert set(seen_tools[0]) == {"read_file", "tool_search"}, seen_tools[0]

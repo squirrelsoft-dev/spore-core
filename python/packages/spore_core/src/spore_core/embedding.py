@@ -201,6 +201,23 @@ def _parse_retry_after(value: str | None) -> float | None:
         return None
 
 
+def _openai_error_message(body: str) -> str:
+    """Pull the message from the typed ``{error:{message}}`` envelope, falling
+    back to the first 500 chars of the raw body. Mirrors Rust's
+    ``provider_http::error_parts``."""
+    try:
+        parsed = _json.loads(body)
+    except (ValueError, TypeError):
+        return body[:500]
+    if isinstance(parsed, dict):
+        err = parsed.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message")
+            if isinstance(msg, str):
+                return msg
+    return body[:500]
+
+
 class OpenAIEmbeddingModel:
     """``EmbeddingModel`` over ``${base_url}/embeddings`` (OpenAI +
     OpenAI-compatible servers). Reuses the shared retry/backoff plumbing.
@@ -303,7 +320,7 @@ class OpenAIEmbeddingModel:
             await resp.aclose()
             if status == 429:
                 raise RateLimited(retry_after=retry_after)
-            raise ProviderError(code=status, message=text[:500])
+            raise ProviderError(code=status, message=_openai_error_message(text))
 
     async def embed(self, inputs: list[str]) -> list[list[float]]:
         if not inputs:

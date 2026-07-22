@@ -110,6 +110,18 @@ def test_coerce_non_dict_returns_none() -> None:
     assert coerce_tool_args("not a dict") is None  # type: ignore[arg-type]
 
 
+def test_coerce_rejects_non_finite_numeric_strings() -> None:
+    # NaN/Inf/-Inf have no JSON number representation; Rust rejects them via
+    # ``serde_json::Number::from_f64`` (returns None for non-finite). Python must
+    # leave them unrepaired too.
+    schema = _schema({"n": {"type": "number"}})
+    assert coerce_tool_args({"n": "NaN"}, schema) is None
+    assert coerce_tool_args({"n": "inf"}, schema) is None
+    assert coerce_tool_args({"n": "-inf"}, schema) is None
+    # A finite float string is still repaired.
+    assert coerce_tool_args({"n": "3.14"}, schema) == {"n": 3.14}
+
+
 # ---------------------------------------------------------------------------
 # detect_prose_response
 # ---------------------------------------------------------------------------

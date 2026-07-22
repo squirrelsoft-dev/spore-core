@@ -1,8 +1,11 @@
 # Python ↔ Rust Behavioral Parity Plan — spore-core
 
-> **Status: PLAN ONLY — no implementation started.**
+> **Status: IMPLEMENTATION COMPLETE — reviewed; review findings fixed.**
 > Authoritative Rust revision: `7058db115b4f05b6b7cde1a3f62ba345c202bcde`
 > (`git rev-parse HEAD` at task start, branch `fm/parity-python`).
+> Final evidence: 1726 passed, 8 skipped; `ruff check` + `ruff format --check`
+> clean; 12 `examples/python/*` import + tests pass. See §12 for the
+> capability→evidence matrix and the review-fix log.
 
 ## 1. Scope, authority, and read-only constraints
 
@@ -678,7 +681,7 @@ change. The Go and TypeScript parity tasks are prohibited from editing
 ## 12. Final parity matrix (implementation complete)
 
 Rust authoritative revision: `7058db115b4f05b6b7cde1a3f62ba345c202bcde`.
-Python suite: **1715 passed, 8 skipped**; `ruff check` clean; `ruff format --check` clean; all 12 `examples/python/*` import + per-example tests pass.
+Python suite: **1726 passed, 8 skipped**; `ruff check` clean; `ruff format --check` clean; all 12 `examples/python/*` import + per-example tests pass.
 
 | Step | Capability | Implementation | Evidence |
 |---|---|---|---|
@@ -695,7 +698,7 @@ Python suite: **1715 passed, 8 skipped**; `ruff check` clean; `ruff format --che
 | §5.15 | `image` module | new `image.py` (`media_type_for_extension`/`is_image_path`/`image_content`/`load_image_content`) | `test_image.py` (5) |
 | §5.16 | `set_plan` + `StandardTools` | new `spore_tools/tools/set_plan.py` + `StandardTools.set_plan()` preset | `test_set_plan.py` (6) |
 | §5.17 | Eval/CLI executable validation | `test_eval_cli_fixture.py` pins CLI to shared `core_suite.json` | `test_eval_cli_fixture.py` (7) |
-| §4.15 | Cancellation/timeout/retry/concurrency regression | `test_parity_lifecycle.py` (retryable set, backoff curve, `retryable()`, wall-time budget, `dispatch_all` concurrency) | `test_parity_lifecycle.py` (5) |
+| §4.15 | Cancellation/timeout/retry/concurrency/cleanup/steering regression | `test_parity_lifecycle.py` (retryable set, backoff curve, `retryable()`, wall-time budget, `dispatch_all` concurrency, cleanup finalization success+failure, steering in-flight no-cancel) | `test_parity_lifecycle.py` (9) |
 | §10 | `AGENTS.md` parity rule | `AGENTS.md` Rust-authoritative + read-only rule | committed |
 
 ### Remaining gaps (explicit)
@@ -705,8 +708,38 @@ passing tests. The following were confirmed **not applicable** (Rust-internal or
 feature-gated): `text_util`/`sync_util`/`macros`/`provider_http` (internal),
 `sandbox_petri` (feature-gated), `BoxFut` (Rust async type).
 
+### Review-fix log (independent review of PR #168)
+
+Every actionable finding was fixed (the `CLAUDE.md` symlink finding was
+retained per the intake — `fm-ensure-agents-md.sh` owns that guarded path):
+
+- **High — NodeAttr wire compat**: `NodeAttr` now omits `agent_id` when `None`
+  and `path` when empty via a `model_dump`/`model_dump_json` override + a
+  `_StreamEvent` `@field_serializer("node")`; golden test
+  `test_node_default_agent_omits_agent_id_and_empty_path`.
+- **High — VectorStore API**: added `delete(filter) -> int`, `len() -> int`,
+  `is_empty() -> bool` to the protocol + `InMemoryVectorStore`; tests for
+  filtered delete, empty-filter full clear, `len`, `is_empty`.
+- **Medium — ToolSearchRegistry harness integration**: `HarnessConfig.tool_search`
+  + `HarnessBuilder.tool_search` + `_maybe_tool_search` wrapping in
+  `_effective_tool_registry`; integration test asserting a harness run
+  advertises only core + `tool_search` before a search.
+- **Medium — OpenAI embedding error envelope**: `_openai_error_message`
+  unwraps `{error:{message}}` (falls back to raw 500 chars); test
+  `test_openai_embed_error_envelope_unwrapped`.
+- **Medium — non-string `query`**: `_run_search` requires a `str` query;
+  test `test_tool_search_rejects_non_string_query`.
+- **Low — non-finite numeric coercion**: `_parse_number` guards
+  `math.isfinite()`; tests for `NaN`/`inf`/`-inf`.
+- **Low — lifecycle claims**: added executable cleanup-finalization tests
+  (success + failure outcomes via `InMemoryObservabilityProvider`) and a
+  steering in-flight-cancellation test (steering injects AFTER the tool
+  result, never mid-turn) — `test_parity_lifecycle.py`.
+- **Low — contradictory status text**: the document status is now a single
+  coherent final-review state; stale plan-only lines removed.
+
 ---
 
 resolved: plan review decisions incorporated (C1 full embedding/vector_store provider impls now; C5 image.rs confirmed public module, concrete plan; C6 eval/CLI parity pinned by executable validation against fixtures/task_suites/core_suite.json; §4.15 cancellation/timeout/retry/cleanup + async/concurrency matrix added with evidence and regression tests)
 
-needs-decision: plan ready for second-mate review at docs/python/rust-parity-plan.md; no implementation started
+resolved: independent review findings fixed (NodeAttr wire compat, VectorStore delete/len/is_empty, ToolSearchRegistry harness integration, OpenAI error envelope, non-string query, non-finite coercion, cleanup/steering lifecycle tests, status text coherence) [key=parity-python-review]
