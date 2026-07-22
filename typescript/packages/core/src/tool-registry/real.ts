@@ -18,7 +18,7 @@ import type {
 } from "../harness/types.js";
 import type { MemoryStore, ProjectId, RunStore } from "../storage/types.js";
 
-import { ToolContext, type ToolSchema as RegistryToolSchema } from "./types.js";
+import { ToolContext, type ToolProgressSink, type ToolSchema as RegistryToolSchema } from "./types.js";
 import { dispatchErrorMessage } from "./types.js";
 import type { StandardToolRegistry } from "./standard.js";
 
@@ -66,13 +66,15 @@ export class RealToolRegistry implements HarnessToolRegistry {
     projectId: ProjectId,
     runStore: RunStore,
     memoryStore: MemoryStore,
+    progressSink?: ToolProgressSink,
   ) {
     // Snapshot the model-facing schemas (sorted by name; activeSchemas already
     // sorts) once at construction; the catalogue is fixed for a run.
     this._schemas = inner.activeSchemas(null).map(toModelSchema);
     // Build the storage seam once per run from the injected session + project +
-    // stores.
-    this.ctx = new ToolContext(sessionId, projectId, runStore, memoryStore);
+    // stores. G-B: thread the optional progress sink so tools can emit live
+    // `tool_progress` previews.
+    this.ctx = new ToolContext(sessionId, projectId, runStore, memoryStore, progressSink);
   }
 
   /** The model-facing tool schemas, sorted by name. */

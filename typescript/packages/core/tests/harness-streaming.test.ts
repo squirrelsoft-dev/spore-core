@@ -181,7 +181,14 @@ describe("Harness streaming fixture replay (#103)", () => {
     const firstCoarse = seen.findIndex((e) => e.kind === "tool_call");
     const deltaSlice = seen
       .slice(0, firstCoarse === -1 ? seen.length : firstCoarse)
-      .filter((e) => deltaKinds.has(e.kind));
+      .filter((e) => deltaKinds.has(e.kind))
+      // G-A: strip `node` attribution before comparing to the golden (mirrors
+      // Rust's `*got_norm.node_mut() = None` normalization).
+      .map((e) => {
+        const { node, ...rest } = e;
+        void node;
+        return rest as HarnessStreamEvent;
+      });
     expect(deltaSlice).toEqual(golden.events);
   });
 

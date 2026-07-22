@@ -14,7 +14,12 @@
 import { z } from "zod";
 
 import type { ToolCall } from "../model/schemas.js";
-import type { SandboxProvider, SandboxViolation, ToolOutput } from "../harness/types.js";
+import type {
+  CommandProgressSink,
+  SandboxProvider,
+  SandboxViolation,
+  ToolOutput,
+} from "../harness/types.js";
 import type { SessionId } from "../harness/types.js";
 import type { MemoryStore, ProjectId, RunStore } from "../storage/types.js";
 
@@ -67,8 +72,51 @@ export class ToolContext {
     readonly projectId: ProjectId,
     readonly runStore: RunStore,
     readonly memoryStore: MemoryStore,
+    /** Optional run-level progress sink for live tool output (G-B). */
+    readonly progressSink?: ToolProgressSink,
   ) {}
+
+  /**
+   * The progress sink for a tool call (G-B): builds a per-call
+   * {@link CommandProgressSink} that captures the tool name + call id and
+   * forwards sanitized tail snapshots to the run-level {@link ToolProgressSink},
+   * or `undefined` when no sink is configured. Mirrors Rust
+   * `ToolContext::command_progress`.
+   */
+  commandProgress(call: ToolCall): CommandProgressSink | undefined {
+    const sink = this.progressSink;
+    if (sink == null) return undefined;
+    const tool = call.name;
+    const callId = call.id;
+    return (preview: string): void => {
+      sink({ tool, call_id: callId, preview });
+    };
+  }
 }
+
+// ============================================================================
+// Tool progress (G-B) — live output from a running tool
+// ============================================================================
+
+/**
+ * One progress update from a RUNNING tool, labeled with the call it belongs
+ * to. The bridge maps it onto a `tool_progress` stream event for UIs. Mirrors
+ * Rust `ToolProgressUpdate`.
+ */
+export interface ToolProgressUpdate {
+  /** Tool name (e.g. `bash_command`). */
+  readonly tool: string;
+  /** The originating `ToolCall` id, so a UI can update the right block. */
+  readonly call_id: string;
+  /** Sanitized tail snapshot of the output so far — REPLACES the previous preview. */
+  readonly preview: string;
+}
+
+/**
+ * Run-level sink for {@link ToolProgressUpdate}s. Must not block (called from
+ * the tool dispatch path). Mirrors Rust `ToolProgressSink`.
+ */
+export type ToolProgressSink = (update: ToolProgressUpdate) => void;
 
 // ============================================================================
 // ToolAnnotations & ToolSchema

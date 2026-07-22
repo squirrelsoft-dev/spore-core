@@ -2228,7 +2228,12 @@ async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<Str
   // does not).
   const leafBehavior = c.behavior ?? defaultBudgetBehavior();
   pushBudget(cx, c.budget, leafBehavior, "react");
-  const onStream = cx.stream;
+  // G-A: stamp every event this leaf emits with `node` attribution (kind
+  // "react" + the leaf agent's handle). An enclosing combinator that wraps
+  // `cx.stream` with its own kind before recursing prepends to `path`/bumps
+  // `depth`; the leaf's stamp is set-once (innermost wins). Mirrors Rust
+  // `wrap_node_sink(cx.stream.clone(), "react", agent_id)`.
+  const onStream = wrapNodeSink(cx.stream, "react", c.agent.length > 0 ? c.agent : undefined);
   cx.stream = undefined;
   const result = await executor.reactWindow(
     task,
@@ -2474,7 +2479,10 @@ async function runPlanExecuteConfig(
   // step boundaries are re-emitted on `cx.stream`). Take it now and keep it OUT
   // of `cx.stream` so the recursive children run with a suppressed sink; restore
   // it before returning.
-  const onStream = cx.stream;
+  // G-A: wrap the parent sink so combinator-emitted events carry `node`
+  // attribution (kind "plan_execute"). Nested leaf events are suppressed by the
+  // design below; the combinator's own coarse events are stamped here.
+  const onStream = wrapNodeSink(cx.stream, "plan_execute");
   cx.stream = undefined;
 
   // #131/#138: the phase-agnostic resume seed (the stalled worker conversation
@@ -3188,7 +3196,9 @@ async function runSelfVerifyingConfig(
   cx.scratch.runSession = emptySessionState();
   const carried: BudgetSnapshot = { ...cx.scratch.runBudget };
   // Suppress the run's stream sink for the recursive child phases.
-  const onStream = cx.stream;
+  // G-A: wrap the parent sink so combinator-emitted events carry `node`
+  // attribution (kind "self_verifying").
+  const onStream = wrapNodeSink(cx.stream, "self_verifying");
   cx.stream = undefined;
 
   // Q1a: resolve the verifier from `evaluator`'s key (NO wire change).
@@ -3477,7 +3487,9 @@ async function runRalphConfig(c: RalphConfig, cx: ExecutionContext): Promise<Str
       error: new InvalidConfiguration("no task in ExecutionContext scratch"),
     };
   }
-  const onStream = cx.stream;
+  // G-A: wrap the parent sink so combinator-emitted events carry `node`
+  // attribution (kind "ralph").
+  const onStream = wrapNodeSink(cx.stream, "ralph");
   cx.stream = undefined;
   // Ralph discards the incoming session state by design (each window is a fresh
   // start re-seeded from the filesystem checkpoint).
@@ -3605,7 +3617,9 @@ async function runHillClimbingConfig(
   }
   const sessionId = task.session_id;
   const taskId = task.id;
-  const onStream = cx.stream;
+  // G-A: wrap the parent sink so combinator-emitted events carry `node`
+  // attribution (kind "hill_climbing").
+  const onStream = wrapNodeSink(cx.stream, "hill_climbing");
   cx.stream = undefined;
   const carried: BudgetSnapshot = { ...cx.scratch.runBudget };
   cx.scratch.runSession = emptySessionState();
@@ -4093,7 +4107,36 @@ export type BlockKind = "text" | "reasoning" | "tool_use";
  * Tool lifecycle ordering per call:
  *   `tool_call_start` → `tool_args_delta`* → (`block_stop`) → coarse `tool_call`.
  */
-export type HarnessStreamEvent =
+export type HarnessStreamEvent = WithNode<HarnessStreamEventBase>;
+
+/**
+ * Attribution stamped onto every {@link HarnessStreamEvent} as it flows up
+ * through the node-wrapping sinks (see {@link wrapNodeSink}). Lets a
+ * multi-agent UI route a frame to the node that produced it. Optional so an
+ * un-attributed event (a bare/single-leaf run, or any pre-attribution
+ * consumer) serializes byte-identically to before this field existed. Mirrors
+ * Rust `NodeAttr`.
+ */
+export interface NodeAttr {
+  /** The emitting node's kind: `"react"` (a leaf turn loop), or a combinator
+   *  kind (`"plan_execute"` / `"self_verifying"` / `"ralph"` / `"hill_climbing"`).
+   *  The leaf's kind is the innermost (most specific) — set first. */
+  readonly kind: string;
+  /** The leaf agent's handle (e.g. `"planner"`/`"executor"`), when the emitting
+   *  node is a `react` leaf. Omitted for combinator frames. */
+  readonly agent_id?: string;
+  /** Nesting depth of the emitting leaf below the root. */
+  readonly depth: number;
+  /** Root→leaf node-kind path, accumulated by the wrapper chain (outermost
+   *  first). E.g. `["ralph","plan_execute","self_verifying","react"]`. */
+  readonly path?: string[];
+}
+
+/** Add an optional `node` attribution to every variant of a stream-event union. */
+type WithNode<E> = E extends { kind: string } ? E & { node?: NodeAttr } : never;
+
+/** The base stream-event union (without node attribution). */
+type HarnessStreamEventBase =
   | { kind: "turn_start"; turn: number }
   | { kind: "turn_end"; turn: number }
   | {
@@ -4121,6 +4164,16 @@ export type HarnessStreamEvent =
     }
   | { kind: "final_response"; content: string }
   | { kind: "budget_warning"; limit_type: BudgetLimitType }
+  /**
+   * Live output from a RUNNING tool (pi-style bash streaming): emitted at most
+   * every ~100ms while a command runs, between the tool's `tool_call` and its
+   * `tool_result`. `preview` is a sanitized TAIL SNAPSHOT of the output so far —
+   * each event REPLACES the previous preview (never append); the final full
+   * output still arrives on the `tool_result`. Purely informational: never
+   * persisted to the session and absent from the model conversation. Mirrors
+   * Rust `StreamEvent::ToolProgress`.
+   */
+  | { kind: "tool_progress"; call_id: string; name: string; preview: string }
   /**
    * Emitted by the harness loop when it dispatches the `send_message` tool
    * (issue #81 — `SendMessageTool`). The loop surfaces the message content as
@@ -4189,6 +4242,44 @@ export type HarnessStreamEvent =
   | { kind: "output_schema_violation"; attempts: number; error: string };
 
 export type StreamSink = (event: HarnessStreamEvent) => void;
+
+/**
+ * Wrap a parent sink so every event passing through is stamped for ONE node.
+ * The leaf installs the innermost wrapper (it sets `kind`/`agent_id`/seeds the
+ * `path`); each enclosing combinator's wrapper PREPENDS its kind to `path` and
+ * bumps `depth`. Stamping is set-once for `kind`/`agent_id` (the innermost leaf
+ * wins) so the event reports who actually spoke, with the full nesting in
+ * `path`. Returns `undefined` when there is no parent sink (no-op, baseline
+ * path). Mirrors Rust `wrap_node_sink`.
+ */
+export function wrapNodeSink(
+  parent: StreamSink | undefined,
+  kind: string,
+  agentId?: string,
+): StreamSink | undefined {
+  if (parent == null) return undefined;
+  return (event: HarnessStreamEvent): void => {
+    if (event.node == null) {
+      // Innermost leaf stamps kind/agent_id and seeds the path.
+      (event as { node?: NodeAttr }).node = {
+        kind,
+        agent_id: agentId,
+        depth: 0,
+        path: [kind],
+      };
+    } else {
+      // An enclosing combinator prepends its kind and bumps depth.
+      const prev = event.node;
+      (event as { node?: NodeAttr }).node = {
+        kind: prev.kind,
+        agent_id: prev.agent_id,
+        depth: prev.depth + 1,
+        path: [kind, ...(prev.path ?? [])],
+      };
+    }
+    parent(event);
+  };
+}
 
 /**
  * Per-turn state threaded through `mapModelStreamEvent` (issue #103). Tracks
@@ -4570,6 +4661,14 @@ export type DangerousIsolationMode = { kind: "none" } & {
 };
 
 /**
+ * Live progress sink for a RUNNING subprocess (G-B). Each call delivers a
+ * sanitized TAIL SNAPSHOT of the output accumulated so far — consumers REPLACE
+ * the previous preview, never append. Must not block. Mirrors Rust
+ * `CommandProgressSink`.
+ */
+export type CommandProgressSink = (preview: string) => void;
+
+/**
  * Internal union of every isolation mode, including the dangerous
  * {@link DangerousIsolationMode}. Used by the sandbox switch bodies and by the
  * dangerous entry point. NOT part of the default public API — default callers
@@ -4723,6 +4822,22 @@ export interface SandboxProvider {
     args: readonly string[],
     cwd?: string | null,
     timeoutMs?: number | null,
+    signal?: AbortSignal,
+  ): Promise<CommandOutput | SandboxViolation>;
+
+  /**
+   * Live progress sink for a RUNNING subprocess (G-B, pi-style bash streaming).
+   * Each call delivers a sanitized TAIL SNAPSHOT of the output accumulated so
+   * far — consumers REPLACE the previous preview, never append. Invoked from
+   * the executor's wait loop at most every ~100ms, and only when the snapshot
+   * changed; it must not block. Mirrors Rust `CommandProgressSink`.
+   */
+  executeCommandStreaming?(
+    command: string,
+    args: readonly string[],
+    cwd: string | null,
+    timeoutMs: number | null,
+    progress: CommandProgressSink | undefined,
     signal?: AbortSignal,
   ): Promise<CommandOutput | SandboxViolation>;
 

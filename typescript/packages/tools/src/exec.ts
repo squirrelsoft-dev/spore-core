@@ -55,7 +55,7 @@ import {
 import {
   finishWithPossibleTruncation,
   isSandboxViolation,
-  sbExecuteCommand,
+  sbExecuteCommandStreaming,
   sbResolvePath,
 } from "./sandbox-defaults.js";
 
@@ -103,18 +103,19 @@ export class ExecTool implements Tool {
   async execute(
     call: ToolCall,
     sandbox: SandboxProvider,
-    _ctx: ToolContext,
+    ctx: ToolContext,
     signal?: AbortSignal,
   ): Promise<ToolOutput> {
     const p = parseParams(ExecParamsSchema, call);
     if (!p.ok) return toolExecutionErrorToOutput(p.error);
     const timeoutMs = p.value.timeout != null ? p.value.timeout * 1000 : null;
-    const out = await sbExecuteCommand(
+    const out = await sbExecuteCommandStreaming(
       sandbox,
       p.value.command,
       p.value.args ?? [],
       null,
       timeoutMs,
+      ctx.commandProgress(call),
       signal,
     );
     if (isSandboxViolation(out))
@@ -192,7 +193,7 @@ export class BashCommandTool implements Tool {
   async execute(
     call: ToolCall,
     sandbox: SandboxProvider,
-    _ctx: ToolContext,
+    ctx: ToolContext,
     signal?: AbortSignal,
   ): Promise<ToolOutput> {
     const p = parseParams(ShellCommandParamsSchema, call);
@@ -214,12 +215,13 @@ export class BashCommandTool implements Tool {
         });
       working = resolved;
     }
-    const out = await sbExecuteCommand(
+    const out = await sbExecuteCommandStreaming(
       sandbox,
       "/bin/sh",
       ["-c", p.value.script],
       working,
       timeoutMs,
+      ctx.commandProgress(call),
       signal,
     );
     if (isSandboxViolation(out))
@@ -283,7 +285,7 @@ export class RunTestsTool implements Tool {
   async execute(
     call: ToolCall,
     sandbox: SandboxProvider,
-    _ctx: ToolContext,
+    ctx: ToolContext,
     signal?: AbortSignal,
   ): Promise<ToolOutput> {
     const p = parseParams(RunTestsParamsSchema, call);
@@ -308,12 +310,13 @@ export class RunTestsTool implements Tool {
         reason: "command must not be empty",
       });
     }
-    const out = await sbExecuteCommand(
+    const out = await sbExecuteCommandStreaming(
       sandbox,
       program,
       parts,
       working,
       timeoutMs,
+      ctx.commandProgress(call),
       signal,
     );
     if (isSandboxViolation(out))

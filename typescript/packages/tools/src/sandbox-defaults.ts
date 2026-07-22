@@ -15,6 +15,7 @@ import { spawn } from "node:child_process";
 import { resolve as pathResolve } from "node:path";
 import type {
   CommandOutput,
+  CommandProgressSink,
   Operation,
   SandboxProvider,
   SandboxViolation,
@@ -196,6 +197,29 @@ export async function sbExecuteCommand(
     return sandbox.executeCommand(command, args, cwd, timeoutMs, signal);
   }
   return defaultExecuteCommand(command, args, cwd, timeoutMs, signal);
+}
+
+/**
+ * Streaming variant (G-B): route through `sandbox.executeCommandStreaming` when
+ * present, passing the live `progress` sink; otherwise delegate to
+ * `executeCommand` (ignoring `progress`). Mirrors Rust's default
+ * `execute_command_streaming` which ignores `progress` and delegates. The
+ * `progress` sink receives sanitized tail snapshots of the output so far.
+ */
+export async function sbExecuteCommandStreaming(
+  sandbox: SandboxProvider,
+  command: string,
+  args: readonly string[],
+  cwd: string | null,
+  timeoutMs: number | null,
+  progress: CommandProgressSink | undefined,
+  signal?: AbortSignal,
+): Promise<CommandOutput | SandboxViolation> {
+  if (sandbox.executeCommandStreaming) {
+    return sandbox.executeCommandStreaming(command, args, cwd, timeoutMs, progress, signal);
+  }
+  // Default: delegate to executeCommand, ignoring progress (mirrors Rust).
+  return sbExecuteCommand(sandbox, command, args, cwd, timeoutMs, signal);
 }
 
 export async function sbHandleLargeOutput(

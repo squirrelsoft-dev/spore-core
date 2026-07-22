@@ -88,6 +88,7 @@ import {
   RegistrationErrorException,
   StandardToolRegistry,
   type StandardTool,
+  type ToolProgressSink,
 } from "../tool-registry/index.js";
 import {
   InMemoryChunkProvider,
@@ -790,7 +791,11 @@ export class StandardHarness implements Harness, StrategyExecutor {
    * global-catalogue / {@link toolRegistry} seam fallback applies, so examples
    * 01–11 that use `.tools()` keep working byte-for-byte.
    */
-  private effectiveToolRegistry(sessionId: SessionId, toolset: ToolsetRef): ToolRegistry {
+  private effectiveToolRegistry(
+    sessionId: SessionId,
+    toolset: ToolsetRef,
+    progressSink?: ToolProgressSink,
+  ): ToolRegistry {
     const store = this.storage();
     // Strict per-node scoping: a non-empty handle with its own catalogue.
     if (toolset.length > 0) {
@@ -803,6 +808,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
           this.resolvedProjectId,
           store.run(),
           store.memory(),
+          progressSink,
         );
       }
     }
@@ -816,6 +822,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
       this.resolvedProjectId,
       store.run(),
       store.memory(),
+      progressSink,
     );
   }
 
@@ -3157,11 +3164,24 @@ export class StandardHarness implements Harness, StrategyExecutor {
     systemPrompt: string | undefined,
   ): Promise<RunResult> {
     const sessionId = task.session_id;
+    // G-B: build a run-level progress sink that re-emits `tool_progress` stream
+    // events on the run's `onStream`. The sink is a no-op when there is no
+    // stream (mirrors Rust: `wrap_node_sink` returns None for no parent sink).
+    const progressSink: ToolProgressSink | undefined =
+      onStream != null
+        ? (update) =>
+            emit(onStream, {
+              kind: "tool_progress",
+              call_id: update.call_id,
+              name: update.tool,
+              preview: update.preview,
+            })
+        : undefined;
     // Resolve the effective tool registry once per turn-loop window (issue #91).
     // Bridges catalogue tools per-run via RealToolRegistry, else the slim seam.
     // Issue 2: the per-node toolset catalogue is bridged when the handle is
     // non-empty and registered; otherwise the global catalogue.
-    const toolRegistry = this.effectiveToolRegistry(sessionId, toolset);
+    const toolRegistry = this.effectiveToolRegistry(sessionId, toolset, progressSink);
     // Reset the adaptive prompt-based-tool-calling escalation flag at the start
     // of this turn-loop window so detection is scoped to the window and does not
     // leak across run() calls (the flag is shared with the model wrapper for the

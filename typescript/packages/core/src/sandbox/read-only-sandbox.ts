@@ -17,6 +17,7 @@ import type { ToolCall } from "../model/schemas.js";
 import type {
   AnyIsolationMode,
   CommandOutput,
+  CommandProgressSink,
   Operation,
   SandboxProvider,
   SandboxViolation,
@@ -70,6 +71,18 @@ export class ReadOnlySandbox implements SandboxProvider {
   ): Promise<CommandOutput | SandboxViolation> {
     // A read-only sandbox forbids subprocess execution outright (commands may
     // have arbitrary write side effects).
+    return { kind: "read_only_violation", path: command };
+  }
+
+  async executeCommandStreaming(
+    command: string,
+    _args: readonly string[],
+    _cwd: string | null,
+    _timeoutMs: number | null,
+    _progress: CommandProgressSink | undefined,
+    _signal?: AbortSignal,
+  ): Promise<CommandOutput | SandboxViolation> {
+    // A read-only sandbox forbids subprocess execution outright.
     return { kind: "read_only_violation", path: command };
   }
 

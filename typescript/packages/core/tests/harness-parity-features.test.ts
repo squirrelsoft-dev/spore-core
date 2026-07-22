@@ -11,11 +11,14 @@ import { describe, expect, it } from "vitest";
 
 import {
   AgentId,
+  HarnessBuilder,
   MockAgent,
   SessionId,
   StandardHarness,
   newTask,
   toolCallRepair,
+  toolRegistry,
+  wrapNodeSink,
   type HarnessConfig,
   type HarnessStreamEvent,
   type LoopStrategy,
@@ -81,6 +84,52 @@ class RecordingRegistry extends ScriptedToolRegistry {
     return next ?? { kind: "success", content: "ok" };
   }
 }
+
+// ============================================================================
+// G-A: NodeAttr stream-event attribution
+// ============================================================================
+
+describe("G-A NodeAttr stream-event attribution", () => {
+  it("a bare react leaf stamps events with kind 'react'", async () => {
+    const a = new MockAgent(AgentId.of("leaf-agent"));
+    a.push({ kind: "final_response", content: "done", usage: usage() } as TurnResult);
+    const cfg = standardConfig(a);
+    const h = new StandardHarness(cfg);
+    const events: HarnessStreamEvent[] = [];
+    await h.run({
+      task: newTask("hi", SessionId.of("s1"), {
+        kind: "react",
+        budget: { kind: "per_loop", value: 8 },
+        agent: "",
+        toolset: "",
+      }),
+      on_stream: (e) => events.push(e),
+    });
+    const turnStart = events.find((e) => e.kind === "turn_start");
+    expect(turnStart).toBeDefined();
+    expect(turnStart!.node).toEqual({
+      kind: "react",
+      agent_id: undefined,
+      depth: 0,
+      path: ["react"],
+    });
+  });
+
+  it("wrapNodeSink: an enclosing combinator prepends its kind and bumps depth", () => {
+    const seen: HarnessStreamEvent[] = [];
+    // Outer combinator sink wraps the real sink.
+    const combinatorSink = wrapNodeSink((e) => seen.push(e), "plan_execute");
+    // Leaf wraps the combinator sink.
+    const leafSink = wrapNodeSink(combinatorSink!, "react", "worker");
+    leafSink!({ kind: "turn_start", turn: 1 });
+    expect(seen[0]!.node).toEqual({
+      kind: "react",
+      agent_id: "worker",
+      depth: 1,
+      path: ["plan_execute", "react"],
+    });
+  });
+});
 
 // ============================================================================
 // G-C: tool_result.revised
@@ -370,5 +419,74 @@ describe("G-J narration refund (send_message-only turns)", () => {
     // WAS emitted — proving the window gate admitted the narration-refunded turn.
     expect(events.some((e) => e.kind === "final_response")).toBe(true);
     expect(r.kind).toBe("failure");
+  });
+});
+
+// ============================================================================
+// G-B: ToolProgress live streaming
+// ============================================================================
+
+describe("G-B ToolProgress live streaming", () => {
+  it("emits tool_progress events from a tool that calls ctx.commandProgress", async () => {
+    // A custom tool that calls ctx.commandProgress(call) with tail snapshots,
+    // then returns success. Registered via HarnessBuilder.tool so the run loop
+    // bridges it through RealToolRegistry (which threads the progress sink).
+    const progressTool: toolRegistry.StandardTool = {
+      implementation: {
+        name: "progress_tool",
+        async execute(
+          call: ToolCall,
+          _sandbox: unknown,
+          ctx: toolRegistry.ToolContext,
+        ): Promise<ToolOutput> {
+          const sink = ctx.commandProgress(call);
+          if (sink != null) {
+            sink("line 1\n");
+            sink("line 1\nline 2\n");
+            sink("line 1\nline 2\nline 3\n");
+          }
+          return { kind: "success", content: "line 1\nline 2\nline 3\n", truncated: false };
+        },
+      },
+      schema: {
+        name: "progress_tool",
+        description: "a tool that streams progress",
+        parameters: { type: "object", properties: {} },
+        annotations: { read_only: true, destructive: false, idempotent: false, open_world: false },
+      } as ToolSchema,
+    };
+
+    const a = new MockAgent(AgentId.of("test"));
+    a.push({
+      kind: "tool_call_requested",
+      calls: [{ id: "c0", name: "progress_tool", input: {} } as ToolCall],
+      usage: usage(),
+    } as TurnResult);
+    a.push({ kind: "final_response", content: "done", usage: usage() } as TurnResult);
+
+    const h = new HarnessBuilder(
+      a,
+      new ScriptedToolRegistry(),
+      new AllowAllSandbox(),
+      new NoopContextManager(),
+      new AlwaysContinuePolicy(),
+    )
+      .tool(progressTool)
+      .build();
+
+    const events: HarnessStreamEvent[] = [];
+    const r = await h.run({ task: react(8), on_stream: (e) => events.push(e) });
+    expect(r.kind).toBe("success");
+
+    const progress = events.filter((e) => e.kind === "tool_progress") as Extract<
+      HarnessStreamEvent,
+      { kind: "tool_progress" }
+    >[];
+    // Three previews, each REPLACING the previous (tail snapshots).
+    expect(progress.length).toBe(3);
+    expect(progress[0]!.call_id).toBe("c0");
+    expect(progress[0]!.name).toBe("progress_tool");
+    expect(progress[0]!.preview).toBe("line 1\n");
+    expect(progress[2]!.preview).toBe("line 1\nline 2\nline 3\n");
   });
 });
