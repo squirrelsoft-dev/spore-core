@@ -421,7 +421,42 @@ type HarnessStreamEvent struct {
 	// output_schema_violation (issue #139): the total attempt count (1 + N). The
 	// final frozen validator error rides the Content field above.
 	Attempts uint32 `json:"-"`
+	// Node is the emitting node's attribution (multi-agent routing, §E1). nil
+	// ⇒ the `node` key is omitted (byte-identical to pre-§E1). Stamped by
+	// wrapNodeSink as events flow up through combinator wrappers; the innermost
+	// leaf sets kind/agent_id and seeds path, each wrapper prepends its kind and
+	// bumps depth.
+	Node *NodeAttr `json:"-"`
 }
+
+// NodeAttr is the emitting node's attribution stamped on every stream event
+// (§E1, mirrors Rust harness/types.rs NodeAttr). Lets a multi-agent UI route a
+// frame to the emitting node. Serialized with conditional omission: agent_id
+// and path are omitted when absent/empty (byte-identical to Rust serde's
+// skip_serializing_if).
+type NodeAttr struct {
+	// Kind is the emitting node's kind: "react" (a leaf turn loop) or a
+	// combinator kind ("plan_execute", "self_verifying", "ralph",
+	// "hill_climbing"). The leaf's kind is the innermost (most specific).
+	Kind string `json:"kind"`
+	// AgentID is the leaf agent's handle (e.g. "planner"/"executor"), when the
+	// emitting node is a react leaf. Empty for combinator frames.
+	AgentID string `json:"agent_id,omitempty"`
+	// Depth is the nesting depth of the emitting leaf below the root,
+	// accumulated as the event passes through each combinator wrapper.
+	Depth uint32 `json:"depth"`
+	// Path is the root→leaf node-kind path, accumulated by the wrapper chain
+	// (outermost first). E.g. ["ralph", "plan_execute", "self_verifying", "react"].
+	Path []string `json:"path,omitempty"`
+}
+
+// NodeMut returns a pointer to the event's NodeAttr slot — the single seam the
+// node-wrapping sinks stamp through (mirrors Rust StreamEvent::node_mut).
+func (e *HarnessStreamEvent) NodeMut() **NodeAttr { return &e.Node }
+
+// Node returns the emitting node's attribution, or nil when unstamped (mirrors
+// Rust StreamEvent::node).
+func (e *HarnessStreamEvent) NodeAttr() *NodeAttr { return e.Node }
 
 // MarshalJSON serialises as a flat tagged object.
 func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
@@ -430,7 +465,8 @@ func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
 		return json.Marshal(struct {
 			Kind HarnessStreamEventKind `json:"kind"`
 			Turn uint32                 `json:"turn"`
-		}{e.Kind, e.Turn})
+			Node *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Turn, e.Node})
 	case HarnessStreamTurnEnd:
 		usage := e.Usage
 		if usage == nil {
@@ -440,7 +476,8 @@ func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
 			Kind  HarnessStreamEventKind `json:"kind"`
 			Turn  uint32                 `json:"turn"`
 			Usage TokenUsage             `json:"usage"`
-		}{e.Kind, e.Turn, *usage})
+			Node  *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Turn, *usage, e.Node})
 	case HarnessStreamToolCall:
 		// Q5: carry the final args. Default to JSON null so pre-#103 consumers
 		// (and fixtures that omit it) round-trip.
@@ -453,7 +490,8 @@ func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
 			CallID string                 `json:"call_id"`
 			Name   string                 `json:"name"`
 			Args   json.RawMessage        `json:"args"`
-		}{e.Kind, e.CallID, e.Name, args})
+			Node   *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.CallID, e.Name, args, e.Node})
 	case HarnessStreamToolResult:
 		return json.Marshal(struct {
 			Kind    HarnessStreamEventKind `json:"kind"`
@@ -461,70 +499,82 @@ func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
 			IsError bool                   `json:"is_error"`
 			Content string                 `json:"content"`
 			Revised bool                   `json:"revised"`
-		}{e.Kind, e.CallID, e.IsError, e.ResultContent, e.Revised})
+			Node    *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.CallID, e.IsError, e.ResultContent, e.Revised, e.Node})
 	case HarnessStreamFinalResponse:
 		return json.Marshal(struct {
 			Kind    HarnessStreamEventKind `json:"kind"`
 			Content string                 `json:"content"`
-		}{e.Kind, e.Content})
+			Node    *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Content, e.Node})
 	case HarnessStreamUserMessage:
 		return json.Marshal(struct {
 			Kind    HarnessStreamEventKind `json:"kind"`
 			Content string                 `json:"content"`
 			Steered bool                   `json:"steered"`
-		}{e.Kind, e.Content, e.Steered})
+			Node    *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Content, e.Steered, e.Node})
 	case HarnessStreamBudgetWarning:
 		return json.Marshal(struct {
 			Kind      HarnessStreamEventKind `json:"kind"`
 			LimitType BudgetLimitType        `json:"limit_type"`
-		}{e.Kind, e.LimitType})
+			Node      *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.LimitType, e.Node})
 	case HarnessStreamTextDelta, HarnessStreamReasoningDelta:
 		return json.Marshal(struct {
 			Kind    HarnessStreamEventKind `json:"kind"`
 			Content string                 `json:"content"`
-		}{e.Kind, e.Content})
+			Node    *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Content, e.Node})
 	case HarnessStreamToolArgsDelta:
 		return json.Marshal(struct {
 			Kind        HarnessStreamEventKind `json:"kind"`
 			CallID      string                 `json:"call_id"`
 			PartialJSON string                 `json:"partial_json"`
-		}{e.Kind, e.CallID, e.PartialJSON})
+			Node        *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.CallID, e.PartialJSON, e.Node})
 	case HarnessStreamBlockStart:
 		return json.Marshal(struct {
 			Kind  HarnessStreamEventKind `json:"kind"`
 			Index uint32                 `json:"index"`
 			Block BlockKind              `json:"block"`
-		}{e.Kind, e.Index, e.Block})
+			Node  *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Index, e.Block, e.Node})
 	case HarnessStreamBlockStop:
 		return json.Marshal(struct {
 			Kind  HarnessStreamEventKind `json:"kind"`
 			Index uint32                 `json:"index"`
-		}{e.Kind, e.Index})
+			Node  *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Index, e.Node})
 	case HarnessStreamToolCallStart:
 		return json.Marshal(struct {
 			Kind   HarnessStreamEventKind `json:"kind"`
 			Index  uint32                 `json:"index"`
 			CallID string                 `json:"call_id"`
 			Name   string                 `json:"name"`
-		}{e.Kind, e.Index, e.CallID, e.Name})
+			Node   *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Index, e.CallID, e.Name, e.Node})
 	case HarnessStreamToolErrorLoopDetected, HarnessStreamToolErrorLoopBroken:
 		return json.Marshal(struct {
 			Kind              HarnessStreamEventKind `json:"kind"`
 			Tool              string                 `json:"tool"`
 			ConsecutiveErrors uint32                 `json:"consecutive_errors"`
-		}{e.Kind, e.Tool, e.ConsecutiveErrors})
+			Node              *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Tool, e.ConsecutiveErrors, e.Node})
 	case HarnessStreamOutputSchemaRetry:
 		return json.Marshal(struct {
 			Kind    HarnessStreamEventKind `json:"kind"`
 			Attempt uint32                 `json:"attempt"`
 			Error   string                 `json:"error"`
-		}{e.Kind, e.Attempt, e.Content})
+			Node    *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Attempt, e.Content, e.Node})
 	case HarnessStreamOutputSchemaViolation:
 		return json.Marshal(struct {
 			Kind     HarnessStreamEventKind `json:"kind"`
 			Attempts uint32                 `json:"attempts"`
 			Error    string                 `json:"error"`
-		}{e.Kind, e.Attempts, e.Content})
+			Node     *NodeAttr              `json:"node,omitempty"`
+		}{e.Kind, e.Attempts, e.Content, e.Node})
 	default:
 		return nil, fmt.Errorf("HarnessStreamEvent: unknown kind %q", e.Kind)
 	}
@@ -3806,6 +3856,33 @@ func NewStandardHarness(c HarnessConfig) *StandardHarness {
 func emit(sink StreamSink, event HarnessStreamEvent) {
 	if sink != nil {
 		sink(event)
+	}
+}
+
+// wrapNodeSink returns a sink that stamps each event with NodeAttr attribution
+// as it flows up through a node-wrapping sink (mirrors Rust
+// harness/types.rs::wrap_node_sink). The leaf sets kind/agent_id and seeds path
+// (depth 0); each combinator wrapper PREPENDS its kind to path and bumps depth.
+// The innermost leaf wins (set-once): a wrapper only fills an unstamped slot,
+// otherwise it prepends to the existing path. Returns nil when parent is nil so
+// an un-attributed run stays byte-identical.
+func wrapNodeSink(parent StreamSink, kind string, agentID string) StreamSink {
+	if parent == nil {
+		return nil
+	}
+	return func(ev HarnessStreamEvent) {
+		if ev.Node == nil {
+			ev.Node = &NodeAttr{
+				Kind:    kind,
+				AgentID: agentID,
+				Depth:   0,
+				Path:    []string{kind},
+			}
+		} else {
+			ev.Node.Path = append([]string{kind}, ev.Node.Path...)
+			ev.Node.Depth++
+		}
+		parent(ev)
 	}
 }
 

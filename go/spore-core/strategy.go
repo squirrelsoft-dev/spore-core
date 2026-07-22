@@ -821,7 +821,7 @@ func (c *ReactConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 	cx.PushBudget(c.Budget, c.Behavior, "react")
 	// The leaf takes the run's stream sink for the window; combinators that
 	// recurse per-phase suppress it (they take it before recursing).
-	onStream := cx.takeStream()
+	onStream := wrapNodeSink(cx.takeStream(), "react", string(c.Agent))
 	// Issue 2: thread THIS leaf's toolset handle down so the window dispatches the
 	// per-node scoped catalogue (empty handle ⇒ global-catalogue fallback).
 	// Mirrors agent resolution.
@@ -927,6 +927,12 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 	// step boundaries are re-emitted on the caller's sink). Take it now and keep
 	// it OUT of cx.Stream so the recursive children run with a suppressed sink.
 	onStream := cx.takeStream()
+	// §E1: wrap the re-emission sink so step-boundary events this combinator
+	// re-emits carry a `plan_execute` node hop. The recursive children run
+	// suppressed (cx.Stream is nil), so leaf events do not flow out — only the
+	// re-emitted boundaries gain the stamp (documented Go adapter mapping; Rust
+	// flows child events through the wrapper chain, Go suppresses them).
+	nodeStream := wrapNodeSink(onStream, "plan_execute", "")
 
 	// #131/#138: the phase-agnostic resume seed (the stalled worker conversation
 	// carried from a resumed consult or budget pause). Taken BEFORE the plan phase
@@ -1108,7 +1114,7 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 	//
 	// The shared execute context starts from baseSession (NOT the plan child's
 	// polluted session) so the directive never leaks (#93).
-	result, exhausted := c.runExecuteLoop(ctx, cx, executor, &task, baseSession, taskList, carried, totalUsage, resumeSeedSession, onStream)
+	result, exhausted := c.runExecuteLoop(ctx, cx, executor, &task, baseSession, taskList, carried, totalUsage, resumeSeedSession, nodeStream)
 	if exhausted != nil {
 		// #125: a BudgetExhausted is surfaced as a typed StrategyOutcome (NOT
 		// collapsed through finish into a Failure override). Restore the parent task
