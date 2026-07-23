@@ -69,6 +69,7 @@ __all__ = [
     "ChunkProviderError",
     "CompositeChunkProvider",
     "ContextSourcesBuilder",
+    "CustomCondition",
     "CustomPredicate",
     "EmbeddedChunkProvider",
     "InMemoryChunkProvider",
@@ -132,6 +133,10 @@ class ToolAffinity:
 # ============================================================================
 
 CustomPredicate = Callable[["AssemblyContext"], bool]
+# Rust publicly names this ``CustomCondition`` (re-exported from the crate root);
+# alias it so Python code written against the Rust public surface can import
+# ``spore_core.CustomCondition``. Mirrors Rust's ``prompt_assembly::CustomCondition``.
+CustomCondition = CustomPredicate
 
 
 class ChunkCondition:

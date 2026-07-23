@@ -69,29 +69,12 @@ from .model import (
 _TOOLS_BLOCK_OPEN = "<available_tools>"
 
 # Curated action-intent phrases. Lower-cased substring match — conservative and
-# cheap. Each phrase strongly implies "I am about to use a tool". Byte-identical
-# to the Rust ``ACTION_PHRASES`` list.
-ACTION_PHRASES: tuple[str, ...] = (
-    "i'll use",
-    "i will use",
-    "i'll call",
-    "i will call",
-    "i'll run",
-    "i will run",
-    "let me use",
-    "let me call",
-    "let me run",
-    "i need to use",
-    "i need to call",
-    "i should use",
-    "i should call",
-    "i'll invoke",
-    "i will invoke",
-    "using the",
-    "i can use the",
-    "i'm going to use",
-    "i am going to use",
-)
+# cheap. Each phrase strongly implies "I am about to use a tool". This is the
+# SAME extended list as ``tool_call_repair.ACTION_PHRASES`` (the authoritative
+# detector): the runtime prose-response escalation and the tool-call-repair seam
+# share one phrase table so a prose response Rust escalates is also escalated
+# here. Re-exported from ``tool_call_repair`` to stay in sync.
+from .tool_call_repair import ACTION_PHRASES  # noqa: E402,F401
 
 # ``<tool_call><name>..</name><input>{json}</input></tool_call>`` — non-greedy,
 # dot-matches-newline. Mirrors the Rust ``(?s)`` regex.
@@ -359,15 +342,16 @@ def detect_prose_response(text: str, tools_advertised: bool) -> str | None:
     costs one extra turn, but a false positive activates prompt-based mode for a
     model that was simply giving a final answer. A bare final answer with no
     action-intent language is therefore **not** classified as a prose response.
+
+    Delegates to the unified :func:`spore_core.tool_call_repair.detect_prose_response`
+    (the authoritative extended phrase table) so the runtime escalation path and
+    the tool-call-repair seam share one detector.
     """
-    if not tools_advertised:
-        return None
-    trimmed = text.strip()
-    if not trimmed:
-        return None
-    lower = trimmed.lower()
-    if any(phrase in lower for phrase in ACTION_PHRASES):
-        return trimmed
+    from .tool_call_repair import detect_prose_response as _detect, ProseResponse
+
+    failure = _detect(text, tools_advertised)
+    if isinstance(failure, ProseResponse):
+        return failure.text
     return None
 
 

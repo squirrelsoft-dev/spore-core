@@ -531,3 +531,73 @@ async def test_fixture_replay(scenario: dict[str, Any], tmp_path: Path) -> None:
     # Byte-identical TSV where the scenario embeds it.
     if "expected_tsv" in scenario:
         assert tsv == scenario["expected_tsv"]
+
+
+# ---------------------------------------------------------------------------
+# VCS-aware revert (§5.3): revert targets the last ACCEPTED candidate SHA,
+# not HEAD; winner applied at stagnation exit.
+# ---------------------------------------------------------------------------
+
+
+class ShaVcs:
+    """A VcsProvider that returns rising SHAs from head/commit_checkpoint and
+    records reset_to calls, to prove the climb reverts to the last accepted
+    candidate (not HEAD)."""
+
+    def __init__(self) -> None:
+        self.reset_to_calls: list[str] = []
+        self.revert_count = 0
+        self._counter = 0
+        self._head = "sha-0"
+
+    async def log(self, args: Any) -> str:
+        return ""
+
+    async def status(self) -> str:
+        return ""
+
+    async def revert(self) -> None:
+        self.revert_count += 1
+
+    async def head(self) -> str:
+        return self._head
+
+    async def commit_checkpoint(self, label: str) -> str:
+        self._counter += 1
+        sha = f"sha-{self._counter}"
+        self._head = sha
+        return sha
+
+    async def reset_to(self, sha: str) -> None:
+        self.reset_to_calls.append(sha)
+
+
+async def test_vcs_aware_revert_targets_last_accepted_sha(tmp_path: Path) -> None:
+    sb = RecordingSandbox(tmp_path)
+    # minimize: baseline 5.0, then a worse 7.0 (discarded → revert to last kept).
+    ev = ScriptedEvaluator([5.0, 7.0], direction="minimize")
+    vcs = ShaVcs()
+    task = _task(direction="minimize", max_stagnation=1, revert=True)
+    h = StandardHarness(_config(sandbox=sb, evaluator=ev, vcs_provider=vcs))
+    r = await h.run(HarnessRunOptions(task))
+    assert isinstance(r, RunResultFailure)
+    # The discarded iteration reverted via reset_to (the last accepted SHA),
+    # NOT via revert() (HEAD).
+    assert vcs.revert_count == 0, "revert() must NOT fire when a SHA is known"
+    assert vcs.reset_to_calls, "reset_to must be called with the last accepted SHA"
+    # The winner is applied at stagnation exit (reset_to best_sha).
+    assert vcs.reset_to_calls[-1].startswith("sha-")
+
+
+async def test_vcs_winner_applied_at_stagnation(tmp_path: Path) -> None:
+    sb = RecordingSandbox(tmp_path)
+    # minimize: baseline 5.0, worse 7.0 (discard), worse 8.0 (discard) → stagnation=2.
+    ev = ScriptedEvaluator([5.0, 7.0, 8.0], direction="minimize")
+    vcs = ShaVcs()
+    task = _task(direction="minimize", max_stagnation=2, revert=True)
+    h = StandardHarness(_config(sandbox=sb, evaluator=ev, vcs_provider=vcs))
+    r = await h.run(HarnessRunOptions(task))
+    assert isinstance(r, RunResultFailure)
+    assert isinstance(r.reason, HaltReasonStagnationLimitReached)
+    # Winner application: the last reset_to is the best_sha (the baseline's SHA).
+    assert vcs.reset_to_calls, "winner must be applied at stagnation exit"

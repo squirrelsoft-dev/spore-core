@@ -82,6 +82,7 @@ from pydantic import (
     Field,
     SerializerFunctionWrapHandler,
     TypeAdapter,
+    field_serializer,
     model_serializer,
 )
 
@@ -547,6 +548,22 @@ class HillClimbingConfig(_Model):
     # #129: what this combinator does when its optimization-loop budget is spent.
     # CANONICAL POSITION on a combinator: the LAST field. Always serialized (Q1).
     behavior: BudgetExhaustedBehavior = Field(default_factory=default_budget_behavior)
+
+
+@dataclass
+class HillCandidate:
+    """Durable candidate pointers threaded through the HillClimbing climb
+    (mirrors Rust's ``HillCandidate``).
+
+    ``current_*`` is where the next neighbor branches from; ``best_*`` is the
+    best artifact ever accepted. Equal under strict greedy, tracked separately
+    from day one (D2). ``current_sha``/``best_sha`` are ``None`` when no usable
+    VCS is wired — the climb then degrades to its pre-fix score-only behaviour."""
+
+    current_sha: str | None
+    best_sha: str | None
+    current_best: float
+    best_score: float
 
 
 LoopStrategy = Annotated[
@@ -1116,6 +1133,17 @@ class RunScratch:
     # ``ContinueWithBudget`` arm (#138 budget). ``None`` on a fresh run / after the
     # seed is consumed. Mirrors Rust's ``RunScratch::resume_seed``.
     resume_seed: SessionState | None = None
+    # ``True`` while the current ReAct window is an EXECUTE step of a PlanExecute
+    # walk (set by ``_run_plan_execute_config`` before dispatching the execute
+    # leaf, consumed by the react loop). Drives the structural ``tool_call_nudge``
+    # (an execute turn that called zero tools while tools were advertised). Runtime-only.
+    in_execute_step: bool = False
+    # Forced output schema for a plan-empty REPAIR re-ask (#139): when set
+    # (by ``run_plan_subtree`` on a retry), the plan leaf VALIDATES its terminal
+    # against this schema instead of the leaf's own declared ``output``. Mirrors
+    # Rust's ``forced_output_schema`` threaded through ``drive_strategy_with_resume_seed``.
+    # Consumed (cleared) by ``_run_react_config``. Runtime-only.
+    forced_output_schema: dict[str, Any] | None = None
 
 
 @dataclass
@@ -1377,6 +1405,7 @@ class StrategyExecutor(Protocol):
         output_schema: dict[str, Any] | None = None,
         output_schema_max_retries: int = 0,
         system_prompt: str | None = None,
+        in_execute_step: bool = False,
     ) -> RunResult:
         """Run ONE bounded ReAct turn-loop window (the leaf primitive) on the
         resolved worker ``agent`` (#124). Issue 2: ``toolset`` is the leaf's
@@ -1495,9 +1524,11 @@ class StrategyExecutor(Protocol):
 
     def plan_directive(self, instruction: str) -> str:
         """The planning directive seeded before the plan sub-strategy runs (R1) —
-        the "respond with a single JSON plan" instruction wrapped around the
-        task. Seeded by the recursive PlanExecute ``run`` body before it dispatches
-        ``self.plan`` (#124)."""
+        the "record your plan via the ``set_plan`` tool" instruction wrapped
+        around the task: the canonical authoring path (#126 decision C). The
+        retry nudge still asks for JSON message content because retries run with
+        tools suppressed (``set_plan`` unavailable). Seeded by the recursive
+        PlanExecute ``run`` body before it dispatches ``self.plan`` (#124)."""
         ...
 
     async def seed_user_message(self, session_state: SessionState, text: str) -> None:
@@ -1513,13 +1544,17 @@ class StrategyExecutor(Protocol):
         plan_task: Task,
         plan_session: SessionState,
         budget_used: BudgetSnapshot,
+        forced_output_schema: dict[str, Any] | None = None,
     ) -> RunResult | None:
         """Dispatch the plan sub-strategy ``plan`` for ``plan_task`` over
         ``plan_session``, returning its terminal :class:`RunResult` (#124).
         Genuinely recursive — the child's ``run`` drives its whole loop. Routes the
         configured ``planner_agent`` (R5/R6) by running the child against an
         agent-swapped child harness when one is set; otherwise the default agent
-        runs the plan turns. ``None`` ⇒ the child produced no terminal."""
+        runs the plan turns. ``None`` ⇒ the child produced no terminal.
+        ``forced_output_schema`` (a plan-empty REPAIR re-ask, #139) forces the
+        plan leaf to validate its terminal against this schema instead of its own
+        declared ``output``; ``None`` ⇒ the leaf's own schema (byte-identical)."""
         ...
 
     async def capture_plan_artifact(
@@ -1600,6 +1635,13 @@ class StrategyExecutor(Protocol):
         """The number of EXTRA terminal-validation retry turns ``N`` granted under
         output-schema enforcement (issue #139; total attempts = ``1 + N``). Read
         by :func:`_run_react_config` to thread into the window. Default ``2``."""
+        ...
+
+    def plan_empty_max_retries(self) -> int:
+        """The plan-empty re-ask cap (mirrors Rust's
+        ``HarnessConfig::plan_empty_max_retries``): when ``> 0``, an empty plan is
+        re-asked up to this many more times before halting with ``EmptyPlan``.
+        ``0`` (default) preserves the historical single-shot behavior."""
         ...
 
 
@@ -1724,13 +1766,18 @@ def _self_verifying_partial_json(last_worker_output: str, last_verdict: str) -> 
     )
 
 
-def _hill_climbing_partial_json(best_score: float) -> str:
-    """HillClimbing partial: the best candidate value + its score (#125, fork
-    #2)."""
-    return json.dumps(
-        {"node": "hill_climbing", "best_candidate": best_score, "score": best_score},
-        separators=(",", ":"),
-    )
+def _hill_climbing_partial_json(best_score: float, best_sha: str | None = None) -> str:
+    """HillClimbing partial: the best candidate value + its score (+ SHA when a
+    usable VCS is wired) (#125, fork #2). Mirrors Rust's
+    ``hill_climbing_partial_json``."""
+    obj: dict[str, Any] = {
+        "node": "hill_climbing",
+        "best_candidate": best_score,
+        "score": best_score,
+    }
+    if best_sha:
+        obj["best_sha"] = best_sha
+    return json.dumps(obj, separators=(",", ":"))
 
 
 def _promote_budget_exhausted(
@@ -1972,6 +2019,14 @@ async def _run_react_config(self: ReactConfig, cx: ExecutionContext) -> Strategy
         resolved = cx.registry.resolve_schema(self.output)
         if isinstance(resolved, dict):
             output_schema = resolved
+    # Plan-empty REPAIR re-ask (#139): a forced schema (threaded via the scratch
+    # by ``run_plan_subtree``) OVERRIDES the leaf's own declared ``output`` so a
+    # re-ask is guided-decoded into valid ``{tasks, rationale}`` JSON. Consumed
+    # (cleared) here so it never leaks past this leaf. Mirrors Rust's
+    # ``forced_output_schema`` threaded through ``drive_strategy_with_resume_seed``.
+    if cx.scratch.forced_output_schema is not None:
+        output_schema = cx.scratch.forced_output_schema
+        cx.scratch.forced_output_schema = None
     output_schema_max_retries = executor.output_schema_max_retries()
     if output_schema is not None:
         # AC1: append the resolved schema to the leaf's directive/system context
@@ -1991,9 +2046,17 @@ async def _run_react_config(self: ReactConfig, cx: ExecutionContext) -> Strategy
     # nested leaf does not).
     cx.push_budget(self.budget, self.behavior, "react")
     # The leaf takes the run's stream sink for the window. Combinators that
-    # recurse per-phase suppress it (they take it before recursing).
-    on_stream = cx.stream
+    # recurse per-phase suppress it (they take it before recursing). Wrap it so
+    # every event this leaf emits is attributed to THIS node (kind ``react`` +
+    # the resolved agent handle). ``agent_id`` is ``None`` when the handle is
+    # empty (mirrors Rust's `(!self.agent.0.is_empty()).then(...)`).
+    on_stream = wrap_node_sink(cx.stream, "react", self.agent or None)
     cx.stream = None
+    # Consume the EXECUTE-step marker for THIS leaf (mirrors Rust's
+    # ``std::mem::take(&mut cx.scratch.in_execute_step)``) so a sibling leaf in a
+    # nested execute strategy cannot inherit it accidentally.
+    in_execute_step = cx.scratch.in_execute_step
+    cx.scratch.in_execute_step = False
     result = await executor.react_window(
         task,
         max_iterations,
@@ -2013,6 +2076,9 @@ async def _run_react_config(self: ReactConfig, cx: ExecutionContext) -> Strategy
         # (``None`` ⇒ the window keeps using the global prompt). Mirrors
         # ``self.toolset``.
         self.system_prompt,
+        # Mark EXECUTE-phase windows so the structural ``tool_call_nudge`` can
+        # fire (mirrors Rust's ``cx.scratch.in_execute_step``).
+        in_execute_step,
     )
     await executor.finalize(result)
 
@@ -2156,10 +2222,12 @@ async def _run_plan_execute_config(
     base_session = cx.scratch.run_session
     cx.scratch.run_session = SessionState()
     budget_used = cx.scratch.run_budget.model_copy(deep=True)
-    # PlanExecute suppresses the run's stream sink for its phases; restore it
-    # before returning so the parent-visible step boundaries are re-emitted.
+    # #stream: children inherit ``cx.stream`` and stream through it, wrapped so
+    # every event is attributed to ``plan_execute`` (mirrors Rust's
+    # ``wrap_node_sink``). The saved parent ``on_stream`` is restored on every
+    # exit so the parent-visible step boundaries are re-emitted un-attributed.
     on_stream = cx.stream
-    cx.stream = None
+    cx.stream = wrap_node_sink(on_stream, "plan_execute", None)
 
     # #131/#138: the phase-agnostic resume seed (the stalled worker conversation
     # carried from a resumed consult or budget pause). Taken BEFORE the plan phase
@@ -2228,84 +2296,155 @@ async def _run_plan_execute_config(
             or all(t.status != TaskStatus.IN_PROGRESS for t in preexisting.tasks)
         )
         directive = executor.plan_directive(task.instruction)
+        # The resume seed (if any) is consumed ONCE here; the re-ask loop below
+        # re-plans from this same base session each attempt.
         if plan_resume and resume_seed_session is not None:
-            plan_session = resume_seed_session
+            plan_base = resume_seed_session
             resume_seed_session = None
         else:
-            plan_session = base_session.model_copy(deep=True)
-        await executor.seed_user_message(plan_session, directive)
-        plan_task = Task(
-            id=task.id,
-            instruction=directive,
-            session_id=session_id,
-            budget=task.budget.model_copy(deep=True),
-            loop_strategy=self.plan,
-        )
-        plan_result = await executor.run_plan_subtree(
-            self.plan, plan_task, plan_session, budget_used.model_copy(deep=True)
-        )
-        if isinstance(plan_result, RunResultSuccess):
-            plan_output, plan_usage, plan_turns = (
-                plan_result.output,
-                plan_result.usage,
-                plan_result.turns,
+            plan_base = base_session.model_copy(deep=True)
+
+        # Plan-empty re-ask loop. A reasoning model can route its plan into the
+        # reasoning channel, leaving the message CONTENT empty so the strict +
+        # prose capture yields no tasks. Rather than halting on the FIRST empty
+        # plan, re-ask up to ``plan_empty_max_retries`` more times — nudging the
+        # planner to emit the plan as message content — before falling through to
+        # ``EmptyPlan``. A cap of ``0`` (the default) preserves the historical
+        # single-shot behaviour byte-for-byte: the loop runs once and the
+        # ``attempt >= max`` guard fires immediately on an empty plan, with zero
+        # discarded usage to fold. Mirrors Rust's plan_execute.rs.
+        plan_empty_max = executor.plan_empty_max_retries()
+        # The re-ask runs with tools SUPPRESSED: a reasoning model offered the
+        # full toolset tends to derail into a tool call (or pure reasoning)
+        # instead of emitting the plan; with no tools it must answer in content.
+        # The first attempt keeps tools (it may research). Built ONLY when re-asks
+        # are enabled — at the default cap of ``0`` the loop is single-shot and
+        # this clone would be wasted (keeps the historical no-retry path
+        # byte-identical and allocation-free).
+        retry_plan = plan_with_tools_suppressed(self.plan) if plan_empty_max > 0 else None
+        # Usage from discarded (empty) attempts, folded into whichever artifact
+        # terminates the loop so the carried budget counts them.
+        discarded_usage = AggregateUsage()
+        attempt = 0
+        while True:
+            active_plan = self.plan if attempt == 0 else (retry_plan or self.plan)
+            # Per-attempt plan session: the seeded directive, plus — on a retry —
+            # a corrective nudge demanding the plan as content.
+            plan_session = plan_base.model_copy(deep=True)
+            await executor.seed_user_message(plan_session, directive)
+            if attempt > 0:
+                # The trailing ``/no_think`` is a soft thinking-suppression hint:
+                # reasoning models that honor it stop routing the plan into the
+                # reasoning channel and emit it as content; models that don't
+                # simply ignore the token.
+                nudge = (
+                    "Your previous response produced no usable plan "
+                    "(no JSON object, and no tasks were authored). Output the "
+                    "plan NOW as a single JSON object in your MESSAGE CONTENT: "
+                    '{"tasks": [<ordered step strings>], "rationale": '
+                    "<string>}. Do NOT put the plan only in your reasoning, and "
+                    "do NOT call any tools. /no_think"
+                )
+                await executor.seed_user_message(plan_session, nudge)
+            plan_task = Task(
+                id=task.id,
+                instruction=directive,
+                session_id=session_id,
+                budget=task.budget.model_copy(deep=True),
+                loop_strategy=active_plan,
             )
-        elif plan_result is None:
-            cx.stream = on_stream
-            result = RunResultFailure(
-                reason=HaltReasonPlanPhaseFailed(
-                    error=PlanPhaseErrorPayload(
-                        kind="planning_turn_failed",
-                        message="plan sub-strategy produced no terminal",
+            # #139: the trusted first attempt runs UNCONSTRAINED; each repair
+            # re-ask FORCES the plan schema (→ ``response_format``), so a model
+            # that answered in prose is now made to emit valid
+            # ``{tasks, rationale}`` JSON.
+            forced_schema = plan_output_schema() if attempt > 0 else None
+            plan_result = await executor.run_plan_subtree(
+                active_plan,
+                plan_task,
+                plan_session,
+                budget_used.model_copy(deep=True),
+                forced_schema,
+            )
+            if isinstance(plan_result, RunResultSuccess):
+                plan_output, plan_usage, plan_turns = (
+                    plan_result.output,
+                    plan_result.usage,
+                    plan_result.turns,
+                )
+            elif plan_result is None:
+                cx.stream = on_stream
+                result = RunResultFailure(
+                    reason=HaltReasonPlanPhaseFailed(
+                        error=PlanPhaseErrorPayload(
+                            kind="planning_turn_failed",
+                            message="plan sub-strategy produced no terminal",
+                        ),
                     ),
-                ),
-                session_id=session_id,
-                usage=AggregateUsage(),
-                turns=budget_used.turns,
-                session_state=SessionState(),
-            )
-            return await cx._finish(executor, task, result)
-        else:
-            # A non-success plan terminal (budget / agent error / pause)
-            # propagates verbatim — the run never reaches execute.
-            cx.stream = on_stream
-            return await cx._finish(executor, task, plan_result)
+                    session_id=session_id,
+                    usage=AggregateUsage(),
+                    turns=budget_used.turns,
+                    session_state=SessionState(),
+                )
+                return await cx._finish(executor, task, result)
+            else:
+                # A non-success plan terminal (budget / agent error / pause)
+                # propagates verbatim — the run never reaches execute.
+                cx.stream = on_stream
+                return await cx._finish(executor, task, plan_result)
 
-        # Capture + persist the artifact from the plan child's output (R3/R4/R11) —
-        # the harness-side machinery, no model turn.
-        outcome = await executor.capture_plan_artifact(
-            session_id, plan_output, plan_usage, plan_turns
-        )
-        if not isinstance(outcome, _PlanPhaseOutcome):
-            cx.stream = on_stream
-            return await cx._finish(executor, task, outcome)
-
-        # #126 decision C: the runnable task list comes from the persisted
-        # ``task_list`` tool store (the ONE authoring path — it can carry real
-        # blockers). Fall back to the linear plan-artifact bridge only when nothing
-        # was authored via the tool (back-compat with the #59/#124 plan-only path
-        # and its replay fixtures).
-        persisted = await executor.load_task_list(session_id)
-        if isinstance(persisted, TaskList) and persisted.tasks:
-            task_list = persisted
-        else:
-            # The fallback intentionally uses the deprecated linear bridge
-            # (decision C keeps it working for the plan-only back-compat path);
-            # silence its DeprecationWarning here (mirrors Rust's
-            # ``#[allow(deprecated)]``).
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                task_list = plan_artifact_to_task_list(outcome.artifact)
-        if not task_list.tasks:
-            cx.stream = on_stream
-            result = RunResultFailure(
-                reason=HaltReasonEmptyPlan(),
-                session_id=session_id,
-                usage=outcome.usage,
-                turns=outcome.turns,
-                session_state=SessionState(),
+            # Capture + persist the artifact from the plan child's output
+            # (R3/R4/R11) — the harness-side machinery, no model turn.
+            outcome = await executor.capture_plan_artifact(
+                session_id, plan_output, plan_usage, plan_turns
             )
-            return await cx._finish(executor, task, result)
+            if not isinstance(outcome, _PlanPhaseOutcome):
+                cx.stream = on_stream
+                return await cx._finish(executor, task, outcome)
+
+            # #126 decision C: the runnable task list comes from the persisted
+            # ``task_list`` tool store (the ONE authoring path — it can carry
+            # real blockers). Fall back to the linear plan-artifact bridge only
+            # when nothing was authored via the tool (back-compat with the
+            # #59/#124 plan-only path and its replay fixtures).
+            persisted = await executor.load_task_list(session_id)
+            if isinstance(persisted, TaskList) and persisted.tasks:
+                task_list = persisted
+            else:
+                # The fallback intentionally uses the deprecated linear bridge
+                # (decision C keeps it working for the plan-only back-compat
+                # path); silence its DeprecationWarning here (mirrors Rust's
+                # ``#[allow(deprecated)]``).
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    task_list = plan_artifact_to_task_list(outcome.artifact)
+
+            if task_list.tasks:
+                # A retry produced a usable plan: fold usage from discarded
+                # empty attempts into the successful artifact so carried budget
+                # and final accounting include every model turn, matching Rust.
+                outcome.usage.input_tokens += discarded_usage.input_tokens
+                outcome.usage.output_tokens += discarded_usage.output_tokens
+                break
+
+            # Empty plan: re-ask while attempts remain, else halt with
+            # ``EmptyPlan`` (reporting every attempt's usage).
+            if attempt >= plan_empty_max:
+                cx.stream = on_stream
+                final_usage = outcome.usage.model_copy(deep=True)
+                final_usage.input_tokens += discarded_usage.input_tokens
+                final_usage.output_tokens += discarded_usage.output_tokens
+                result = RunResultFailure(
+                    reason=HaltReasonEmptyPlan(),
+                    session_id=session_id,
+                    usage=final_usage,
+                    turns=outcome.turns,
+                    session_state=SessionState(),
+                )
+                return await cx._finish(executor, task, result)
+            # Fold this attempt's usage and re-ask.
+            discarded_usage.input_tokens += outcome.usage.input_tokens
+            discarded_usage.output_tokens += outcome.usage.output_tokens
+            attempt += 1
 
         # #126 AC5: re-check the WHOLE graph for cycles at execute entry (defense in
         # depth — ``add_task`` already rejects cycles, but the persisted store
@@ -2471,10 +2610,18 @@ async def _run_plan_execute_config(
         cx.scratch.task = step_task
         cx.scratch.run_session = step_session
         cx.scratch.run_budget = carried.model_copy(deep=True)
+        # Mark this as an EXECUTE step so the react loop's structural
+        # ``tool_call_nudge`` can fire (an execute turn that called zero tools
+        # while tools were advertised). Mirrors Rust's
+        # ``cx.scratch.in_execute_step = more_tasks_pending;`` (taken/restored
+        # after the step). Runtime-only.
+        _prev_in_execute_step = cx.scratch.in_execute_step
+        cx.scratch.in_execute_step = True
         # #125: absolute turn count BEFORE this step, so the success path charges
         # only the DELTA against the PlanExecute scope.
         carried_before = carried.turns
         step_outcome = await run_strategy(self.execute, cx)
+        cx.scratch.in_execute_step = _prev_in_execute_step
 
         # ── BudgetExhausted (#125 rule 4/7) — resolve THIS scope. ────────────
         if isinstance(step_outcome, StrategyOutcomeBudgetExhausted):
@@ -2782,9 +2929,10 @@ async def _run_self_verifying_config(
     session_state = cx.scratch.resume_seed or cx.scratch.run_session
     cx.scratch.resume_seed = None
     carried = cx.scratch.run_budget.model_copy(deep=True)
-    # Suppress the run's stream sink for the recursive child phases.
+    # #stream: children stream through the wrapped sink so every event is
+    # attributed to ``self_verifying`` (mirrors Rust's ``wrap_node_sink``).
     on_stream = cx.stream
-    cx.stream = None
+    cx.stream = wrap_node_sink(on_stream, "self_verifying", None)
 
     # Q1a: resolve the verifier from ``evaluator``'s key (NO wire change).
     verifier = cx.registry.resolve_verifier(self.evaluator)
@@ -3058,7 +3206,7 @@ async def _run_ralph_config(self: RalphConfig, cx: ExecutionContext) -> Strategy
         return executor
     task = cx._current_task()
     on_stream = cx.stream
-    cx.stream = None
+    cx.stream = wrap_node_sink(on_stream, "ralph", None)
     cx.scratch.run_session = SessionState()
     max_resets = max(executor.ralph_max_resets(), 1)
 
@@ -3176,7 +3324,7 @@ async def _run_hill_climbing_config(
     session_id = task.session_id
     task_id = task.id
     on_stream = cx.stream
-    cx.stream = None
+    cx.stream = wrap_node_sink(on_stream, "hill_climbing", None)
     carried = cx.scratch.run_budget.model_copy(deep=True)
     cx.scratch.run_session = SessionState()
     direction = self.direction
@@ -3221,6 +3369,15 @@ async def _run_hill_climbing_config(
         cx.stream = on_stream
         return await cx._finish(executor, task, baseline)
     current_best = baseline
+    # Resolve the workspace's start SHA (None when no usable VCS) and seed the
+    # durable candidate pointers (mirrors Rust's HillCandidate).
+    start_sha = await executor._hill_climbing_head_sha()
+    cand = HillCandidate(
+        current_sha=start_sha,
+        best_sha=start_sha,
+        current_best=baseline,
+        best_score=baseline,
+    )
 
     stagnation = 0
     iteration = 1
@@ -3247,7 +3404,7 @@ async def _run_hill_climbing_config(
             ):
                 continue
             await executor.hill_write_tsv(task_id, rows)
-            partial = _hill_climbing_partial_json(current_best)
+            partial = _hill_climbing_partial_json(cand.best_score, cand.best_sha)
             cx.pop_budget()
             cx.scratch.task = task
             cx.stream = on_stream
@@ -3282,6 +3439,9 @@ async def _run_hill_climbing_config(
         limit_type = executor.budget_exceeded(task.budget, carried, started_at)
         if limit_type is not None:
             await executor.hill_write_tsv(task_id, rows)
+            # Winner application (§4.6): a wall/cost/token budget halt is a
+            # terminal exit — leave the best accepted candidate on disk.
+            await executor._hill_apply_winner(cand.best_sha)
             cx.pop_budget()
             cx.stream = on_stream
             result: RunResult = RunResultFailure(
@@ -3312,7 +3472,7 @@ async def _run_hill_climbing_config(
         # BudgetExhausted (partial = best candidate + score).
         if isinstance(iter_outcome, StrategyOutcomeBudgetExhausted):
             await executor.hill_write_tsv(task_id, rows)
-            partial = _hill_climbing_partial_json(current_best)
+            partial = _hill_climbing_partial_json(cand.best_score, cand.best_sha)
             scope = cx.budgets.current()
             assert scope is not None, "hill_climbing scope pushed above"
             err = BudgetExhausted(
@@ -3356,11 +3516,19 @@ async def _run_hill_climbing_config(
             current_best,
             rows,
             span_seq,
+            cand,
         )
+        # ``hill_iteration`` mutates ``cand`` (commit-on-keep, reset-on-discard);
+        # mirror its ``current_best`` so the loop's budget partials stay in sync.
+        current_best = cand.current_best
+
         stagnation = stagnation + 1 if non_improvement else 0
 
         if max_stagnation is not None and stagnation >= max_stagnation:
             await executor.hill_write_tsv(task_id, rows)
+            # Winner application (§4.6): stagnation is the canonical HillClimbing
+            # termination — leave the best accepted candidate on disk.
+            await executor._hill_apply_winner(cand.best_sha)
             cx.pop_budget()
             cx.stream = on_stream
             result = RunResultFailure(
@@ -3415,6 +3583,47 @@ def _worker_agent_key_of(ls: LoopStrategy) -> str:
     if isinstance(ls, HillClimbingConfig):
         return _worker_agent_key_of(ls.inner)
     raise AssertionError(f"unknown loop strategy: {ls!r}")  # pragma: no cover
+
+
+# The sentinel toolset handle that advertises NO tools (mirrors Rust's
+# ``NO_TOOLS_TOOLSET``). A plan re-ask run through it advertises no tools so a
+# reasoning model must answer in content instead of derailing into a tool call.
+NO_TOOLS_TOOLSET = "__none__"
+
+
+def plan_with_tools_suppressed(ls: LoopStrategy) -> LoopStrategy:
+    """Clone ``ls`` with the worker leaf's toolset set to
+    :data:`NO_TOOLS_TOOLSET` (mirrors Rust's ``plan_with_tools_suppressed``).
+    Descends the worker child chain so a nested plan combinator suppresses the
+    innermost leaf. Used by the plan-empty REPAIR re-ask so the planner emits the
+    plan as message content instead of calling a tool."""
+    cloned = ls.model_copy(deep=True)
+    if isinstance(cloned, ReactConfig):
+        cloned.toolset = NO_TOOLS_TOOLSET
+    elif isinstance(cloned, PlanExecuteConfig):
+        cloned.plan = plan_with_tools_suppressed(cloned.plan)
+    elif isinstance(cloned, SelfVerifyingConfig):
+        cloned.inner = plan_with_tools_suppressed(cloned.inner)
+    elif isinstance(cloned, RalphConfig):
+        cloned.inner = plan_with_tools_suppressed(cloned.inner)
+    elif isinstance(cloned, HillClimbingConfig):
+        cloned.inner = plan_with_tools_suppressed(cloned.inner)
+    return cloned
+
+
+def plan_output_schema() -> dict[str, Any]:
+    """The JSON schema the plan-empty REPAIR forces on a re-ask (#139): the
+    canonical ``{ tasks: [string], rationale: string }`` plan contract. Mirrors
+    Rust's ``plan_output_schema``. Delivered as the forced output schema so the
+    planner is guided-decoded into valid JSON instead of free prose."""
+    return {
+        "type": "object",
+        "properties": {
+            "tasks": {"type": "array", "items": {"type": "string"}},
+            "rationale": {"type": "string"},
+        },
+        "required": ["tasks", "rationale"],
+    }
 
 
 def _worker_toolset_of(ls: LoopStrategy) -> ToolsetRef:
@@ -3526,17 +3735,88 @@ class BlockKind(str, Enum):
     TOOL_USE = "tool_use"
 
 
-class StreamTurnStart(_Model):
+class NodeAttr(_Model):
+    """Attribution stamped onto every :class:`HarnessStreamEvent` as it flows
+    up through the node-wrapping sinks (mirrors Rust's ``NodeAttr``).
+
+    Lets a multi-agent UI route a frame to the node that produced it.
+    ``agent_id`` is ``None`` for combinator frames; ``path`` is the root→leaf
+    node-kind path (outermost first). Serialized byte-identically to Rust:
+    ``agent_id`` is omitted when ``None`` and ``path`` is omitted when empty
+    (Rust's ``skip_serializing_if = "Option::is_none"`` / ``"Vec::is_empty"``).
+    """
+
+    kind: str
+    agent_id: str | None = None
+    depth: int = 0
+    path: list[str] = Field(default_factory=list)
+
+    def model_dump(self, **kwargs: object) -> dict[str, object]:  # type: ignore[override]
+        out = super().model_dump(**kwargs)
+        if self.agent_id is None and "agent_id" in out:
+            out.pop("agent_id", None)
+        if not self.path and "path" in out:
+            out.pop("path", None)
+        return out
+
+    def model_dump_json(self, **kwargs: object) -> str:  # type: ignore[override]
+        exclude: set[str] = set(kwargs.pop("exclude", set()))  # type: ignore[arg-type]
+        if self.agent_id is None:
+            exclude.add("agent_id")
+        if not self.path:
+            exclude.add("path")
+        return super().model_dump_json(exclude=exclude, **kwargs)  # type: ignore[arg-type]
+
+
+class _StreamEvent(_Model):
+    """Base for every harness stream event. Carries the optional ``node``
+    attribution (``None`` for an un-attributed/single-leaf run). Mirrors Rust's
+    ``#[serde(default, skip_serializing_if = "Option::is_none")]`` on ``node``:
+    when ``node`` is ``None`` it is OMITTED from serialized output so an
+    un-attributed event serializes byte-identically to before this field
+    existed."""
+
+    node: NodeAttr | None = None
+
+    @field_serializer("node")
+    def _serialize_node(self, value: NodeAttr | None) -> dict[str, object] | None:
+        # Serialize ``NodeAttr`` with Rust's ``skip_serializing_if`` rules
+        # (``agent_id`` omitted when ``None``, ``path`` omitted when empty) so a
+        # nested node serializes byte-identically whether emitted standalone or
+        # inside an event. Returns ``None`` verbatim (pydantic omits the field
+        # via the parent ``model_dump_json`` exclude).
+        if value is None:
+            return None
+        return value.model_dump()
+
+    def model_dump(self, **kwargs: object) -> dict[str, object]:  # type: ignore[override]
+        out = super().model_dump(**kwargs)
+        if self.node is None and "node" in out:
+            out.pop("node", None)
+        return out
+
+    def model_dump_json(self, **kwargs: object) -> str:  # type: ignore[override]
+        exclude: set[str] = set(kwargs.pop("exclude", set()))  # type: ignore[arg-type]
+        if self.node is None:
+            exclude.add("node")
+        return super().model_dump_json(exclude=exclude, **kwargs)  # type: ignore[arg-type]
+
+
+class StreamTurnStart(_StreamEvent):
     kind: Literal["turn_start"] = "turn_start"
     turn: int
 
 
-class StreamTurnEnd(_Model):
+class StreamTurnEnd(_StreamEvent):
     kind: Literal["turn_end"] = "turn_end"
     turn: int
+    # This turn's token usage, so a live consumer can update PER-TURN. Defaults
+    # to zero so pre-existing serialized events back-compat (matches Rust's
+    # ``#[serde(default)]``).
+    usage: TokenUsage = Field(default_factory=TokenUsage)
 
 
-class StreamToolCall(_Model):
+class StreamToolCall(_StreamEvent):
     kind: Literal["tool_call"] = "tool_call"
     call_id: str
     name: str
@@ -3545,33 +3825,59 @@ class StreamToolCall(_Model):
     args: dict[str, Any] = Field(default_factory=dict)
 
 
-class StreamToolResult(_Model):
+class StreamToolResult(_StreamEvent):
     kind: Literal["tool_result"] = "tool_result"
     call_id: str
     is_error: bool
     # The tool result content (issue #103, Q5). Defaults to ``""`` so pre-#103
     # serialized events round-trip (back-compat).
     content: str = ""
+    # ``True`` when this event REPLACES a ``ToolResult`` already emitted for the
+    # same ``call_id`` because an ``AfterTool`` middleware rewrote the result
+    # in place (``ContinueWithModification``, issue #11 / SC-9). Defaults to
+    # ``False`` for back-compat. Mirrors Rust's ``revised`` field.
+    revised: bool = False
 
 
-class StreamFinalResponse(_Model):
+class StreamFinalResponse(_StreamEvent):
     kind: Literal["final_response"] = "final_response"
     content: str
 
 
-class StreamBudgetWarning(_Model):
+class StreamBudgetWarning(_StreamEvent):
     kind: Literal["budget_warning"] = "budget_warning"
     limit_type: BudgetLimitTypeT
 
 
-class StreamUserMessage(_Model):
+class StreamUserMessage(_StreamEvent):
     """Out-of-band, prominent message to the user (issue #81). Emitted by the
     loop when the ``send_message`` tool runs, INSTEAD of collapsing the content
-    into a normal tool result. The harness only emits the event — rendering it
-    prominently is the architect's UI concern."""
+    into a normal tool result — OR when a queued steering message is injected
+    into the run (:func:`StandardHarness` ``steering_source``). The harness only
+    emits the event — rendering it prominently is the architect's UI concern."""
 
     kind: Literal["user_message"] = "user_message"
     content: str
+    # ``True`` when this is a USER-authored steering message injected at a turn
+    # boundary; ``False`` when emitted by the ``send_message`` tool. Defaults to
+    # ``False`` for back-compat. Mirrors Rust's ``steered`` field.
+    steered: bool = False
+
+
+class StreamToolProgress(_StreamEvent):
+    """Live output from a RUNNING tool (pi-style bash streaming): emitted at
+    most every ~100ms while a command runs, between the tool's
+    :class:`StreamToolCall` and its :class:`StreamToolResult`. ``preview`` is a
+    sanitized TAIL SNAPSHOT of the output so far — each event REPLACES the
+    previous preview (never append); the final full output still arrives on the
+    :class:`StreamToolResult`. Purely informational: never persisted to the
+    session and absent from the model conversation. Mirrors Rust's
+    ``StreamEvent::ToolProgress``."""
+
+    kind: Literal["tool_progress"] = "tool_progress"
+    call_id: str
+    name: str
+    preview: str = ""
 
 
 # ── Delta-level streaming (issue #103) ──────────────────────────────────────
@@ -3602,21 +3908,21 @@ class StreamUserMessage(_Model):
 # a stream that somehow omitted the start frame.
 
 
-class StreamTextDelta(_Model):
+class StreamTextDelta(_StreamEvent):
     """Streamed text fragment (``model`` ``ContentBlockDelta``)."""
 
     kind: Literal["text_delta"] = "text_delta"
     content: str
 
 
-class StreamReasoningDelta(_Model):
+class StreamReasoningDelta(_StreamEvent):
     """Streamed reasoning/thinking fragment (``model`` ``ThinkingDelta``). Q4."""
 
     kind: Literal["reasoning_delta"] = "reasoning_delta"
     content: str
 
 
-class StreamToolArgsDelta(_Model):
+class StreamToolArgsDelta(_StreamEvent):
     """Streamed tool-argument JSON fragment (``model`` ``ToolUseDelta``),
     correlated to a ``call_id`` via the open-block index."""
 
@@ -3625,7 +3931,7 @@ class StreamToolArgsDelta(_Model):
     partial_json: str
 
 
-class StreamBlockStart(_Model):
+class StreamBlockStart(_StreamEvent):
     """A content block opened (Q2). Emitted the first time a delta for an index
     is seen."""
 
@@ -3634,14 +3940,14 @@ class StreamBlockStart(_Model):
     block: BlockKind
 
 
-class StreamBlockStop(_Model):
+class StreamBlockStop(_StreamEvent):
     """A content block closed (``model`` ``ContentBlockStop``). Q2."""
 
     kind: Literal["block_stop"] = "block_stop"
     index: int
 
 
-class StreamToolCallStart(_Model):
+class StreamToolCallStart(_StreamEvent):
     """A tool-use block opened (issue #103). Emitted so consumers can correlate
     the subsequent :class:`StreamToolArgsDelta` fragments and the final coarse
     :class:`StreamToolCall` by ``call_id``. The ``name`` and ``call_id`` are the
@@ -3654,7 +3960,7 @@ class StreamToolCallStart(_Model):
     name: str
 
 
-class StreamToolErrorLoopDetected(_Model):
+class StreamToolErrorLoopDetected(_StreamEvent):
     """The consecutive-recoverable-tool-error breaker DETECTED a loop (issue
     #137): ``tool`` hit ``error_loop_threshold`` (``N``) consecutive
     identical-argument recoverable errors and ONE corrective message was
@@ -3667,7 +3973,7 @@ class StreamToolErrorLoopDetected(_Model):
     consecutive_errors: int
 
 
-class StreamToolErrorLoopBroken(_Model):
+class StreamToolErrorLoopBroken(_StreamEvent):
     """The consecutive-recoverable-tool-error breaker TRIPPED (issue #137):
     ``tool`` reached ``2 * error_loop_threshold`` (``2 * N``) consecutive
     identical-argument recoverable errors and the loop STOPPED to resolve the
@@ -3679,7 +3985,7 @@ class StreamToolErrorLoopBroken(_Model):
     consecutive_errors: int
 
 
-class StreamOutputSchemaRetry(_Model):
+class StreamOutputSchemaRetry(_StreamEvent):
     """Output-schema enforcement (issue #139) fed a validation error back and
     RETRIED: the terminal ``FinalResponse`` failed validation against the leaf's
     ``output`` schema and a retry turn was granted (within budget). A warning —
@@ -3692,7 +3998,7 @@ class StreamOutputSchemaRetry(_Model):
     error: str
 
 
-class StreamOutputSchemaViolation(_Model):
+class StreamOutputSchemaViolation(_StreamEvent):
     """Output-schema enforcement (issue #139) EXHAUSTED its retries: the terminal
     still failed validation after ``output_schema_max_retries`` extra turns (with
     budget remaining), so the run terminates with
@@ -3713,6 +4019,7 @@ HarnessStreamEvent = Annotated[
     | StreamFinalResponse
     | StreamBudgetWarning
     | StreamUserMessage
+    | StreamToolProgress
     | StreamTextDelta
     | StreamReasoningDelta
     | StreamToolArgsDelta
@@ -3727,6 +4034,32 @@ HarnessStreamEvent = Annotated[
 ]
 
 StreamSink = Callable[[HarnessStreamEvent], None]
+
+
+def wrap_node_sink(
+    parent: StreamSink | None, kind: str, agent_id: str | None = None
+) -> StreamSink | None:
+    """Wrap a parent sink so every event passing through is stamped for ONE
+    node (mirrors Rust's ``wrap_node_sink``).
+
+    The leaf installs the innermost wrapper (it sets ``kind``/``agent_id``/seeds
+    the ``path``); each enclosing combinator's wrapper PREPENDS its kind to
+    ``path`` and bumps ``depth``. Stamping is set-once for ``kind``/
+    ``agent_id`` (the innermost leaf wins) so the event reports who actually
+    spoke, with the full nesting in ``path``. Returns ``None`` when there is no
+    parent sink (no-op, baseline path)."""
+    if parent is None:
+        return None
+
+    def _wrapped(ev: HarnessStreamEvent) -> None:
+        if ev.node is None:
+            ev.node = NodeAttr(kind=kind, agent_id=agent_id, depth=0, path=[kind])
+        else:
+            ev.node.path.insert(0, kind)
+            ev.node.depth += 1
+        parent(ev)
+
+    return _wrapped
 
 
 class TurnStreamState:
@@ -4385,6 +4718,14 @@ class CommandOutput(_Model):
     truncated: bool = False
 
 
+#: Live progress sink for a RUNNING subprocess (pi-style bash streaming). Each
+#: call delivers a sanitized TAIL SNAPSHOT of the output accumulated so far —
+#: consumers REPLACE the previous preview, never append. Invoked from the
+#: executor's wait loop at most every ~100ms, and only when the snapshot
+#: changed; it must not block. Mirrors Rust's ``CommandProgressSink``.
+CommandProgressSink = Callable[[str], None]
+
+
 class FileRef(_Model):
     """Reference to a file holding offloaded tool output."""
 
@@ -4533,6 +4874,15 @@ class SandboxProvider(Protocol):
         timeout: float | None = None,
     ) -> CommandOutput: ...
 
+    async def execute_command_streaming(
+        self,
+        command: str,
+        args: list[str],
+        working_dir: Path | None = None,
+        timeout: float | None = None,
+        progress: CommandProgressSink | None = None,
+    ) -> CommandOutput: ...
+
     async def handle_large_output(
         self,
         content: str,
@@ -4615,6 +4965,28 @@ class VcsProvider(Protocol):
         climb."""
         return None
 
+    async def head(self) -> str:
+        """Return the SHA the workspace currently points at. The default returns
+        the empty string — a provider whose workspace has no commit concept
+        reports "no SHA", and the HillClimbing loop degrades to its no-VCS
+        fallback. Mirrors Rust's ``VcsProvider::head``."""
+        return ""
+
+    async def commit_checkpoint(self, label: str) -> str:
+        """Commit the current working tree as an accepted candidate and return
+        its SHA. The default returns the empty string (no-op providers cannot
+        checkpoint). Mirrors Rust's ``VcsProvider::commit_checkpoint``."""
+        _ = label
+        return ""
+
+    async def reset_to(self, sha: str) -> None:
+        """Reset the workspace to a SPECIFIC accepted candidate SHA — the
+        load-bearing fix: a no-improvement revert targets the last KEPT state,
+        not the original ``HEAD``. The default is a no-op. Mirrors Rust's
+        ``VcsProvider::reset_to``."""
+        _ = sha
+        return None
+
 
 class GitVcsProvider:
     """Real :class:`VcsProvider` that shells out to ``git`` THROUGH a
@@ -4663,6 +5035,23 @@ class GitVcsProvider:
         # raises :class:`VcsError` on a sandbox block or non-zero exit.
         await self._run(["reset", "--hard", "HEAD"])
 
+    async def head(self) -> str:
+        # ``git rev-parse HEAD`` THROUGH the sandbox. Raises :class:`VcsError`
+        # on a non-zero exit; the HillClimbing loop treats that as "no SHA".
+        return (await self._run(["rev-parse", "HEAD"])).strip()
+
+    async def commit_checkpoint(self, label: str) -> str:
+        # Stage everything EXCEPT the harness's own ``.spore/`` diagnostics: it
+        # must stay UNTRACKED so a later ``git reset --hard`` leaves the live
+        # results ledger on disk. Mirrors Rust's ``hill_climbing_commit_accepted``.
+        await self._run(["add", "-A"])
+        await self._run(["commit", "-m", label])
+        return (await self._run(["rev-parse", "HEAD"])).strip()
+
+    async def reset_to(self, sha: str) -> None:
+        # ``git reset --hard <sha>`` THROUGH the sandbox.
+        await self._run(["reset", "--hard", sha])
+
 
 class BaseSandboxProvider:
     """Concrete base class providing default implementations of
@@ -4677,6 +5066,21 @@ class BaseSandboxProvider:
 
     async def validate(self, call: ToolCall) -> SandboxViolation | None:
         return None
+
+    async def execute_command_streaming(
+        self,
+        command: str,
+        args: list[str],
+        working_dir: Path | None = None,
+        timeout: float | None = None,
+        progress: CommandProgressSink | None = None,
+    ) -> CommandOutput:
+        # Default impl ignores ``progress`` and delegates to
+        # :meth:`execute_command` — sandboxes that capture output incrementally
+        # override THIS method (and delegate ``execute_command`` to it). Mirrors
+        # Rust's ``SandboxProvider::execute_command_streaming`` default.
+        _ = progress
+        return await self.execute_command(command, args, working_dir, timeout)
 
     async def execute_command(
         self,
@@ -5864,6 +6268,12 @@ class HarnessConfig:
         consult_handlers: dict[str, ConsultHandlerEntry] | None = None,
         registry: ExecutionRegistry | None = None,
         escalation_mode: EscalationMode | None = None,
+        steering_source: Callable[[], list[str]] | None = None,
+        tool_call_repair: Any | None = None,
+        max_repair_attempts: int = 1,
+        tool_search: Any | None = None,
+        tool_call_nudge: bool = False,
+        plan_empty_max_retries: int = 0,
     ) -> None:
         # #124: the legacy single-collaborator fields (``agent`` / ``verifier`` /
         # ``planner_agent`` / ``evaluator_agent`` / ``metric_evaluator``) are GONE
@@ -6139,6 +6549,37 @@ class HarnessConfig:
 
             escalation_mode = EscalationModeSurfaceToHuman()
         self.escalation_mode: EscalationMode = escalation_mode
+        # Mid-run steering (pi-style, ``HarnessConfig::steering_source``): a
+        # callback drained at each turn boundary BEFORE the next model call —
+        # after the previous turn's tool calls fully executed, so steering
+        # redirects the next turn without ever cancelling in-flight work. Each
+        # drained message is recorded on the session via the ContextManager seam
+        # and emitted as a ``StreamUserMessage(steered=True)``. ``None`` (default)
+        # disables steering. Mirrors Rust's ``HarnessConfig::steering_source``.
+        self.steering_source: Callable[[], list[str]] | None = steering_source
+        # Tool-call repair (mirrors Rust's ``HarnessConfig::tool_call_repair``):
+        # an optional :class:`~spore_core.tool_call_repair.ToolCallRepair`
+        # applied on a recoverable dispatch error. ``None`` (default) disables
+        # repair — behaviour is byte-identical to pre-repair. ``max_repair_attempts``
+        # bounds re-dispatch (default ``1``).
+        self.tool_call_repair = tool_call_repair
+        self.max_repair_attempts: int = max_repair_attempts
+        # Deferred-tool pattern (mirrors Rust's ``HarnessConfig::tool_search``):
+        # when set, the effective per-window registry is wrapped in a
+        # :class:`~spore_core.tool_registry.ToolSearchRegistry` so only a small,
+        # description-bounded ACTIVE set is advertised. ``None`` disables it.
+        self.tool_search = tool_search
+        # Behavioral tool-call nudge (mirrors Rust's
+        # ``HarnessConfig::tool_call_nudge``): when ``True``, an EXECUTE-phase
+        # turn that called zero tools while tools were advertised is nudged to
+        # actually use a tool before reporting. Off (default) → byte-identical.
+        self.tool_call_nudge: bool = tool_call_nudge
+        # Plan-empty re-ask cap (mirrors Rust's
+        # ``HarnessConfig::plan_empty_max_retries``): when ``> 0``, an empty plan
+        # is re-asked up to this many more times (tools suppressed + forced plan
+        # schema) before halting with ``EmptyPlan``. ``0`` (default) preserves the
+        # historical single-shot behavior byte-for-byte.
+        self.plan_empty_max_retries: int = plan_empty_max_retries
 
     def with_sandbox(self, sandbox: SandboxProvider) -> HarnessConfig:
         """A full copy of this config with only ``sandbox`` swapped (#124). Every
@@ -6184,6 +6625,12 @@ class HarnessConfig:
             consult_handlers=self.consult_handlers,
             registry=self.registry,
             escalation_mode=self.escalation_mode,
+            steering_source=self.steering_source,
+            tool_call_repair=self.tool_call_repair,
+            max_repair_attempts=self.max_repair_attempts,
+            tool_search=self.tool_search,
+            tool_call_nudge=self.tool_call_nudge,
+            plan_empty_max_retries=self.plan_empty_max_retries,
         )
 
 
@@ -6340,6 +6787,17 @@ class HarnessBuilder:
         # :class:`AdaptiveToolCallModelInterface` holding the same holder. ``None``
         # on the plain constructor leaves adaptive escalation off.
         self._prompt_tool_call_flag: PromptToolCallFlag | None = None
+        # Mid-run steering callback (pi-style). ``None`` disables steering.
+        self._steering_source: Callable[[], list[str]] | None = None
+        # Tool-call repair (None disables; default 1 attempt).
+        self._tool_call_repair: Any | None = None
+        self._max_repair_attempts: int = 1
+        # Deferred-tool pattern (None disables).
+        self._tool_search: Any | None = None
+        # Behavioral tool-call nudge (off by default).
+        self._tool_call_nudge: bool = False
+        # Plan-empty re-ask cap (0 = single-shot, byte-identical).
+        self._plan_empty_max_retries: int = 0
         # Per-kind consult handlers (issue #114). Empty by default — consults
         # degrade gracefully (R6). Populated via :meth:`consult_handler`.
         self._consult_handlers: dict[str, ConsultHandlerEntry] = {}
@@ -6779,6 +7237,54 @@ class HarnessBuilder:
         self._escalation_mode = mode
         return self
 
+    def steering_source(self, source: Callable[[], list[str]]) -> HarnessBuilder:
+        """Wire a mid-run steering callback (pi-style) drained at each turn
+        boundary BEFORE the next model call — after the previous turn's tool
+        calls fully executed, so steering redirects the next turn without ever
+        cancelling in-flight work. Each drained message is recorded on the
+        session via the ContextManager seam and emitted as a
+        ``StreamUserMessage(steered=True)``. Mirrors Rust's
+        ``HarnessBuilder::steering_source``."""
+        self._steering_source = source
+        return self
+
+    def tool_call_repair(self, repair: Any, max_repair_attempts: int = 1) -> HarnessBuilder:
+        """Wire a :class:`~spore_core.tool_call_repair.ToolCallRepair` strategy
+        applied on a recoverable dispatch error (coerce weak-model tool args and
+        re-dispatch). ``max_repair_attempts`` bounds re-dispatch (default ``1``).
+        Mirrors Rust's ``HarnessBuilder::tool_call_repair``."""
+        self._tool_call_repair = repair
+        self._max_repair_attempts = max_repair_attempts
+        return self
+
+    def tool_search(self, config: Any) -> HarnessBuilder:
+        """Wire a :class:`~spore_core.tool_registry.ToolSearchConfig` so the
+        effective per-window registry is wrapped in a
+        :class:`~spore_core.tool_registry.ToolSearchRegistry` (deferred-tool
+        pattern for local models). Mirrors Rust's ``HarnessBuilder::tool_search``.
+        """
+        self._tool_search = config
+        return self
+
+    def tool_call_nudge(self, enabled: bool = True) -> HarnessBuilder:
+        """Enable the behavioral tool-call nudge (mirrors Rust's
+        ``HarnessBuilder::tool_call_nudge``): an EXECUTE-phase turn that called
+        zero tools while tools were advertised is nudged to actually use a tool
+        before reporting. Off (default) → byte-identical.
+        """
+        self._tool_call_nudge = enabled
+        return self
+
+    def plan_empty_max_retries(self, retries: int) -> HarnessBuilder:
+        """Set the plan-empty re-ask cap (mirrors Rust's
+        ``HarnessBuilder::plan_empty_max_retries``): when ``> 0``, an empty plan
+        is re-asked up to this many more times (tools suppressed + forced plan
+        schema) before halting with ``EmptyPlan``. ``0`` (default) preserves the
+        historical single-shot behavior byte-for-byte.
+        """
+        self._plan_empty_max_retries = retries
+        return self
+
     def drain_tools_into_registry(self) -> StandardToolRegistry:
         """Drain the accumulated catalogue tools into a populated
         :class:`StandardToolRegistry`, registering each with last-wins upsert
@@ -7061,6 +7567,12 @@ class HarnessBuilder:
             consult_handlers=self._consult_handlers,
             registry=self._registry,
             escalation_mode=self._escalation_mode,
+            steering_source=self._steering_source,
+            tool_call_repair=self._tool_call_repair,
+            max_repair_attempts=self._max_repair_attempts,
+            tool_search=self._tool_search,
+            tool_call_nudge=self._tool_call_nudge,
+            plan_empty_max_retries=self._plan_empty_max_retries,
         )
 
     def build(self) -> StandardHarness:
@@ -7405,6 +7917,12 @@ class StandardHarness:
         ``self._config.output_schema_max_retries``."""
         return self._config.output_schema_max_retries
 
+    def plan_empty_max_retries(self) -> int:
+        """The plan-empty re-ask cap (mirrors Rust's
+        ``HarnessConfig::plan_empty_max_retries``, :class:`StrategyExecutor`
+        accessor): returns ``self._config.plan_empty_max_retries``."""
+        return self._config.plan_empty_max_retries
+
     def storage(self) -> StorageProvider:
         """The injected :class:`StorageProvider` (issue #73). Defaults to an
         all-no-op provider when ``.storage(...)`` was never set."""
@@ -7423,7 +7941,7 @@ class StandardHarness:
         return self._config.storage.session()
 
     def _effective_tool_registry(
-        self, session_id: SessionId, toolset: ToolsetRef = ""
+        self, session_id: SessionId, toolset: ToolsetRef = "", on_stream: StreamSink | None = None
     ) -> ToolRegistry:
         """The harness-loop tool registry to use for a run keyed by
         ``session_id`` (issue #91).
@@ -7442,33 +7960,74 @@ class StandardHarness:
         Otherwise (empty handle, or non-empty handle with no per-key catalogue)
         the existing global-catalogue / ``tool_registry`` seam fallback applies, so
         examples 01–11 that use ``.tools()`` keep working byte-for-byte. Mirrors
-        Rust's ``StandardHarness::effective_tool_registry``."""
-        from .tool_registry import RealToolRegistry
+        Rust's ``StandardHarness::effective_tool_registry``.
+
+        When ``on_stream`` is given, the run's stream sink is bridged into the
+        :class:`ToolContext` progress seam so a running tool's tail-preview
+        snapshots surface as :class:`StreamToolProgress` events (mirrors Rust's
+        ``effective_tool_registry`` progress bridge)."""
+        from .tool_registry import RealToolRegistry, ToolProgressSink, ToolProgressUpdate
+
+        progress: ToolProgressSink | None = None
+        if on_stream is not None:
+            sink = on_stream
+
+            def _bridge(u: ToolProgressUpdate) -> None:
+                sink(StreamToolProgress(call_id=u.call_id, name=u.tool, preview=u.preview))
+
+            progress = _bridge
+
+        # Reserved handle: advertise NO tools (plan-empty re-ask). Intercepted
+        # before the catalogue lookup so it never falls through to the full
+        # registry. Dispatch is unreachable — the model is offered nothing.
+        if toolset == NO_TOOLS_TOOLSET:
+            return EmptyToolRegistry()
 
         # Strict per-node scoping: a non-empty handle with its own catalogue.
         if toolset:
             scoped = self._config.toolset_catalogues.get(toolset)
             if scoped is not None:
-                return RealToolRegistry(
-                    scoped,
-                    self._config.sandbox,
-                    session_id,
-                    self._config.project_id,
-                    self._config.storage.run(),
-                    self._config.storage.memory(),
+                return self._maybe_tool_search(
+                    RealToolRegistry(
+                        scoped,
+                        self._config.sandbox,
+                        session_id,
+                        self._config.project_id,
+                        self._config.storage.run(),
+                        self._config.storage.memory(),
+                    ).with_progress(progress)
                 )
         # Fallback: empty handle (back-compat) or unregistered non-empty handle.
         catalogue = self._config.catalogue_registry
         if catalogue is None:
+            # No catalogue tools were added via ``.tool()`` / ``.tools()``: return
+            # the injected ``tool_registry`` seam UNCHANGED — do NOT wrap it with
+            # ``ToolSearchRegistry``. Mirrors Rust's ``effective_tool_registry``
+            # (``None => self.config.tool_registry.clone()``): a caller that
+            # supplies a custom harness-loop ``tool_registry`` and also configures
+            # ``tool_search`` sees the custom registry advertised unchanged.
             return self._config.tool_registry
-        return RealToolRegistry(
-            catalogue,
-            self._config.sandbox,
-            session_id,
-            self._config.project_id,
-            self._config.storage.run(),
-            self._config.storage.memory(),
+        return self._maybe_tool_search(
+            RealToolRegistry(
+                catalogue,
+                self._config.sandbox,
+                session_id,
+                self._config.project_id,
+                self._config.storage.run(),
+                self._config.storage.memory(),
+            ).with_progress(progress)
         )
+
+    def _maybe_tool_search(self, reg: ToolRegistry) -> ToolRegistry:
+        """Wrap ``reg`` in a :class:`~spore_core.tool_registry.ToolSearchRegistry`
+        when :attr:`HarnessConfig.tool_search` is configured; otherwise return it
+        unchanged. Mirrors Rust's ``StandardHarness::maybe_tool_search``."""
+        cfg = self._config.tool_search
+        if cfg is None:
+            return reg
+        from .tool_registry import ToolSearchRegistry
+
+        return ToolSearchRegistry(reg, cfg)
 
     # ---- helpers ----------------------------------------------------
 
@@ -7509,6 +8068,70 @@ class StandardHarness:
             "rather than as quoted strings."
         )
         return ToolOutputError(message=enriched, recoverable=True)
+
+    @staticmethod
+    def _is_param_error(message: str) -> bool:
+        """Whether a recoverable tool-error message is a PARAMETER problem (a
+        malformed call) rather than a command/runtime failure. Only
+        parameter-shaped errors benefit from the schema+hint enrichment.
+        Mirrors Rust's ``is_param_error``."""
+        m = message.lower()
+        return (
+            "invalid parameters" in m
+            or "invalid type" in m
+            or "missing required field" in m
+            or "missing field" in m
+            or "schema validation failed" in m
+            or "unknown field" in m
+            or "unknown variant" in m
+        )
+
+    async def _dispatch_with_repair(
+        self,
+        tool_registry: ToolRegistry,
+        call: ToolCall,
+    ) -> tuple[ToolCall, ToolOutput]:
+        """Dispatch a tool call, applying the configured tool-call repair on a
+        recoverable error: coerce the arguments and re-dispatch up to
+        ``max_repair_attempts``, enriching the error (schema + hint) when repair
+        gives up. Returns the call ACTUALLY dispatched (the repaired variant
+        when repair fired) and its final output. Mirrors Rust's
+        ``StandardHarness::dispatch_with_repair``."""
+        effective_call = call
+        output = await tool_registry.dispatch(effective_call)
+        repair = self._config.tool_call_repair
+        if repair is None:
+            return effective_call, output
+        attempts_left = self._config.max_repair_attempts
+        while attempts_left > 0:
+            if not (isinstance(output, ToolOutputError) and output.recoverable):
+                break
+            message = output.message
+            schema = next(
+                (s for s in tool_registry.schemas() if s.name == effective_call.name),
+                None,
+            )
+            repaired_call = repair.repair(effective_call, message, schema)
+            if repaired_call is None:
+                # Repair gave up. Enrich with the schema+hint ONLY for a
+                # parameter-shaped error; a command/runtime failure is left raw.
+                if self._is_param_error(message):
+                    output = self._enrich_tool_error(message, schema)
+                break
+            attempts_left -= 1
+            effective_call = repaired_call
+            output = await tool_registry.dispatch(effective_call)
+            if not (isinstance(output, ToolOutputError) and output.recoverable):
+                break
+            if attempts_left == 0:
+                message = output.message
+                if self._is_param_error(message):
+                    schema = next(
+                        (s for s in tool_registry.schemas() if s.name == effective_call.name),
+                        None,
+                    )
+                    output = self._enrich_tool_error(message, schema)
+        return effective_call, output
 
     @classmethod
     async def _drive_turn(
@@ -7841,7 +8464,7 @@ class StandardHarness:
         # via ``_drive_strategy``, which re-resolves per-leaf toolsets during the
         # re-drive — so this registry is only used by the Clarification /
         # direct-resume paths whose pending calls need the carried handle.
-        tool_registry = self._effective_tool_registry(session_id, state.toolset)
+        tool_registry = self._effective_tool_registry(session_id, state.toolset, on_stream)
 
         # Clarification resume (issue #81, Q4b): if this pause came from
         # :class:`ToolOutputAwaitingClarification`, the human's answer is
@@ -7866,7 +8489,9 @@ class StandardHarness:
                     # Drain path: no place to issue a typed halt here, so flatten
                     # any tool-surfaced sandbox violation to a recoverable-vs-halt
                     # error per the policy (#150).
-                    output = self._normalize_sandbox_violation(await tool_registry.dispatch(call))
+                    output = self._normalize_sandbox_violation(
+                        (await self._dispatch_with_repair(tool_registry, call))[1]
+                    )
                     tr = HarnessToolResult(call_id=call.id, output=output)
                     await self._config.context_manager.append_tool_result(session_state, tr)
             # SC-BUG-1: a clarification that surfaced from inside a composed tree
@@ -8028,16 +8653,44 @@ class StandardHarness:
             for call in pending:
                 # Drain path: flatten a tool-surfaced sandbox violation per the
                 # policy — no place to issue a typed halt here (#150).
-                output = self._normalize_sandbox_violation(await tool_registry.dispatch(call))
+                self._emit(
+                    on_stream, StreamToolCall(call_id=call.id, name=call.name, args=call.input)
+                )
+                output = self._normalize_sandbox_violation(
+                    (await self._dispatch_with_repair(tool_registry, call))[1]
+                )
                 tr = HarnessToolResult(call_id=call.id, output=output)
+                is_err = isinstance(output, ToolOutputError)
+                self._emit(
+                    on_stream,
+                    StreamToolResult(
+                        call_id=call.id,
+                        is_error=is_err,
+                        content=self._tool_output_text(output),
+                    ),
+                )
                 await self._config.context_manager.append_tool_result(session_state, tr)
 
         elif isinstance(response, HumanResponseAllowWithModification):
             for call in response.calls:
                 # Drain path: flatten a tool-surfaced sandbox violation per the
                 # policy — no place to issue a typed halt here (#150).
-                output = self._normalize_sandbox_violation(await tool_registry.dispatch(call))
+                self._emit(
+                    on_stream, StreamToolCall(call_id=call.id, name=call.name, args=call.input)
+                )
+                output = self._normalize_sandbox_violation(
+                    (await self._dispatch_with_repair(tool_registry, call))[1]
+                )
                 tr = HarnessToolResult(call_id=call.id, output=output)
+                is_err = isinstance(output, ToolOutputError)
+                self._emit(
+                    on_stream,
+                    StreamToolResult(
+                        call_id=call.id,
+                        is_error=is_err,
+                        content=self._tool_output_text(output),
+                    ),
+                )
                 await self._config.context_manager.append_tool_result(session_state, tr)
 
         # SC-BUG-1: an Allow / Deny / Answer / Reject resume that surfaced from
@@ -8106,7 +8759,7 @@ class StandardHarness:
         # pending calls) through the pausing leaf's own toolset handle, restoring
         # its scoped per-node catalogue. An empty handle (the default) still falls
         # back to the global catalogue, so pre-#140 blobs behave unchanged.
-        tool_registry = self._effective_tool_registry(session_id, state.toolset)
+        tool_registry = self._effective_tool_registry(session_id, state.toolset, on_stream)
 
         if isinstance(response, ConsultResponseAnswer):
             text, answered = response.text, True
@@ -8152,7 +8805,9 @@ class StandardHarness:
             for call in rest:
                 # Drain path: flatten a tool-surfaced sandbox violation per the
                 # policy — no place to issue a typed halt here (#150).
-                output = self._normalize_sandbox_violation(await tool_registry.dispatch(call))
+                output = self._normalize_sandbox_violation(
+                    (await self._dispatch_with_repair(tool_registry, call))[1]
+                )
                 tr = HarnessToolResult(call_id=call.id, output=output)
                 await self._config.context_manager.append_tool_result(session_state, tr)
 
@@ -8222,6 +8877,7 @@ class StandardHarness:
         output_schema: dict[str, Any] | None = None,
         output_schema_max_retries: int = 0,
         system_prompt: str | None = None,
+        in_execute_step: bool = False,
     ) -> RunResult:
         """:class:`StrategyExecutor` primitive: one bounded ReAct turn-loop window
         on the resolved worker ``agent`` (delegates to :meth:`_run_react_inner`).
@@ -8230,7 +8886,9 @@ class StandardHarness:
         ``agent``. Issue #139: ``output_schema`` / ``output_schema_max_retries``
         drive terminal-output validation + retry (``None`` ⇒ no enforcement).
         SC-10 (#161): ``system_prompt`` is the leaf's per-node prompt override,
-        threaded down alongside ``toolset`` (``None`` ⇒ global prompt)."""
+        threaded down alongside ``toolset`` (``None`` ⇒ global prompt).
+        ``in_execute_step`` marks an EXECUTE-phase window so the structural
+        ``tool_call_nudge`` can fire (mirrors Rust's ``cx.scratch.in_execute_step``)."""
         return await self._run_react_inner(
             task,
             max_iterations,
@@ -8242,6 +8900,7 @@ class StandardHarness:
             output_schema,
             output_schema_max_retries,
             system_prompt,
+            in_execute_step,
         )
 
     def resolve_agent_ref(self, ref: str, session_id: SessionId) -> Agent | RunResultFailure:
@@ -8319,9 +8978,11 @@ class StandardHarness:
         """:class:`StrategyExecutor` primitive: the planning directive seeded
         before the plan sub-strategy runs (R1)."""
         return (
-            "Produce a step-by-step plan for the following task. Respond with a "
-            'single JSON object: {"tasks": [<ordered step strings>], '
-            '"rationale": <string>}.\n\nTask:\n' + instruction
+            "Produce a step-by-step plan for the following task, then RECORD it by "
+            "calling the `set_plan` tool with `tasks` = the ordered list of concrete "
+            "step strings (plus an optional one-line `rationale`). Record the plan "
+            "ONLY through `set_plan` — do NOT write it as a JSON or text message."
+            "\n\nTask:\n" + instruction
         )
 
     async def seed_user_message(self, session_state: SessionState, text: str) -> None:
@@ -8335,6 +8996,7 @@ class StandardHarness:
         plan_task: Task,
         plan_session: SessionState,
         budget_used: BudgetSnapshot,
+        forced_output_schema: dict[str, Any] | None = None,
     ) -> RunResult | None:
         """:class:`StrategyExecutor` primitive: dispatch the plan sub-strategy
         ``plan`` for ``plan_task`` over ``plan_session`` (#124).
@@ -8343,12 +9005,16 @@ class StandardHarness:
         ``ReactConfig.agent`` is authoritative and resolved by the recursing leaf
         itself. The child's ``run`` drives the WHOLE plan loop (genuine recursion).
         Returns the child's verbatim terminal, or ``None`` when it produced no
-        terminal."""
+        terminal. ``forced_output_schema`` (a plan-empty REPAIR re-ask, #139)
+        overrides the plan leaf's own ``output`` schema so a re-ask is
+        guided-decoded into valid ``{tasks, rationale}`` JSON; ``None`` ⇒ the
+        leaf's own schema (byte-identical)."""
         cx = ExecutionContext(registry=self._config.registry)
         cx.executor = self
         cx.scratch.run_session = plan_session
         cx.scratch.run_budget = budget_used
         cx.scratch.task = plan_task
+        cx.scratch.forced_output_schema = forced_output_schema
         await run_strategy(plan, cx)
         return cx.scratch.terminal_override
 
@@ -8834,14 +9500,86 @@ class StandardHarness:
         except Exception:  # noqa: BLE001 — revert is best-effort; never abort the loop
             pass
 
-    @staticmethod
-    def _hill_climbing_commit_hash() -> str | None:
-        """Resolve the ``commit_hash`` recorded on a HillClimbing TSV row (issue
-        #60, Decision 1). The harness never commits, so this is the EMPTY string
-        (``None`` serialized as empty in the TSV) unless a ``VcsProvider`` is
-        wired to supply a hash. v1 has no per-keep commit, so we always return
-        ``None``. Mirrors Rust's ``hill_climbing_commit_hash``."""
+    def _hill_climbing_commit_hash(self) -> str | None:
+        """Resolve the ``commit_hash`` recorded on a HillClimbing TSV row. The
+        harness never commits in the default path, so this is ``None`` unless a
+        ``VcsProvider`` is wired to supply a hash. Mirrors Rust's
+        ``hill_climbing_commit_hash``."""
         return None
+
+    async def _hill_climbing_head_sha(self) -> str | None:
+        """Resolve the workspace's current commit SHA (mirrors Rust's
+        ``hill_climbing_head_sha``). A wired :class:`VcsProvider` supplies it
+        via ``head()``; otherwise ``git rev-parse HEAD`` THROUGH the sandbox.
+        Returns ``None`` when there is no usable VCS — the loop then degrades
+        gracefully to its pre-fix score-only behaviour."""
+        vcs = self._config.vcs_provider
+        if vcs is not None:
+            try:
+                sha = (await vcs.head()).strip()
+            except Exception:  # noqa: BLE001
+                return None
+            return sha or None
+        try:
+            out = await self._config.sandbox.execute_command("git", ["rev-parse", "HEAD"])
+        except Exception:  # noqa: BLE001
+            return None
+        if out.exit_code != 0:
+            return None
+        sha = out.stdout.strip()
+        return sha or None
+
+    async def _hill_climbing_commit_accepted(self, label: str) -> str | None:
+        """Commit the current working tree as an accepted candidate and return
+        its SHA (mirrors Rust's ``hill_climbing_commit_accepted``). A wired
+        provider's ``commit_checkpoint`` wins; otherwise ``git add -A && git
+        commit`` THROUGH the sandbox, then ``_hill_climbing_head_sha``. Returns
+        ``None`` when no SHA could be obtained."""
+        vcs = self._config.vcs_provider
+        if vcs is not None:
+            try:
+                sha = (await vcs.commit_checkpoint(label)).strip()
+            except Exception:  # noqa: BLE001
+                return None
+            return sha or None
+        try:
+            await self._config.sandbox.execute_command("git", ["add", "-A"])
+            await self._config.sandbox.execute_command("git", ["commit", "-m", label])
+        except Exception:  # noqa: BLE001
+            return None
+        return await self._hill_climbing_head_sha()
+
+    async def _hill_climbing_reset_to(self, target_sha: str | None) -> None:
+        """Reset the working tree for a no-improvement iteration (mirrors Rust's
+        ``hill_climbing_reset_to``). Revert targets the last ACCEPTED candidate
+        (``target_sha``), NOT the original ``HEAD``. A wired :class:`VcsProvider`
+        owns the reset (``reset_to(sha)`` for a known SHA, else ``revert()``);
+        otherwise ``git reset --hard <sha>`` (or ``HEAD``) THROUGH the sandbox.
+        Best-effort."""
+        known = target_sha if target_sha else None
+        vcs = self._config.vcs_provider
+        if vcs is not None:
+            try:
+                if known:
+                    await vcs.reset_to(known)
+                else:
+                    await vcs.revert()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        target = known or "HEAD"
+        try:
+            await self._config.sandbox.execute_command("git", ["reset", "--hard", target])
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _hill_apply_winner(self, best_sha: str | None) -> None:
+        """Apply the best accepted candidate at loop exit (mirrors Rust's
+        ``hill_apply_winner``). A no-op when there is no usable VCS / no best
+        SHA — the best artifact is already on disk."""
+        if not best_sha:
+            return
+        await self._hill_climbing_reset_to(best_sha)
 
     def _emit_hill_climbing_span(
         self,
@@ -9076,11 +9814,16 @@ class StandardHarness:
         current_best: float,
         rows: list[Any],
         span_seq: list[int],
+        cand: HillCandidate | None = None,
     ) -> tuple[float, bool]:
         """HillClimbing per-iteration metric eval + keep/revert decision (#124):
         the agent turn already ran (recursively); this evaluates the metric,
         applies ``should_keep``, optionally reverts, records the row + span, and
-        returns ``(current_best, non_improvement)``. Mirrors Rust's
+        returns ``(current_best, non_improvement)``. When ``cand`` is provided,
+        a KEPT iteration commits the accepted candidate and mutates ``cand``
+        (``current_sha``/``best_sha``/``current_best``/``best_score``); a
+        DISCARDED iteration resets to ``cand.current_sha`` (the last accepted
+        state, NOT ``HEAD`` — the load-bearing fix). Mirrors Rust's
         ``hill_iteration``."""
         from .metric import MetricResult, ResultsEntry, iteration_status_from_error, should_keep
         from .termination import SessionStateSnapshot
@@ -9099,10 +9842,22 @@ class StandardHarness:
             kept = should_keep(value, current_best, direction, min_improvement_delta)
             delta = (current_best - value) if direction == "minimize" else (value - current_best)
             if kept:
+                # Commit-on-keep: when a HillCandidate is threaded, commit the
+                # accepted candidate and advance its durable pointers (mirrors
+                # Rust's commit-on-keep). The commit hash is recorded on the row.
+                commit_hash = self._hill_climbing_commit_hash()
+                if cand is not None:
+                    commit_hash = await self._hill_climbing_commit_accepted(
+                        f"hill-climbing-keep-{iteration}"
+                    )
+                    cand.current_sha = commit_hash
+                    cand.best_sha = commit_hash or cand.best_sha
+                    cand.current_best = value
+                    cand.best_score = value
                 rows.append(
                     ResultsEntry(
                         iteration=iteration,
-                        commit_hash=self._hill_climbing_commit_hash(),
+                        commit_hash=commit_hash,
                         metric_value=value,
                         direction=direction,
                         status="kept",
@@ -9117,7 +9872,13 @@ class StandardHarness:
                 return value, False
             reverted = revert_on_no_improvement
             if reverted:
-                await self._hill_climbing_revert()
+                # Reset to the last ACCEPTED candidate (``cand.current_sha``),
+                # NOT ``HEAD`` — the load-bearing fix. Falls back to the legacy
+                # ``_hill_climbing_revert`` when no candidate is threaded.
+                if cand is not None:
+                    await self._hill_climbing_reset_to(cand.current_sha)
+                else:
+                    await self._hill_climbing_revert()
             rows.append(
                 ResultsEntry(
                     iteration=iteration,
@@ -9138,7 +9899,10 @@ class StandardHarness:
         status = iteration_status_from_error(eval_result)
         reverted = revert_on_no_improvement
         if reverted:
-            await self._hill_climbing_revert()
+            if cand is not None:
+                await self._hill_climbing_reset_to(cand.current_sha)
+            else:
+                await self._hill_climbing_revert()
         rows.append(
             ResultsEntry(
                 iteration=iteration,
@@ -9604,12 +10368,13 @@ class StandardHarness:
         # this window, so the leaf sees ONLY its own prompt (the per-leaf prompt
         # half of SC-10; the toolset half is the ``toolset`` arg above).
         system_prompt: str | None = None,
+        in_execute_step: bool = False,
     ) -> RunResult:
         session_id = task.session_id
         # Resolve the effective tool registry once per turn-loop window (all
         # strategies funnel through here). Bridges the per-node toolset catalogue
         # (or the global catalogue when the handle is empty) per-run.
-        tool_registry = self._effective_tool_registry(session_id, toolset)
+        tool_registry = self._effective_tool_registry(session_id, toolset, on_stream)
         # Reset the adaptive prompt-based-tool-calling escalation flag at the
         # start of this turn-loop window so detection is scoped to the window and
         # does not leak across run() calls (the flag is shared with the model
@@ -9633,6 +10398,13 @@ class StandardHarness:
         # reset). ``N`` is ``error_loop_threshold``; the hard stop is at ``2 * N``.
         error_loop_n = self._config.error_loop_threshold
         error_runs: dict[str, ErrorRun] = {}
+        # Per-window cap for the behavioral tool-call nudge (mirrors Rust's
+        # ``MAX_TOOL_CALL_NUDGES``) so a model that keeps answering without
+        # acting can't loop forever, plus a count of tools actually called this
+        # window — the signal is "execute turn finished having called ZERO tools".
+        MAX_TOOL_CALL_NUDGES = 2
+        tool_call_nudges_used = 0
+        tools_called_this_window = 0
         # Output-schema enforcement state (issue #139), loop-local to this window.
         # ``output_schema_retries_used`` counts the EXTRA retry turns spent on
         # validation feedback; the budget for them is ``output_schema_max_retries``
@@ -9649,6 +10421,18 @@ class StandardHarness:
         config = self._config
 
         while True:
+            # Mid-run steering (pi-style, ``HarnessConfig::steering_source``):
+            # drain any user messages queued since the last turn boundary and
+            # inject them BEFORE the next model call — after the previous turn's
+            # tool calls fully executed, so steering redirects the next turn
+            # without ever cancelling in-flight work. Each is recorded on the
+            # session via the ContextManager seam and emitted as a
+            # ``StreamUserMessage(steered=True)``. Mirrors Rust's react.rs steering.
+            if config.steering_source is not None:
+                for _text in config.steering_source():
+                    await config.context_manager.append_user_message(session_state, _text)
+                    self._emit(on_stream, StreamUserMessage(content=_text, steered=True))
+
             # Layer-1 budget gates before the turn.
             if budget_used.turns >= effective_turn_cap:
                 return self._fail(
@@ -9827,6 +10611,7 @@ class StandardHarness:
                 stop_reason, tool_calls_requested = StopReason.TOOL_USE, len(result.calls)
             else:
                 stop_reason, tool_calls_requested = StopReason.END_TURN, 0
+            tools_called_this_window += tool_calls_requested
             turn_base = SpanBase.new_root(
                 new_span_id(f"{session_id}-turn-{budget_used.turns}"),
                 session_id,
@@ -9889,7 +10674,12 @@ class StandardHarness:
             span_seq += 1
             current_turn_base = turn_base
 
-            self._emit(on_stream, StreamTurnEnd(turn=budget_used.turns))
+            # Per-turn token usage on TurnEnd (mirrors Rust's `TurnEnd.usage`).
+            if isinstance(result, TurnError):
+                turn_usage = result.usage if result.usage is not None else TokenUsage()
+            else:
+                turn_usage = result.usage
+            self._emit(on_stream, StreamTurnEnd(turn=budget_used.turns, usage=turn_usage))
 
             # ---- FinalResponse --------------------------------------
             if isinstance(result, FinalResponse):
@@ -9899,21 +10689,32 @@ class StandardHarness:
 
                 # Adaptive prompt-based tool-calling escalation (#111). When
                 # tools were advertised but the model answered in prose with
-                # action-intent language (it *meant* to act), set the session
-                # flag so the wrapped model switches to prompt-based tool calling,
-                # nudge the model, and force another turn instead of completing.
-                # Guarded on the flag being unset so it fires at most once per
-                # window (bounded — one extra turn) and only on the conversational
-                # adaptive path.
+                # action-intent language (it *meant* to act), OR when the
+                # opt-in structural ``tool_call_nudge`` detects an EXECUTE-phase
+                # terminal answer that called ZERO tools while tools were
+                # advertised, set the session flag so the wrapped model switches
+                # to prompt-based tool calling, nudge the model, and force
+                # another turn instead of completing. Guarded on the flag being
+                # unset so it fires at most once per window (bounded — one extra
+                # turn) and only on the conversational adaptive path. Mirrors
+                # Rust's combined ``phrase || structural`` adaptive branch.
                 flag = config.prompt_tool_call_flag
+                prose_detected = detect_prose_response(result.content, tools_advertised) is not None
+                structural_detected = (
+                    config.tool_call_nudge
+                    and in_execute_step
+                    and tools_advertised
+                    and tools_called_this_window == 0
+                    and output_schema is None
+                )
                 if (
                     flag is not None
                     and flag.value is False
-                    and detect_prose_response(result.content, tools_advertised) is not None
+                    and (prose_detected or structural_detected)
                 ):
                     flag.value = True
-                    # Record the model's prose, then a corrective nudge, so the
-                    # next turn has coherent context.
+                    # Record the model's failed output, then a corrective nudge,
+                    # so the next turn has coherent context.
                     appender = getattr(config.context_manager, "append_assistant_message", None)
                     if appender is not None:
                         await appender(
@@ -9924,8 +10725,49 @@ class StandardHarness:
                             ),
                         )
                     nudge = (
-                        "You described an action but did not call a tool. Use the "
-                        "provided tool-call format to actually invoke the tool."
+                        "No tool call was detected in your last response. The "
+                        "tools available to you and the exact tool-call format are "
+                        "described in the system prompt — use that format now to "
+                        "actually invoke a tool, not prose or a code block."
+                    )
+                    await config.context_manager.append_user_message(session_state, nudge)
+                    continue
+
+                # Behavioral tool-call nudge (opt-in via ``tool_call_nudge``).
+                # This does NOT inspect the response text for phrases — it keys
+                # on ACTION: an EXECUTE-phase task window finished (a terminal
+                # answer) having called ZERO tools while tools were advertised,
+                # i.e. the model "reported findings" without ever reading
+                # anything. Record that answer, nudge it to actually use a tool
+                # before reporting, and force another turn. Scoped to execute
+                # steps so the legitimately tool-free plan-JSON turn is
+                # untouched, skips schema-constrained turns, and bounded per
+                # window so a model that refuses to act can't loop. Off
+                # (default) → byte-identical. Mirrors Rust's react.rs.
+                if (
+                    config.tool_call_nudge
+                    and in_execute_step
+                    and tools_advertised
+                    and tools_called_this_window == 0
+                    and output_schema is None
+                    and tool_call_nudges_used < MAX_TOOL_CALL_NUDGES
+                ):
+                    tool_call_nudges_used += 1
+                    appender = getattr(config.context_manager, "append_assistant_message", None)
+                    if appender is not None:
+                        await appender(
+                            session_state,
+                            Message(
+                                role=Role.ASSISTANT,
+                                content=TextContent(text=result.content),
+                            ),
+                        )
+                    nudge = (
+                        "You have not called any tool yet, so you have not "
+                        "actually inspected anything — your answer would be "
+                        "guessed, not grounded. Use the available tools "
+                        "(list_dir, read_file, grep, …) to gather the real "
+                        "data NOW, then report only what the tools returned."
                     )
                     await config.context_manager.append_user_message(session_state, nudge)
                     continue
@@ -10237,6 +11079,11 @@ class StandardHarness:
                 # place (via ``ContextManager.replace_tool_result``). Captured at
                 # append time so it survives the #137 corrective-message interleaving.
                 result_msg_indices: list[int] = []
+                # SC-9: pre-rewrite stream view (is_error, content) per result,
+                # captured so the AfterTool ``ContinueWithModification`` path can
+                # re-emit a ``revised=True`` ``StreamToolResult`` ONLY for results
+                # the chain actually changed (mirrors Rust's `pre_views`).
+                pre_views: list[tuple[bool, str]] = []
                 for i, call in enumerate(calls):
                     # Sandbox validation. The pre-dispatch ``validate`` seam
                     # honours the SAME policy as tool-surfaced violations
@@ -10271,6 +11118,7 @@ class StandardHarness:
                         await config.context_manager.append_tool_result(session_state, tr)
                         result_msg_indices.append(max(len(session_state.messages) - 1, 0))
                         approved_results.append(tr)
+                        pre_views.append((True, f"sandbox: {violation.kind}"))
                         continue
 
                     self._emit(
@@ -10279,7 +11127,7 @@ class StandardHarness:
                     )
                     tool_started_at = _now()
                     tool_clock = time.monotonic()
-                    output = await tool_registry.dispatch(call)
+                    call, output = await self._dispatch_with_repair(tool_registry, call)
 
                     # Tool-surfaced sandbox violation: the HARNESS decides
                     # halt-vs-recoverable per ``sandbox_violation_policy``, not
@@ -10660,14 +11508,16 @@ class StandardHarness:
                         span_seq += 1
 
                     tr = HarnessToolResult(call_id=call.id, output=output)
+                    result_content = self._tool_output_text(output)
                     self._emit(
                         on_stream,
                         StreamToolResult(
                             call_id=call.id,
                             is_error=is_error,
-                            content=self._tool_output_text(output),
+                            content=result_content,
                         ),
                     )
+                    pre_views.append((is_error, result_content))
                     await config.context_manager.append_tool_result(session_state, tr)
                     # SC-9: record this result's message index BEFORE the #137
                     # corrective user message may be appended, so the index points
@@ -10705,6 +11555,25 @@ class StandardHarness:
                         if replacer is not None:
                             for res, idx in zip(approved_results, result_msg_indices, strict=False):
                                 await replacer(session_state, idx, res)
+                        # Symmetric stream-side correction (mirrors Rust): the model
+                        # side was patched above, but the ``StreamToolResult`` already
+                        # on the stream still shows the stale content. Re-emit with
+                        # ``revised=True`` ONLY for results the chain actually changed,
+                        # so consumers correct in place rather than double-count by
+                        # ``call_id``.
+                        for res, pre in zip(approved_results, pre_views, strict=False):
+                            new_is_error = isinstance(res.output, ToolOutputError)
+                            new_content = self._tool_output_text(res.output)
+                            if (new_is_error, new_content) != pre:
+                                self._emit(
+                                    on_stream,
+                                    StreamToolResult(
+                                        call_id=res.call_id,
+                                        is_error=new_is_error,
+                                        content=new_content,
+                                        revised=True,
+                                    ),
+                                )
                     elif isinstance(decision, MiddlewareHalt):
                         return self._fail(
                             HaltReasonMiddlewareHalt(hook="after_tool", reason=decision.reason),

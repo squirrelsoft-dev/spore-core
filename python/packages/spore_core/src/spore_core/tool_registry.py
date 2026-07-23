@@ -68,8 +68,9 @@ Rules enforced here (mirror Rust reference byte-for-byte):
 
 from __future__ import annotations
 
-from collections.abc import Awaitable
-from dataclasses import dataclass, field
+from collections import deque
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
@@ -81,6 +82,7 @@ from .harness import (
 )
 from .harness import (
     BaseSandboxProvider,
+    CommandProgressSink,
     SandboxProvider,
     SandboxViolation,
     SessionId,
@@ -149,6 +151,11 @@ class ToolContext:
       provider this is the scope-routing memory slot; for the never-null
       contract it is at worst a :class:`NoOpStorageProvider`. ``MemoryTool``
       (#82) picks up this already-threaded seam.
+    * ``progress`` — optional run-level live-progress sink (pi-style bash
+      streaming). Set by the harness bridge
+      (:meth:`RealToolRegistry.with_progress`) when the run has a stream sink;
+      tools derive a per-call emitter via :meth:`command_progress`. ``None``
+      (default) means no consumer is listening — tools skip streaming entirely.
 
     It is a **dataclass** (not a tuple) so future fields can be added without
     breaking the trait signature again. The :class:`SandboxProvider` is
@@ -161,6 +168,43 @@ class ToolContext:
     project_id: ProjectId
     run_store: RunStore
     memory_store: MemoryStore
+    progress: ToolProgressSink | None = None
+
+    def command_progress(self, call: ToolCall) -> CommandProgressSink | None:
+        """Derive a per-call :class:`CommandProgressSink` that forwards tail
+        snapshots to the run's :class:`ToolProgressSink`, labeled with this
+        call's tool name + id. Returns ``None`` when no run sink is wired so
+        tools skip streaming. Mirrors Rust's ``ToolContext::command_progress``.
+        """
+        sink = self.progress
+        if sink is None:
+            return None
+        tool = call.name
+        call_id = call.id
+
+        def _emit(preview: str) -> None:
+            sink(ToolProgressUpdate(tool=tool, call_id=call_id, preview=preview))
+
+        return _emit
+
+
+@dataclass
+class ToolProgressUpdate:
+    """One live-progress update from a RUNNING tool, labeled with the call it
+    belongs to. The harness bridge maps it onto
+    :class:`spore_core.harness.StreamToolProgress` for UIs. Mirrors Rust's
+    ``ToolProgressUpdate``.
+    """
+
+    tool: str
+    call_id: str
+    preview: str
+
+
+#: Run-level sink for :class:`ToolProgressUpdate`-es. Must not block (called
+#: from the executor's ~100ms wait-loop tick). Mirrors Rust's
+#: ``ToolProgressSink``.
+ToolProgressSink = Callable[[ToolProgressUpdate], None]
 
 
 # ============================================================================
@@ -581,6 +625,13 @@ class RealToolRegistry:
         live."""
         return self._ctx
 
+    def with_progress(self, sink: ToolProgressSink | None) -> RealToolRegistry:
+        """Wire a run-level :class:`ToolProgressSink` into the threaded
+        :class:`ToolContext` so tools can emit live progress. Mirrors Rust's
+        ``RealToolRegistry::with_progress``."""
+        self._ctx = replace(self._ctx, progress=sink)
+        return self
+
     async def dispatch(self, call: ToolCall) -> ToolOutput:
         try:
             result = await self._inner.dispatch(call, self._sandbox, self._ctx)
@@ -600,6 +651,279 @@ class RealToolRegistry:
 
 
 # ============================================================================
+# ToolSearchRegistry — deferred-tool pattern for local models (issue #looper)
+# ============================================================================
+
+
+@dataclass
+class ToolNamespace:
+    """A namespace grouping: a cheap header advertised to the model; calling
+    it loads the member tools. Mirrors Rust's ``ToolNamespace``."""
+
+    name: str
+    description: str
+    tools: list[str]
+
+    @staticmethod
+    def of(name: str, description: str, tools: list[str]) -> ToolNamespace:
+        return ToolNamespace(name=name, description=description, tools=list(tools))
+
+
+@dataclass
+class ToolSearchConfig:
+    """Configuration for :class:`ToolSearchRegistry` (mirrors Rust's
+    ``ToolSearchConfig``): which tools are always advertised, the deferred-tool
+    namespaces, the description-prose byte budget, and how many tools a single
+    ``tool_search`` call surfaces."""
+
+    core: list[str]
+    namespaces: list[ToolNamespace] = field(default_factory=list)
+    description_budget: int = 4096
+    search_top_k: int = 5
+    search_tool_name: str = "tool_search"
+
+    @staticmethod
+    def new(core: list[str]) -> ToolSearchConfig:
+        return ToolSearchConfig(core=list(core))
+
+    def namespace(self, ns: ToolNamespace) -> ToolSearchConfig:
+        self.namespaces.append(ns)
+        return self
+
+    def with_description_budget(self, bytes_: int) -> ToolSearchConfig:
+        self.description_budget = bytes_
+        return self
+
+    def with_search_top_k(self, k: int) -> ToolSearchConfig:
+        self.search_top_k = k
+        return self
+
+    def with_search_tool_name(self, name: str) -> ToolSearchConfig:
+        self.search_tool_name = name
+        return self
+
+
+class ToolSearchRegistry:
+    """A harness-loop :class:`~spore_core.harness.ToolRegistry` wrapper that
+    advertises only a small, description-bounded ACTIVE set — the configured
+    core tools plus a ``tool_search`` meta-tool (and namespace headers) — and
+    loads the rest of the catalogue on demand. Mirrors Rust's
+    ``ToolSearchRegistry``.
+
+    ``schemas()`` is re-read by the harness every turn, so the wrapper
+    grows/shrinks the advertised set turn-to-turn. ``dispatch`` of any
+    non-search, non-namespace tool delegates straight to the inner registry, so
+    a model that calls a catalogue tool that is not currently advertised STILL
+    succeeds — exposure is a hint, never a hard gate.
+    """
+
+    def __init__(self, inner: HarnessLoopToolRegistry, config: ToolSearchConfig) -> None:
+        self._inner = inner
+        self._config = config
+        catalogue = inner.schemas()
+        self._catalogue = catalogue
+        names = {s.name for s in catalogue}
+
+        # Core names that actually exist in the catalogue, catalogue order, deduped.
+        core: list[str] = []
+        for s in catalogue:
+            if s.name in config.core and s.name not in core:
+                core.append(s.name)
+        self._core = core
+        core_set = set(core)
+
+        # Validate namespaces: drop a name colliding with a catalogue tool or an
+        # earlier namespace; keep only members that exist and are non-core.
+        namespaces: list[ToolNamespace] = []
+        ns_names: set[str] = set()
+        for ns in config.namespaces:
+            if ns.name in names or ns.name in ns_names:
+                continue
+            tools: list[str] = []
+            for t in ns.tools:
+                if t in names and t not in core_set and t not in tools:
+                    tools.append(t)
+            if not tools:
+                continue
+            namespaces.append(ToolNamespace(name=ns.name, description=ns.description, tools=tools))
+            ns_names.add(ns.name)
+        self._namespaces = namespaces
+        self._namespace_headers = [self._header_schema(ns) for ns in namespaces]
+        self._search_schema = self._build_search_schema(config.search_tool_name)
+        self._loaded: deque[str] = deque()
+
+    @staticmethod
+    def _header_schema(ns: ToolNamespace) -> ModelToolSchema:
+        return ModelToolSchema(
+            name=ns.name,
+            description=f"{ns.description} (call to load this group's tools)",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+    @staticmethod
+    def _build_search_schema(name: str) -> ModelToolSchema:
+        return ModelToolSchema(
+            name=name,
+            description=(
+                "Load more tools by keyword when you need a capability you don't "
+                "currently have (e.g. run command, web search, task list)."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keywords for the capability you need.",
+                    }
+                },
+                "required": ["query"],
+            },
+        )
+
+    def _is_core(self, name: str) -> bool:
+        return name in self._core
+
+    def _touch(self, name: str) -> None:
+        if name == self._config.search_tool_name or self._is_core(name):
+            return
+        if not any(s.name == name for s in self._catalogue):
+            return
+        try:
+            self._loaded.remove(name)
+        except ValueError:
+            pass
+        self._loaded.appendleft(name)
+
+    def _search(self, query: str) -> list[str]:
+        import re
+
+        terms = [t for t in re.split(r"[^a-z0-9]+", query.lower()) if len(t) >= 2]
+        if not terms:
+            return []
+        scored: list[tuple[int, str]] = []
+        for s in self._catalogue:
+            if s.name == self._config.search_tool_name or self._is_core(s.name):
+                continue
+            name_l = s.name.lower()
+            desc_l = s.description.lower()
+            score = 0
+            for t in terms:
+                if t in name_l:
+                    score += 3
+                if t in desc_l:
+                    score += 1
+            if score > 0:
+                scored.append((score, s.name))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return [n for _, n in scored[: self._config.search_top_k]]
+
+    def _load_and_list(self, names: list[str], header: str) -> ToolOutput:
+        # Push in reverse so the first-listed ends at the LRU front.
+        for name in reversed(names):
+            self._touch(name)
+        by_name = {s.name: s for s in self._catalogue}
+        lines = [header]
+        for name in names:
+            s = by_name.get(name)
+            if s is not None:
+                lines.append(f"- {s.name}: {s.description}")
+                lines.append(f"  parameters: {s.input_schema}")
+        return ToolOutputSuccess(content="\n".join(lines))
+
+    def _run_search(self, input_: dict[str, Any]) -> ToolOutput:
+        raw = input_.get("query", "")
+        # Rust treats a missing/non-string `query` as empty (→ recoverable error).
+        query = raw.strip() if isinstance(raw, str) else ""
+        if not query:
+            return ToolOutputError(
+                message=(
+                    f"{self._config.search_tool_name}: provide a non-empty `query` "
+                    "string describing the capability you need."
+                ),
+                recoverable=True,
+            )
+        hits = self._search(query)
+        if not hits:
+            return ToolOutputSuccess(
+                content=(
+                    f'No tools matched "{query}". Try different keywords — the tools '
+                    "you already have are in your current tool list."
+                )
+            )
+        return self._load_and_list(
+            hits,
+            f'Loaded {len(hits)} tool(s) for "{query}". You can now call them directly:',
+        )
+
+    def _open_namespace(self, name: str) -> ToolOutput:
+        ns = next((n for n in self._namespaces if n.name == name), None)
+        if ns is None:
+            return ToolOutputError(
+                message=f"namespace `{name}` is not registered", recoverable=True
+            )
+        members = ns.tools[: self._config.search_top_k]
+        if not members:
+            return ToolOutputSuccess(content=f'Namespace "{name}" has no available tools.')
+        return self._load_and_list(
+            members,
+            f'Opened namespace "{name}" — loaded {len(members)} tool(s). '
+            "You can now call them directly:",
+        )
+
+    async def dispatch(self, call: ToolCall) -> ToolOutput:
+        if call.name == self._config.search_tool_name:
+            return self._run_search(call.input)
+        if any(n.name == call.name for n in self._namespaces):
+            return self._open_namespace(call.name)
+        self._touch(call.name)
+        return await self._inner.dispatch(call)
+
+    def is_always_halt(self, tool_name: str) -> bool:
+        if tool_name == self._config.search_tool_name or any(
+            n.name == tool_name for n in self._namespaces
+        ):
+            return False
+        return self._inner.is_always_halt(tool_name)
+
+    def schemas(self) -> list[ModelToolSchema]:
+        by_name = {s.name: s for s in self._catalogue}
+        out: list[ModelToolSchema] = []
+        used = 0
+        for name in self._core:
+            s = by_name.get(name)
+            if s is not None:
+                used += len(s.description)
+                out.append(s.model_copy(deep=True))
+        for header in self._namespace_headers:
+            used += len(header.description)
+            out.append(header.model_copy(deep=True))
+        used += len(self._search_schema.description)
+        out.append(self._search_schema.model_copy(deep=True))
+        kept: deque[str] = deque()
+        for name in list(self._loaded):
+            if self._is_core(name):
+                continue
+            s = by_name.get(name)
+            if s is None:
+                continue
+            nxt = used + len(s.description)
+            if nxt > self._config.description_budget:
+                break
+            used = nxt
+            kept.append(name)
+            out.append(s.model_copy(deep=True))
+        self._loaded = kept
+        out.sort(key=lambda s: s.name)
+        return out
+
+    def advertised_description_bytes(self) -> int:
+        return sum(len(s.description) for s in self.schemas())
+
+
+# ============================================================================
+# ReadOnlyToolView — SC-30 read-only view over a harness-loop ToolRegistry
+# ============================================================================
+
 # ReadOnlyToolView — SC-30 read-only view over a harness-loop ToolRegistry
 # ============================================================================
 
@@ -775,7 +1099,12 @@ __all__ = [
     "Tool",
     "ToolAnnotations",
     "ToolContext",
+    "ToolNamespace",
+    "ToolProgressSink",
+    "ToolProgressUpdate",
     "ToolRegistry",
+    "ToolSearchConfig",
+    "ToolSearchRegistry",
     "ToolResult",
     "ToolSchema",
     "ToolSet",
