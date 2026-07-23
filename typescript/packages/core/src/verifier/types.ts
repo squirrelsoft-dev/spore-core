@@ -121,6 +121,13 @@ function view(label: string, r: RunResult): ResultView {
           `${label} run escalated (${r.signal.kind}) — verifier received an escalated ` +
           `harness; the caller must handle the signal before verification`,
       };
+    default:
+      // `consult` (and any future non-terminal) — the verifier expects a
+      // completed run; surface it as a misconfiguration.
+      return {
+        kind: "failed",
+        reason: `${label} run did not produce a terminal (kind=${r.kind})`,
+      };
   }
 }
 
@@ -232,7 +239,7 @@ function compileFixturePattern(source: string): RegExp {
   while (true) {
     const m = body.match(/^\(\?([imsux]+)\)/);
     if (m === null) break;
-    for (const ch of m[1]) {
+    for (const ch of m[1]!) {
       if (ch === "i" && !flags.includes("i")) flags += "i";
       if (ch === "m" && !flags.includes("m")) flags += "m";
       if (ch === "s" && !flags.includes("s")) flags += "s";
@@ -297,6 +304,9 @@ export class TestSuiteVerifier implements Verifier {
       return failed("empty test command");
     }
     const [program, ...args] = parts;
+    if (program === undefined) {
+      return failed("empty test command");
+    }
 
     if (!this.sandbox.executeCommand) {
       return failed("sandbox does not support executeCommand");
@@ -304,7 +314,7 @@ export class TestSuiteVerifier implements Verifier {
     const result = await this.sandbox.executeCommand(
       program,
       args,
-      this.working_dir,
+      this.working_dir ?? null,
       this.timeout_ms,
       signal,
     );
@@ -370,7 +380,7 @@ export class CompositeVerifier implements Verifier {
   async verify(input: VerifierInput, signal?: AbortSignal): Promise<VerifierVerdict> {
     const failures: string[] = [];
     for (let i = 0; i < this.verifiers.length; i++) {
-      const v = this.verifiers[i];
+      const v = this.verifiers[i]!;
       const verdict = await v.verify(input, signal);
       if (verdict.kind === "failed") {
         failures.push(`[verifier ${i}] ${verdict.reason}`);

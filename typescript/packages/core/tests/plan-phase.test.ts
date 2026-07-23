@@ -37,6 +37,7 @@ import {
   type Agent,
   type Context,
   type HarnessConfig,
+  type HarnessStreamEvent,
   type LoopStrategy,
   type SessionState,
   type TokenUsage,
@@ -102,6 +103,7 @@ function tcr(): TurnResult {
  *  that it was invoked, so R5/R6 can assert which agent ran. */
 class RecordingAgent implements Agent {
   ran = 0;
+  readonly seen: Context[] = [];
   private readonly results: TurnResult[] = [];
   constructor(private readonly agentId: AgentId) {}
   push(r: TurnResult): this {
@@ -111,8 +113,9 @@ class RecordingAgent implements Agent {
   id(): AgentId {
     return this.agentId;
   }
-  async turn(_ctx: Context, _signal?: AbortSignal): Promise<TurnResult> {
+  async turn(ctx: Context, _signal?: AbortSignal): Promise<TurnResult> {
     this.ran += 1;
+    this.seen.push(ctx);
     const next = this.results.shift();
     if (next == null) return { kind: "error", error: new EmptyResponse(), usage: null };
     return next;
@@ -603,5 +606,106 @@ describe("PlanExecute plan phase", () => {
     // Neither key is mirrored into SessionState.extras anymore.
     expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
     expect(state.extras[TASK_LIST_EXTRAS_KEY]).toBeUndefined();
+  });
+
+  // G-G: plan-empty re-ask (issue #70). A planner that emits an empty plan on
+  // the first attempt is re-asked up to `planEmptyMaxRetries` more times before
+  // halting with `empty_plan`. Default `0` preserves single-shot behavior.
+  it("G-G: re-asks on an empty plan when planEmptyMaxRetries > 0", async () => {
+    // Attempt 0: empty plan. Attempt 1: real plan. The execute phase then runs
+    // and exhausts the script (no more turns) → a non-`empty_plan` failure,
+    // proving the plan phase RE-ASKED and captured the real plan instead of
+    // halting on the first empty plan.
+    const a = new RecordingAgent(AgentId.of("default"))
+      .push(fr('{"tasks":[],"rationale":"empty"}'))
+      .push(fr(PLAN_JSON));
+    const h = new StandardHarness(configWith(a, { planEmptyMaxRetries: 1 }));
+    const r = await h.run({ task: planTask() });
+    expect(r.kind).toBe("failure");
+    if (r.kind === "failure") {
+      // The plan phase re-asked and captured the real plan; the run proceeded to
+      // execute (which failed), so the reason is NOT `empty_plan`.
+      expect(r.reason.kind).not.toBe("empty_plan");
+    }
+    // The plan artifact was persisted (the re-ask captured the real plan).
+    // 2 plan attempts + execute turns >= 2 agent invocations.
+    expect(a.ran).toBeGreaterThanOrEqual(2);
+  });
+
+  it("G-G: default (planEmptyMaxRetries=0) halts with empty_plan on an empty plan", async () => {
+    const a = new RecordingAgent(AgentId.of("default")).push(
+      fr('{"tasks":[],"rationale":"empty"}'),
+    );
+    const h = new StandardHarness(configWith(a));
+    const r = await h.run({ task: planTask() });
+    expect(r.kind).toBe("failure");
+    if (r.kind === "failure") {
+      expect(r.reason.kind).toBe("empty_plan");
+    }
+    // Single-shot: only one plan attempt.
+    expect(a.ran).toBe(1);
+  });
+
+  it("fresh PlanExecute runs plan again instead of draining a stale completed task_list", async () => {
+    const a = new RecordingAgent(AgentId.of("default"))
+      .push(fr('{"tasks":["first"],"rationale":"r1"}'))
+      .push(fr("first done"))
+      .push(fr('{"tasks":["second"],"rationale":"r2"}'))
+      .push(fr("second done"));
+    const h = new StandardHarness(configWith(a, { storage: inMemoryStorage() }));
+
+    const r1 = await h.run({ task: planTask("run one") });
+    const r2 = await h.run({ task: planTask("run two") });
+
+    expect(r1.kind).toBe("success");
+    expect(r2.kind).toBe("success");
+    // 2 turns per run (plan + execute). A stale-list skip would leave this at 2.
+    expect(a.ran).toBe(4);
+  });
+
+  it("PlanExecute child stream events inherit plan_execute then react node attribution", async () => {
+    const a = new RecordingAgent(AgentId.of("default"))
+      .push(fr('{"tasks":["streamed step"],"rationale":"r"}'))
+      .push(fr("step done"));
+    const h = new StandardHarness(configWith(a));
+    const events: HarnessStreamEvent[] = [];
+    const r = await h.run({ task: planTask("stream me"), on_stream: (e) => events.push(e) });
+
+    expect(r.kind).toBe("success");
+    expect(
+      events.some(
+        (e) =>
+          e.kind === "final_response" &&
+          e.node?.path?.[0] === "plan_execute" &&
+          e.node?.path?.[1] === "react",
+      ),
+    ).toBe(true);
+  });
+
+  it("G-G retry suppresses tools and forces the plan output schema", async () => {
+    const a = new RecordingAgent(AgentId.of("default"))
+      .push(fr('{"tasks":[],"rationale":"empty"}'))
+      .push(fr(PLAN_JSON));
+    const reg = new ScriptedToolRegistry().withSchema({
+      name: "read_file",
+      description: "",
+      input_schema: { type: "object", properties: { path: { type: "string" } } },
+    });
+    const h = new StandardHarness(
+      configWith(a, { planEmptyMaxRetries: 1, toolRegistry: reg }),
+    );
+    const r = await h.run({ task: planTask() });
+
+    expect(r.kind).toBe("failure");
+    expect(a.seen[0]!.tools.map((t) => t.name)).toContain("read_file");
+    expect(a.seen[1]!.tools).toHaveLength(0);
+    expect(a.seen[1]!.params.output_schema).toEqual({
+      type: "object",
+      properties: {
+        tasks: { type: "array", items: { type: "string" } },
+        rationale: { type: "string" },
+      },
+      required: ["tasks", "rationale"],
+    });
   });
 });

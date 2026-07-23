@@ -336,5 +336,7 @@ function renderToolOutput(result: ToolResultRecord): string {
       return "";
     case "awaiting_clarification":
       return "";
+    case "consult":
+      return "";
   }
 }

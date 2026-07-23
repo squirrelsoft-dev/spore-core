@@ -33,7 +33,7 @@ function finalResponse(text: string): ModelResponse {
 }
 
 function mockModel(...texts: string[]): MockModelInterface {
-  const model = new MockModelInterface({ name: "mock", model_id: "mock-model" });
+  const model = new MockModelInterface({ name: "mock", model_id: "mock-model", context_window: 4096 });
   for (const t of texts) model.pushResponse(finalResponse(t));
   return model;
 }
@@ -65,6 +65,7 @@ describe("HarnessBuilder.conversational", () => {
     const model: ModelInterface = new MockModelInterface({
       name: "mock",
       model_id: "mock-model",
+      context_window: 4096,
     }).pushResponse(finalResponse("queued reply"));
     const harness = HarnessBuilder.conversational(model).build();
 

@@ -25,6 +25,7 @@ import {
   hasCycle,
   pushStepLedger,
   renderStepLedger,
+  defaultTaskList,
   type StepLedgerEntry,
   type TaskList,
 } from "../tasklist/index.js";
@@ -1300,6 +1301,8 @@ export interface StrategyExecutor {
     planTask: Task,
     planSession: SessionState,
     budgetUsed: BudgetSnapshot,
+    onStream: StreamSink | undefined,
+    forcedOutputSchema: unknown | undefined,
     signal: AbortSignal | undefined,
   ): Promise<RunResult | undefined>;
 
@@ -1465,6 +1468,15 @@ export interface StrategyExecutor {
    * {@link runReactConfig} to thread into the window. Default `2`.
    */
   outputSchemaMaxRetries(): number;
+
+  /**
+   * The plan-empty re-ask budget `N` (issue #70). When the plan phase captures
+   * an EMPTY plan, re-ask the planner up to `N` more times (tools suppressed +
+   * a `/no_think` nudge demanding the plan as content) before halting with
+   * `empty_plan`. `0` (the default) preserves single-shot behavior. Mirrors
+   * Rust `StrategyExecutor::plan_empty_max_retries`.
+   */
+  planEmptyMaxRetries(): number;
 }
 
 /**
@@ -1522,6 +1534,22 @@ export interface RunScratch {
    * consumed.
    */
   resumeSeed?: SessionState;
+  /**
+   * Continuation signal (#138 AC1): set by Ralph (cross-window continuation of
+   * one logical task) / the `Skip` resolution / an explicit
+   * {@link HarnessRunOptions.continue_task_list} so a `PlanExecute` inner resumes
+   * its durable task list INSTEAD of planning fresh. CONSUMED by the FIRST
+   * `PlanExecute` walk so it never leaks into a nested per-task PlanExecute
+   * (which must plan fresh). Mirrors Rust `cx.scratch.continue_task_list`.
+   */
+  continueTaskList?: boolean;
+  /**
+   * A FORCED output schema (the plan-empty repair re-ask, #139) that wins over
+   * the global `enforceOutputSchemas` gate and is consumed one-shot by the
+   * react leaf. `undefined` on every non-forced path. Mirrors Rust
+   * `cx.scratch.forced_output_schema`.
+   */
+  forcedOutputSchema?: unknown;
 }
 
 function newRunScratch(): RunScratch {
@@ -2206,7 +2234,14 @@ async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<Str
   // compact key-sorted JSON in the window, so they are identical across the four
   // language ports.
   let outputSchema: unknown | undefined;
-  if (executor.enforceOutputSchemas() && c.output !== undefined) {
+  // A FORCED schema (the plan-empty repair re-ask, #139) wins over the global
+  // enforce gate and is consumed one-shot; otherwise fall back to the normal
+  // `enforceOutputSchemas` + `c.output` resolution.
+  const forcedOutputSchema = cx.scratch.forcedOutputSchema;
+  cx.scratch.forcedOutputSchema = undefined;
+  if (forcedOutputSchema !== undefined) {
+    outputSchema = forcedOutputSchema;
+  } else if (executor.enforceOutputSchemas() && c.output !== undefined) {
     outputSchema = cx.registry.resolveSchema(c.output);
   }
   const outputSchemaMaxRetries = executor.outputSchemaMaxRetries();
@@ -2219,8 +2254,15 @@ async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<Str
   // does not).
   const leafBehavior = c.behavior ?? defaultBudgetBehavior();
   pushBudget(cx, c.budget, leafBehavior, "react");
-  const onStream = cx.stream;
-  cx.stream = undefined;
+  // G-A: stamp every event this leaf emits with `node` attribution (kind
+  // "react" + the leaf agent's handle). An enclosing combinator that wraps
+  // `cx.stream` with its own kind before recursing prepends to `path`/bumps
+  // `depth`; the leaf's stamp is set-once (innermost wins). Mirrors Rust
+  // `wrap_node_sink(cx.stream.clone(), "react", agent_id)`.
+  const onStream = wrapNodeSink(cx.stream, "react", c.agent.length > 0 ? c.agent : undefined);
+  // NOTE: do NOT clear `cx.stream` — an enclosing combinator that wrapped it
+  // with its own kind needs it to persist for sibling/next children (mirrors
+  // Rust `wrap_node_sink(cx.stream.clone(), ..)` which clones, not takes).
   const result = await executor.reactWindow(
     task,
     maxIterations,
@@ -2385,6 +2427,52 @@ function fillEmptyWorkerAgent(ls: LoopStrategy, agent: AgentRef): LoopStrategy {
 }
 
 /**
+ * The reserved toolset handle that advertises NO tools (plan-empty re-ask).
+ * Mirrors Rust `NO_TOOLS_TOOLSET = "__none__"`.
+ */
+export const NO_TOOLS_TOOLSET = "__none__";
+
+/**
+ * Clone `ls` with its driving leaf's ReAct toolset re-pointed at
+ * {@link NO_TOOLS_TOOLSET}, so a plan re-ask run through it advertises NO tools
+ * and the planner is forced to answer in message content. Recurses into
+ * wrappers (the PLAN side of a nested `PlanExecute`). Mirrors Rust
+ * `plan_with_tools_suppressed`.
+ */
+export function planWithToolsSuppressed(ls: LoopStrategy): LoopStrategy {
+  switch (ls.kind) {
+    case "react":
+      return { ...ls, toolset: NO_TOOLS_TOOLSET };
+    case "plan_execute":
+      return { ...ls, plan: planWithToolsSuppressed(ls.plan) };
+    case "self_verifying":
+      return { ...ls, inner: planWithToolsSuppressed(ls.inner) };
+    case "ralph":
+      return { ...ls, inner: planWithToolsSuppressed(ls.inner) };
+    case "hill_climbing":
+      return { ...ls, inner: planWithToolsSuppressed(ls.inner) };
+  }
+}
+
+/**
+ * The JSON schema the plan-empty REPAIR forces on a re-ask (#139): the
+ * canonical `{ tasks: [string], rationale: string }` plan contract. Delivered
+ * as the OpenAI/vLLM `response_format` (or Ollama `format`) so the planner is
+ * guided-decoded into valid JSON instead of free prose. Mirrors Rust
+ * `plan_output_schema`.
+ */
+export function planOutputSchema(): unknown {
+  return {
+    type: "object",
+    properties: {
+      tasks: { type: "array", items: { type: "string" } },
+      rationale: { type: "string" },
+    },
+    required: ["tasks", "rationale"],
+  };
+}
+
+/**
  * Fold a child terminal's usage + turns into the cumulative `totalUsage` and
  * the shared `carried` budget snapshot (#124). Mirrors Rust `fold_usage`:
  * `waiting_for_human` / `consult` are non-terminal pauses and carry nothing;
@@ -2465,8 +2553,13 @@ async function runPlanExecuteConfig(
   // step boundaries are re-emitted on `cx.stream`). Take it now and keep it OUT
   // of `cx.stream` so the recursive children run with a suppressed sink; restore
   // it before returning.
+  // G-A: wrap the parent sink so combinator-emitted events carry `node`
+  // attribution (kind "plan_execute"). Children inherit the WRAPPER as
+  // `cx.stream` and stream through it, each event gaining a `plan_execute` hop
+  // in its node path (mirrors Rust `cx.stream = wrap_node_sink(on_stream, ..)`).
+  // Restored to the saved parent on every exit.
   const onStream = cx.stream;
-  cx.stream = undefined;
+  cx.stream = wrapNodeSink(onStream, "plan_execute");
 
   // #131/#138: the phase-agnostic resume seed (the stalled worker conversation
   // carried from a resumed consult or budget pause). Taken BEFORE the plan phase
@@ -2476,14 +2569,28 @@ async function runPlanExecuteConfig(
   cx.scratch.resumeSeed = undefined;
 
   // #138 AC1 (skip re-planning): probe the DURABLE task_list BEFORE the plan
-  // phase. If a non-empty list already exists (e.g. a prior window authored it,
-  // #142 makes it survive Ralph's per-window session reset), the plan phase is
-  // REDUNDANT — go straight to reconcile + the ready-set walk. This is the core
-  // fix: a budget/consult re-entry no longer burns its grant re-planning a graph
-  // that is already durable. The plan artifact may be ABSENT in this case (AC1-a
-  // artifact-optional) — nothing downstream requires it once a task_list exists.
+  // phase. Skip the plan phase ONLY when this is an explicit CONTINUATION that
+  // still has UNFINISHED work to resume — never on the mere presence of a
+  // durable list. The durable task_list is keyed by the stable project namespace
+  // (#142), so it survives across independent re-entries that share a workspace:
+  // separate `run()` calls on one long-lived harness (a conversational host), and
+  // HillClimbing iterations (each a fresh neighbor candidate). Treating "a list
+  // exists" as "resume it" made those re-plan into nothing — a second
+  // `run()`/iteration found the prior, fully-`Completed` graph, walked to no
+  // ready task, and drained to a silent empty `Success`. Continuation is therefore
+  // SIGNALLED, not inferred: a `resumeSeed` (consult/budget/clarification/HITL
+  // resume) or an explicit `continueTaskList` flag set by Ralph (cross-window
+  // continuation of one logical task) / the `Skip` resolution / the run options.
+  // The signal is CONSUMED here so it never leaks into a nested per-task
+  // PlanExecute (which must plan fresh). Mirrors Rust `plan_execute.rs:415-426`.
   const preexisting = await executor.loadTaskList(sessionId);
-  const skipPlan = preexisting != null && preexisting.tasks.length > 0;
+  const isContinuation =
+    resumeSeedSession !== undefined || (cx.scratch.continueTaskList ?? false);
+  cx.scratch.continueTaskList = undefined;
+  const hasUnfinishedWork =
+    preexisting != null &&
+    preexisting.tasks.some((t) => t.status === "pending" || t.status === "in_progress");
+  const skipPlan = isContinuation && hasUnfinishedWork;
 
   let taskList: TaskList;
   let totalUsage: AggregateUsage;
@@ -2520,6 +2627,14 @@ async function runPlanExecuteConfig(
   } else {
     // ── AC3 / fresh-plan path: run the plan phase. ────────────────────────────
     //
+    // A fresh (non-continuation) run clears any STALE durable task list so a
+    // prior completed/abandoned plan in the same project namespace is NOT
+    // reused (model A: `run()` plans fresh by default). Mirrors Rust
+    // `plan_execute.rs` fresh-plan clearing.
+    if (preexisting != null) {
+      await executor.persistTaskList(sessionId, defaultTaskList());
+    }
+    //
     // #138 AC3 (plan-phase exhaustion): when a resume seed is present AND the
     // durable list has no `in_progress` task, the exhaustion happened in the PLAN
     // phase before authoring any task (AC3-b: the list is still empty). Seed the
@@ -2536,93 +2651,155 @@ async function runPlanExecuteConfig(
     // the plan sub-strategy's OWN declared budget (e.g. a ReAct `PerLoop{4}`);
     // the global `max_turns` is only the outer backstop.
     const directive = executor.planDirective(task.instruction);
-    const planSession =
-      planResume && resumeSeedSession !== undefined
-        ? resumeSeedSession
-        : structuredClone(baseSession);
-    if (planResume) resumeSeedSession = undefined;
-    await executor.seedUserMessage(planSession, directive);
-    const planTask: Task = {
-      id: task.id,
-      instruction: directive,
-      session_id: sessionId,
-      budget: { ...task.budget },
-      loop_strategy: c.plan,
-    };
-    const planResult = await executor.runPlanSubtree(
-      c.plan,
-      planTask,
-      planSession,
-      { ...budgetUsed },
-      cx.signal,
-    );
+    // Plan-empty re-ask loop (issue #70): a reasoning model can route its plan
+    // into the reasoning channel, leaving the message CONTENT empty so capture
+    // yields no tasks. Rather than halting on the FIRST empty plan, re-ask up to
+    // `planEmptyMaxRetries` more times — nudging the planner to emit the plan as
+    // message content — before falling through to `empty_plan`. A cap of `0`
+    // (the default) preserves the historical single-shot behaviour
+    // byte-identically. Mirrors Rust `plan_empty_max_retries`.
+    const planEmptyMaxRetries = executor.planEmptyMaxRetries();
+    // The re-ask runs with tools SUPPRESSED: a reasoning model offered the full
+    // toolset tends to derail into a tool call (or pure reasoning) instead of
+    // emitting the plan; with no tools it must answer in content. The first
+    // attempt keeps tools (it may research). Built ONLY when re-asks are enabled
+    // — at the default cap of `0` the loop is single-shot and this clone would
+    // be wasted (keeps the historical no-retry path byte-identical and
+    // allocation-free). Mirrors Rust `plan_with_tools_suppressed`.
+    const retryPlan =
+      planEmptyMaxRetries > 0 ? planWithToolsSuppressed(c.plan) : undefined;
+    let discardedUsage: AggregateUsage = emptyAggregateUsage();
+    let outcome!: { ok: true; artifact: PlanArtifact; usage: AggregateUsage; turns: number } | { ok: false; failure: RunResult };
+    for (let attempt = 0; ; attempt += 1) {
+      const activePlan: LoopStrategy = attempt === 0 ? c.plan : (retryPlan ?? c.plan);
+      const planSession =
+        planResume && attempt === 0 && resumeSeedSession !== undefined
+          ? resumeSeedSession
+          : structuredClone(baseSession);
+      if (planResume && attempt === 0) resumeSeedSession = undefined;
+      await executor.seedUserMessage(planSession, directive);
+      if (attempt > 0) {
+        // Corrective nudge: demand the plan as message content (a soft
+        // `/no_think` hint reasoning models honor). Mirrors Rust's re-ask nudge.
+        const nudge =
+          "Your previous response produced no usable plan (no JSON object, and no " +
+          "tasks were authored). Output the plan NOW as a single JSON object in your " +
+          'MESSAGE CONTENT: {"tasks": [<ordered step strings>], "rationale": ' +
+          "<string>}. Do NOT put the plan only in your reasoning, and do NOT call any " +
+          "tools. /no_think";
+        await executor.seedUserMessage(planSession, nudge);
+      }
+      const planTask: Task = {
+        id: task.id,
+        instruction: directive,
+        session_id: sessionId,
+        budget: { ...task.budget },
+        loop_strategy: activePlan,
+      };
+      // #139: the trusted first attempt runs UNCONSTRAINED; each repair re-ask
+      // FORCES the plan schema (→ `response_format`), so a model that answered
+      // in prose is now made to emit valid `{tasks, rationale}` JSON. Mirrors
+      // Rust `plan_output_schema`.
+      const forcedSchema = attempt > 0 ? planOutputSchema() : undefined;
+      const planResult = await executor.runPlanSubtree(
+        activePlan,
+        planTask,
+        planSession,
+        { ...budgetUsed },
+        cx.stream,
+        forcedSchema,
+        cx.signal,
+      );
 
-    let planOutput: string;
-    let planUsage: AggregateUsage;
-    let planTurns: number;
-    if (planResult == null) {
-      cx.stream = onStream;
-      const result: RunResult = {
-        kind: "failure",
-        reason: {
-          kind: "plan_phase_failed",
-          error: {
-            kind: "planning_turn_failed",
-            message: "plan sub-strategy produced no terminal",
+      let planOutput: string;
+      let planUsage: AggregateUsage;
+      let planTurns: number;
+      if (planResult == null) {
+        cx.stream = onStream;
+        const result: RunResult = {
+          kind: "failure",
+          reason: {
+            kind: "plan_phase_failed",
+            error: {
+              kind: "planning_turn_failed",
+              message: "plan sub-strategy produced no terminal",
+            },
           },
-        },
-        session_id: sessionId,
-        usage: emptyAggregateUsage(),
-        turns: budgetUsed.turns,
-        session_state: emptySessionState(),
-      };
-      return finishCombinator(cx, executor, task, result);
-    } else if (planResult.kind === "success") {
-      planOutput = planResult.output;
-      planUsage = planResult.usage;
-      planTurns = planResult.turns;
-    } else {
-      // A non-success plan terminal (budget / agent error / pause) propagates
-      // verbatim — the run never reaches execute.
-      cx.stream = onStream;
-      return finishCombinator(cx, executor, task, planResult);
-    }
+          session_id: sessionId,
+          usage: emptyAggregateUsage(),
+          turns: budgetUsed.turns,
+          session_state: emptySessionState(),
+        };
+        return finishCombinator(cx, executor, task, result);
+      } else if (planResult.kind === "success") {
+        planOutput = planResult.output;
+        planUsage = planResult.usage;
+        planTurns = planResult.turns;
+      } else {
+        // A non-success plan terminal (budget / agent error / pause) propagates
+        // verbatim — the run never reaches execute.
+        cx.stream = onStream;
+        return finishCombinator(cx, executor, task, planResult);
+      }
 
-    // Capture + persist the artifact from the plan child's output (R3/R4/R11) —
-    // the harness-side machinery, no model turn.
-    const outcome = await executor.capturePlanArtifact(
-      sessionId,
-      planOutput,
-      planUsage,
-      planTurns,
-      cx.signal,
-    );
-    if (!outcome.ok) {
-      cx.stream = onStream;
-      return finishCombinator(cx, executor, task, outcome.failure);
-    }
+      // Capture + persist the artifact from the plan child's output (R3/R4/R11).
+      outcome = await executor.capturePlanArtifact(
+        sessionId,
+        planOutput,
+        planUsage,
+        planTurns,
+        cx.signal,
+      );
+      if (!outcome.ok) {
+        cx.stream = onStream;
+        return finishCombinator(cx, executor, task, outcome.failure);
+      }
 
-    // #126 decision C: the runnable task list comes from the persisted
-    // `task_list` tool store (the ONE authoring path — it can carry real
-    // blockers). Fall back to the linear plan-artifact bridge only when nothing
-    // was authored via the tool (back-compat with the #59/#124 plan-only path and
-    // its replay fixtures).
-    const persisted = await executor.loadTaskList(sessionId);
-    taskList =
-      persisted != null && persisted.tasks.length > 0
-        ? persisted
-        : planArtifactToTaskList(outcome.artifact);
-    if (taskList.tasks.length === 0) {
-      cx.stream = onStream;
-      const result: RunResult = {
-        kind: "failure",
-        reason: { kind: "empty_plan" },
-        session_id: sessionId,
-        usage: outcome.usage,
-        turns: outcome.turns,
+      // #126 decision C: the runnable task list comes from the persisted
+      // `task_list` tool store (the ONE authoring path). Fall back to the linear
+      // plan-artifact bridge only when nothing was authored via the tool.
+      const persisted = await executor.loadTaskList(sessionId);
+      taskList =
+        persisted != null && persisted.tasks.length > 0
+          ? persisted
+          : planArtifactToTaskList(outcome.artifact);
+      if (taskList.tasks.length > 0) break;
+
+      // Empty plan: re-ask while attempts remain, else halt with `empty_plan`
+      // (folding every attempt's usage so the carried budget counts them).
+      if (attempt >= planEmptyMaxRetries) {
+        cx.stream = onStream;
+        const finalUsage: AggregateUsage = {
+          input_tokens: outcome.usage.input_tokens + discardedUsage.input_tokens,
+          output_tokens: outcome.usage.output_tokens + discardedUsage.output_tokens,
+          cache_read_tokens:
+            (outcome.usage.cache_read_tokens ?? 0) + (discardedUsage.cache_read_tokens ?? 0),
+          cache_write_tokens:
+            (outcome.usage.cache_write_tokens ?? 0) + (discardedUsage.cache_write_tokens ?? 0),
+          cost_usd: (outcome.usage.cost_usd ?? 0) + (discardedUsage.cost_usd ?? 0),
+        };
+        const result: RunResult = {
+          kind: "failure",
+          reason: { kind: "empty_plan" },
+          session_id: sessionId,
+          usage: finalUsage,
+          turns: outcome.turns,
+        };
+        return finishCombinator(cx, executor, task, result);
+      }
+      // Fold this discarded attempt's usage and re-ask.
+      discardedUsage = {
+        input_tokens: discardedUsage.input_tokens + outcome.usage.input_tokens,
+        output_tokens: discardedUsage.output_tokens + outcome.usage.output_tokens,
+        cache_read_tokens:
+          (discardedUsage.cache_read_tokens ?? 0) + (outcome.usage.cache_read_tokens ?? 0),
+        cache_write_tokens:
+          (discardedUsage.cache_write_tokens ?? 0) + (outcome.usage.cache_write_tokens ?? 0),
+        cost_usd: (discardedUsage.cost_usd ?? 0) + (outcome.usage.cost_usd ?? 0),
       };
-      return finishCombinator(cx, executor, task, result);
     }
+    // `outcome` is the successful capture from the breaking iteration; `taskList`
+    // is non-empty. The post-loop cycle check + persist + carry proceed below.
 
     // #126 AC5: re-check the WHOLE graph for cycles at execute entry (defense in
     // depth — `add_task` already rejects cycles, but the persisted store could be
@@ -2930,8 +3107,10 @@ async function runPlanExecuteConfig(
       if (pushStepLedger(ledger, entry)) ledgerElided = true;
 
       // Surface the completed step's final text to the caller's sink — the
-      // parent-visible step boundary.
-      if (onStream != null) onStream({ kind: "final_response", content: lastOutput });
+      // parent-visible step boundary. Emit through the WRAPPED `cx.stream` (not
+      // the saved parent `onStream`) so this combinator-surfaced step output is
+      // attributed to the `plan_execute` node (mirrors Rust `#stream`).
+      if (cx.stream != null) cx.stream({ kind: "final_response", content: lastOutput });
 
       // #125: charge this step's turns against the PlanExecute scope.
       const stepCharge = chargeCurrent(cx, Math.max(0, subResult.turns - carriedBefore));
@@ -3134,8 +3313,10 @@ async function runSelfVerifyingConfig(
   cx.scratch.runSession = emptySessionState();
   const carried: BudgetSnapshot = { ...cx.scratch.runBudget };
   // Suppress the run's stream sink for the recursive child phases.
+  // G-A: wrap the parent sink so combinator-emitted events carry `node`
+  // attribution (kind "self_verifying").
   const onStream = cx.stream;
-  cx.stream = undefined;
+  cx.stream = wrapNodeSink(onStream, "self_verifying");
 
   // Q1a: resolve the verifier from `evaluator`'s key (NO wire change).
   const verifier = cx.registry.resolveVerifier(c.evaluator);
@@ -3423,8 +3604,10 @@ async function runRalphConfig(c: RalphConfig, cx: ExecutionContext): Promise<Str
       error: new InvalidConfiguration("no task in ExecutionContext scratch"),
     };
   }
+  // G-A: wrap the parent sink so combinator-emitted events carry `node`
+  // attribution (kind "ralph").
   const onStream = cx.stream;
-  cx.stream = undefined;
+  cx.stream = wrapNodeSink(onStream, "ralph");
   // Ralph discards the incoming session state by design (each window is a fresh
   // start re-seeded from the filesystem checkpoint).
   cx.scratch.runSession = emptySessionState();
@@ -3459,6 +3642,14 @@ async function runRalphConfig(c: RalphConfig, cx: ExecutionContext): Promise<Str
     cx.scratch.runSession = sessionState;
     // FRESH per-window budget (the reset discards the turn budget).
     cx.scratch.runBudget = emptyBudgetSnapshot();
+    // Model (A): Ralph is the continuation loop — each window continues the ONE
+    // logical task across the per-window session reset. Signal it so a
+    // PlanExecute inner resumes its durable task list (window 0 / fresh-start
+    // has an empty list ⇒ the inner's "unfinished work" check still plans fresh;
+    // a window that finished its whole plan but is not yet "done" likewise has
+    // no unfinished work ⇒ re-plans for the remaining work instead of no-op
+    // draining). Mirrors Rust `ralph.rs:306`.
+    cx.scratch.continueTaskList = true;
     const windowOutcome = await runStrategy(innerForWindow, cx);
     // #125 rule 4/7: a window child's `budget_exhausted` reaches Ralph as a
     // `StrategyOutcome`, never auto-cascaded. Ralph's recovery semantics: a
@@ -3551,8 +3742,10 @@ async function runHillClimbingConfig(
   }
   const sessionId = task.session_id;
   const taskId = task.id;
+  // G-A: wrap the parent sink so combinator-emitted events carry `node`
+  // attribution (kind "hill_climbing").
   const onStream = cx.stream;
-  cx.stream = undefined;
+  cx.stream = wrapNodeSink(onStream, "hill_climbing");
   const carried: BudgetSnapshot = { ...cx.scratch.runBudget };
   cx.scratch.runSession = emptySessionState();
   const direction = c.direction;
@@ -3681,6 +3874,13 @@ async function runHillClimbingConfig(
     await executor.appendUserMessage(iterState, task.instruction);
     cx.scratch.runSession = iterState;
     cx.scratch.runBudget = { ...carried };
+    // Model (A): each HillClimbing iteration generates a FRESH neighbor
+    // candidate — never a continuation of the prior iteration's plan. Clear the
+    // continue signal so a PlanExecute inner re-plans each iteration (the
+    // load-bearing requirement of hill climbing), and so an enclosing Ralph
+    // window's continue signal does not leak in. Mirrors Rust
+    // `hill_climbing.rs:422`.
+    cx.scratch.continueTaskList = false;
     const iterOutcome = await runStrategy(c.inner, cx);
     // #125 rule 4/7: a child's `budget_exhausted` reaches HillClimbing as a
     // `StrategyOutcome`, never auto-cascaded. Surface this node's own typed
@@ -4039,7 +4239,36 @@ export type BlockKind = "text" | "reasoning" | "tool_use";
  * Tool lifecycle ordering per call:
  *   `tool_call_start` → `tool_args_delta`* → (`block_stop`) → coarse `tool_call`.
  */
-export type HarnessStreamEvent =
+export type HarnessStreamEvent = WithNode<HarnessStreamEventBase>;
+
+/**
+ * Attribution stamped onto every {@link HarnessStreamEvent} as it flows up
+ * through the node-wrapping sinks (see {@link wrapNodeSink}). Lets a
+ * multi-agent UI route a frame to the node that produced it. Optional so an
+ * un-attributed event (a bare/single-leaf run, or any pre-attribution
+ * consumer) serializes byte-identically to before this field existed. Mirrors
+ * Rust `NodeAttr`.
+ */
+export interface NodeAttr {
+  /** The emitting node's kind: `"react"` (a leaf turn loop), or a combinator
+   *  kind (`"plan_execute"` / `"self_verifying"` / `"ralph"` / `"hill_climbing"`).
+   *  The leaf's kind is the innermost (most specific) — set first. */
+  readonly kind: string;
+  /** The leaf agent's handle (e.g. `"planner"`/`"executor"`), when the emitting
+   *  node is a `react` leaf. Omitted for combinator frames. */
+  readonly agent_id?: string;
+  /** Nesting depth of the emitting leaf below the root. */
+  readonly depth: number;
+  /** Root→leaf node-kind path, accumulated by the wrapper chain (outermost
+   *  first). E.g. `["ralph","plan_execute","self_verifying","react"]`. */
+  readonly path?: string[];
+}
+
+/** Add an optional `node` attribution to every variant of a stream-event union. */
+type WithNode<E> = E extends { kind: string } ? E & { node?: NodeAttr } : never;
+
+/** The base stream-event union (without node attribution). */
+type HarnessStreamEventBase =
   | { kind: "turn_start"; turn: number }
   | { kind: "turn_end"; turn: number }
   | {
@@ -4055,9 +4284,28 @@ export type HarnessStreamEvent =
       is_error: boolean;
       /** The tool result content (issue #103, Q5). */
       content?: string;
+      /**
+       * `true` when this event REPLACES a `tool_result` already emitted for the
+       * same `call_id` because an AfterTool middleware rewrote the result in
+       * place (`continue_with_modification`, issue #11 / SC-9). The model side is
+       * patched via `ContextManager.replaceToolResult`; this is the symmetric
+       * stream-side signal so consumers correct the displayed result instead of
+       * double-counting it as a second call. Mirrors Rust `StreamEvent::ToolResult.revised`.
+       */
+      revised?: boolean;
     }
   | { kind: "final_response"; content: string }
   | { kind: "budget_warning"; limit_type: BudgetLimitType }
+  /**
+   * Live output from a RUNNING tool (pi-style bash streaming): emitted at most
+   * every ~100ms while a command runs, between the tool's `tool_call` and its
+   * `tool_result`. `preview` is a sanitized TAIL SNAPSHOT of the output so far —
+   * each event REPLACES the previous preview (never append); the final full
+   * output still arrives on the `tool_result`. Purely informational: never
+   * persisted to the session and absent from the model conversation. Mirrors
+   * Rust `StreamEvent::ToolProgress`.
+   */
+  | { kind: "tool_progress"; call_id: string; name: string; preview: string }
   /**
    * Emitted by the harness loop when it dispatches the `send_message` tool
    * (issue #81 — `SendMessageTool`). The loop surfaces the message content as
@@ -4065,7 +4313,13 @@ export type HarnessStreamEvent =
    * rendering it prominently is the architect's UI concern. A minimal success
    * tool result is still recorded in history so the loop continues.
    */
-  | { kind: "user_message"; content: string }
+  | { kind: "user_message"; content: string; /**
+   * `true` when this is a USER-authored steering message injected at a turn
+   * boundary (rendered as user input), `false` for the agent's `send_message`
+   * narration (rendered as agent output). Mirrors Rust
+   * `StreamEvent::UserMessage.steered`.
+   */
+  steered?: boolean }
   // ── Delta-level streaming (issue #103) ──────────────────────────────────
   /** Streamed text fragment (model `content_block_delta`). */
   | { kind: "text_delta"; content: string }
@@ -4120,6 +4374,44 @@ export type HarnessStreamEvent =
   | { kind: "output_schema_violation"; attempts: number; error: string };
 
 export type StreamSink = (event: HarnessStreamEvent) => void;
+
+/**
+ * Wrap a parent sink so every event passing through is stamped for ONE node.
+ * The leaf installs the innermost wrapper (it sets `kind`/`agent_id`/seeds the
+ * `path`); each enclosing combinator's wrapper PREPENDS its kind to `path` and
+ * bumps `depth`. Stamping is set-once for `kind`/`agent_id` (the innermost leaf
+ * wins) so the event reports who actually spoke, with the full nesting in
+ * `path`. Returns `undefined` when there is no parent sink (no-op, baseline
+ * path). Mirrors Rust `wrap_node_sink`.
+ */
+export function wrapNodeSink(
+  parent: StreamSink | undefined,
+  kind: string,
+  agentId?: string,
+): StreamSink | undefined {
+  if (parent == null) return undefined;
+  return (event: HarnessStreamEvent): void => {
+    if (event.node == null) {
+      // Innermost leaf stamps kind/agent_id and seeds the path.
+      (event as { node?: NodeAttr }).node = {
+        kind,
+        agent_id: agentId,
+        depth: 0,
+        path: [kind],
+      };
+    } else {
+      // An enclosing combinator prepends its kind and bumps depth.
+      const prev = event.node;
+      (event as { node?: NodeAttr }).node = {
+        kind: prev.kind,
+        agent_id: prev.agent_id,
+        depth: prev.depth + 1,
+        path: [kind, ...(prev.path ?? [])],
+      };
+    }
+    parent(event);
+  };
+}
 
 /**
  * Per-turn state threaded through `mapModelStreamEvent` (issue #103). Tracks
@@ -4267,12 +4559,27 @@ export const HarnessSignalSchema = z.discriminatedUnion("kind", [
     mode: z.enum(["always_ask", "auto_edit", "plan", "safe_auto"]),
   }),
   z.object({ kind: z.literal("abort"), reason: z.string() }),
+  z.object({ kind: z.literal("plan_recorded") }),
 ]);
 export type HarnessSignal =
   | { kind: "enter_plan_mode"; context: string }
   | { kind: "exit_plan_mode"; plan: PlanArtifact }
   | { kind: "switch_mode"; mode: Mode }
-  | { kind: "abort"; reason: string };
+  | { kind: "abort"; reason: string }
+  /**
+   * The planner recorded its plan via `set_plan` and is done planning — END the
+   * PlanExecute plan phase (the plan-phase analogue of `plan_completed`) so the
+   * DAG walk proceeds to EXECUTE. Carries no artifact: the runnable plan is
+   * already in the durable `task_list` store the plan phase reads. Unlike
+   * `abort`, it is CONSUMED inside PlanExecute and never ends the whole run.
+   *
+   * Forward-compatible seam: mirrors Rust `HarnessSignal::PlanRecorded`. The
+   * `set_plan` tool itself returns success (it does NOT escalate this signal);
+   * the plan phase handles an `escalate { plan_recorded }` RunResult for
+   * future loop recognition, while today the plan is captured via the durable
+   * `task_list` store fallback (SC-28).
+   */
+  | { kind: "plan_recorded" };
 
 /**
  * Tool dispatch output. Full type lives in issue #4/#5; this covers loop routing.
@@ -4486,6 +4793,14 @@ export type DangerousIsolationMode = { kind: "none" } & {
 };
 
 /**
+ * Live progress sink for a RUNNING subprocess (G-B). Each call delivers a
+ * sanitized TAIL SNAPSHOT of the output accumulated so far — consumers REPLACE
+ * the previous preview, never append. Must not block. Mirrors Rust
+ * `CommandProgressSink`.
+ */
+export type CommandProgressSink = (preview: string) => void;
+
+/**
  * Internal union of every isolation mode, including the dangerous
  * {@link DangerousIsolationMode}. Used by the sandbox switch bodies and by the
  * dangerous entry point. NOT part of the default public API — default callers
@@ -4639,6 +4954,22 @@ export interface SandboxProvider {
     args: readonly string[],
     cwd?: string | null,
     timeoutMs?: number | null,
+    signal?: AbortSignal,
+  ): Promise<CommandOutput | SandboxViolation>;
+
+  /**
+   * Live progress sink for a RUNNING subprocess (G-B, pi-style bash streaming).
+   * Each call delivers a sanitized TAIL SNAPSHOT of the output accumulated so
+   * far — consumers REPLACE the previous preview, never append. Invoked from
+   * the executor's wait loop at most every ~100ms, and only when the snapshot
+   * changed; it must not block. Mirrors Rust `CommandProgressSink`.
+   */
+  executeCommandStreaming?(
+    command: string,
+    args: readonly string[],
+    cwd: string | null,
+    timeoutMs: number | null,
+    progress: CommandProgressSink | undefined,
     signal?: AbortSignal,
   ): Promise<CommandOutput | SandboxViolation>;
 
@@ -4969,6 +5300,13 @@ export interface ConsultHandlerEntry {
 
 /** Per-kind consult handlers (issue #114), keyed by {@link ConsultRequest.kind}. */
 export type ConsultHandlerMap = Map<string, ConsultHandlerEntry>;
+
+/**
+ * Mid-run steering source (pi-style): a callback drained at each turn boundary
+ * that returns user messages queued since the last turn. Mirrors Rust
+ * `SteeringSource = Arc<dyn Fn() -> Vec<String> + Send + Sync>`.
+ */
+export type SteeringSource = () => string[];
 
 // ============================================================================
 // PausedState / ChildPausedState
@@ -5338,6 +5676,18 @@ export interface HarnessRunOptions {
   /** Optional starting session state (resumed history). */
   session_state?: SessionState;
   signal?: AbortSignal;
+  /**
+   * Opt in to CONTINUING the durable, project-scoped task list from a prior
+   * run rather than planning fresh (model A). Default `false` (omitted): a
+   * `PlanExecute` `run()` plans fresh and clears any stale list — the correct
+   * default for a conversational host issuing one independent `run()` per user
+   * turn. Set `true` only to deliberately resume an in-flight plan across
+   * `run()` calls; the in-process HITL / budget / consult resume paths and the
+   * Ralph window loop signal continuation on their own and do NOT need this.
+   * Has effect only when there is unfinished (`pending`/`in_progress`) work to
+   * resume. Mirrors Rust `HarnessRunOptions::continue_task_list`.
+   */
+  continue_task_list?: boolean;
 }
 
 // ============================================================================

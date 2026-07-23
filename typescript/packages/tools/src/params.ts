@@ -55,6 +55,9 @@ export type ListDirParams = z.infer<typeof ListDirParamsSchema>;
 export const DeleteFileParamsSchema = z.object({ path: z.string() });
 export type DeleteFileParams = z.infer<typeof DeleteFileParamsSchema>;
 
+export const CreateDirParamsSchema = z.object({ path: z.string() });
+export type CreateDirParams = z.infer<typeof CreateDirParamsSchema>;
+
 export const MoveFileParamsSchema = z.object({
   src: z.string(),
   dst: z.string(),

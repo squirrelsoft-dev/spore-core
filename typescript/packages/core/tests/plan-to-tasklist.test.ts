@@ -42,10 +42,10 @@ describe("planArtifactToTaskList (#72)", () => {
 
   it("copies descriptions verbatim — whitespace and empty strings preserved", () => {
     const list = planArtifactToTaskList(artifact(["  spaced  ", ""]));
-    expect(list.tasks[0].description).toBe("  spaced  ");
-    expect(list.tasks[1].description).toBe("");
-    expect(list.tasks[0].id).toBe(1);
-    expect(list.tasks[1].id).toBe(2);
+    expect(list.tasks[0]!.description).toBe("  spaced  ");
+    expect(list.tasks[1]!.description).toBe("");
+    expect(list.tasks[0]!.id).toBe(1);
+    expect(list.tasks[1]!.id).toBe(2);
   });
 
   it("maps an empty plan to the canonical default list", () => {

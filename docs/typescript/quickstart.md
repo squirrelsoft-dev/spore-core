@@ -1,9 +1,16 @@
 # Quickstart — TypeScript
 
-> 🚧 **Stub.** Full TypeScript guide pages are in progress. The TypeScript implementation tracks
-> the same specification as Rust; until these pages fill in, read the language-agnostic
-> [quickstart guide](../guides/quickstart.md) for the concepts and follow the
-> [Rust quickstart](../rust/quickstart.md) for the shape of the code.
+> The TypeScript implementation tracks the same specification as Rust. Read the
+> language-agnostic [quickstart guide](../guides/quickstart.md) for the concepts;
+> the TypeScript-specific pages below carry the code shape.
+
+## Companion pages
+
+- [Building a tool](building-a-tool.md) — catalogue tools, a custom `ToolRegistry`,
+  and the storage seam.
+- [Conversation](conversation.md) — threading `SessionState` and auto-persist.
+- [Custom harness](custom-harness.md) — overriding one slot at a time from the
+  `conversational` preset, or building from scratch.
 
 ## The shape
 

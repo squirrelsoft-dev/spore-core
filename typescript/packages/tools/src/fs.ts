@@ -21,6 +21,7 @@ import {
   sbResolvePath,
 } from "./sandbox-defaults.js";
 import {
+  CreateDirParamsSchema,
   DeleteFileParamsSchema,
   ListDirParamsSchema,
   MoveFileParamsSchema,
@@ -467,6 +468,67 @@ async function walk(
     } else {
       const rel = toRootRelative(full);
       if (rel !== null) out.push(rel);
+    }
+  }
+}
+
+// ============================================================================
+// DeleteFile
+// ============================================================================
+
+// ============================================================================
+// CreateDir
+// ============================================================================
+
+export class CreateDirTool implements Tool {
+  static readonly NAME = "create_dir";
+  readonly name = CreateDirTool.NAME;
+
+  static schema(): ToolSchema {
+    return {
+      name: CreateDirTool.NAME,
+      description:
+        "Create a directory, including any missing parent directories (like mkdir -p)",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string" } },
+        required: ["path"],
+      },
+      annotations: {
+        read_only: false,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+      },
+    };
+  }
+
+  async execute(
+    call: ToolCall,
+    sandbox: SandboxProvider,
+    _ctx: ToolContext,
+  ): Promise<ToolOutput> {
+    const p = parseParams(CreateDirParamsSchema, call);
+    if (!p.ok) return toolExecutionErrorToOutput(p.error);
+    const resolved = await sbResolvePath(sandbox, p.value.path, "write");
+    if (isSandboxViolation(resolved))
+      return toolExecutionErrorToOutput({
+        kind: "sandbox_violation",
+        violation: resolved,
+      });
+    try {
+      await fs.mkdir(resolved, { recursive: true });
+      return {
+        kind: "success",
+        content: `created directory ${p.value.path}`,
+        truncated: false,
+      };
+    } catch (e) {
+      return {
+        kind: "error",
+        message: `create_dir failed: ${stringifyError(e)}`,
+        recoverable: true,
+      };
     }
   }
 }

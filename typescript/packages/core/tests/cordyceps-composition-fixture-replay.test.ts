@@ -288,7 +288,7 @@ describe("cordyceps composition fixture replay (#131)", () => {
     addTask(tl, "audit module two", []); // 2 (independent)
     await h.persistTaskList(session, tl);
 
-    const r = await h.run({ task: peTask("cordyceps-pe") });
+    const r = await h.run({ task: peTask("cordyceps-pe"), continue_task_list: true });
     expect(r.kind).toBe("success");
 
     // Every ready task was walked and self-verified to completion.
@@ -310,7 +310,7 @@ describe("cordyceps composition fixture replay (#131)", () => {
     addTask(tl, "independent module", []); // 4 (still completes)
     await h.persistTaskList(session, tl);
 
-    const r = await h.run({ task: peTask("cordyceps-runaway") });
+    const r = await h.run({ task: peTask("cordyceps-runaway"), continue_task_list: true });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") {
       expect(r.reason.kind).toBe("tasks_blocked_by_failure");
@@ -356,7 +356,7 @@ describe("cordyceps composition fixture replay (#131)", () => {
     await h.persistTaskList(session, tl);
 
     // First leg: drive to the consult pause.
-    const first = await h.run({ task: peTask("cordyceps-consult") });
+    const first = await h.run({ task: peTask("cordyceps-consult"), continue_task_list: true });
     if (first.kind !== "consult") {
       throw new Error(`expected RunResult.consult to surface to the host, got ${first.kind}`);
     }
@@ -402,7 +402,7 @@ describe("cordyceps composition fixture replay (#131)", () => {
     await h.persistTaskList(session, tl);
 
     // Leg 1: drive to the budget-exhaustion pause.
-    const first = await h.run({ task: smallPeTask("cordyceps-budget") });
+    const first = await h.run({ task: smallPeTask("cordyceps-budget"), continue_task_list: true });
     if (first.kind !== "waiting_for_human") {
       throw new Error(`expected WaitingForHuman budget pause, got ${first.kind}`);
     }

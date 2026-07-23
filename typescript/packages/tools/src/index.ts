@@ -29,6 +29,7 @@ export {
 export * from "./params.js";
 
 export {
+  CreateDirTool,
   DeleteFileTool,
   ListDirTool,
   MoveFileTool,
@@ -75,6 +76,7 @@ export {
 } from "./git.js";
 export { HttpGetTool, HttpPostTool } from "./http.js";
 export { TaskListTool } from "./tasklist.js";
+export { SetPlanTool } from "./set-plan.js";
 export {
   type BuildError as SubagentBuildError,
   type ContextSharing,

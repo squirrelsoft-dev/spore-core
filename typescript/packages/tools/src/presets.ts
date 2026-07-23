@@ -23,8 +23,8 @@ import {
   autoContinue,
   HarnessBuilder,
   WorkspaceScopedSandbox,
+  metric,
   type EscalationMode,
-  type MetricEvaluator,
   type ModelInterface,
   type WorkspaceConfig,
 } from "@spore/core";
@@ -158,7 +158,7 @@ export function codingAgent(
  */
 export function hillClimber(
   model: ModelInterface,
-  evaluator: MetricEvaluator,
+  evaluator: metric.MetricEvaluator,
 ): HarnessBuilder {
   return HarnessBuilder.conversational(model)
     .metricEvaluator(evaluator)

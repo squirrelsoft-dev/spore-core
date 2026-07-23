@@ -428,6 +428,28 @@ describe("ExecConfig exec-hardening (SC-12)", () => {
     15000,
   );
 
+  it.runIf(IS_UNIX)(
+    "kill_on_drop reaps background descendant process group on timeout",
+    async () => {
+      const root = tmp();
+      const sentinel = join(root, "kod_descendant_sentinel");
+      const sb = new WorkspaceScopedSandbox(execCfg(root, { kill_on_drop: true }));
+      const out = await sb.executeCommand(
+        "/bin/sh",
+        ["-c", `(sleep 0.3; touch ${sentinel}) & sleep 5`],
+        root,
+        50,
+      );
+      if ("kind" in out) throw new Error("unexpected violation");
+      expect(out.timed_out).toBe(true);
+      // Wait past the descendant's scheduled touch. If only the direct shell was
+      // killed, the background subshell remains alive and creates this file.
+      await new Promise((r) => setTimeout(r, 700));
+      expect(existsSync(sentinel)).toBe(false);
+    },
+    15000,
+  );
+
   it.runIf(IS_UNIX)("unset exec_config preserves legacy behavior", async () => {
     const sb = new WorkspaceScopedSandbox(cfg(tmp()));
     // No implicit timeout: a quick echo runs to completion, un-timed.

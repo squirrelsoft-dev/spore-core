@@ -191,7 +191,7 @@ describe("TaskListTool", () => {
       ),
     );
     expect(l1.tasks).toHaveLength(1);
-    expect(l1.tasks[0].id).toBe(1);
+    expect(l1.tasks[0]!.id).toBe(1);
     expect(l1.next_id).toBe(2);
 
     const l2 = parseList(
@@ -262,7 +262,7 @@ describe("TaskListTool", () => {
     const a = await loadFromStore(runStore, "project-a");
     const b = await loadFromStore(runStore, "project-b");
     expect(a?.tasks).toHaveLength(1);
-    expect(a?.tasks[0].description).toBe("a1");
+    expect(a?.tasks[0]!.description).toBe("a1");
     expect(b?.tasks).toHaveLength(2);
     expect(b?.tasks.map((t) => t.description)).toEqual(["b1", "b2"]);
   });
@@ -301,7 +301,7 @@ describe("TaskListTool", () => {
       await tool.execute(call({ action: "list_tasks" }), sb, ctxW2),
     );
     expect(listed.tasks).toHaveLength(1);
-    expect(listed.tasks[0].description).toBe("from window 1");
+    expect(listed.tasks[0]!.description).toBe("from window 1");
   });
 
   // Persist then reload with a FRESH tool over the SAME ctx yields identical list.
@@ -343,12 +343,12 @@ describe("TaskListTool", () => {
         ctx,
       ),
     );
-    expect(r.tasks[0].status).toBe("in_progress");
+    expect(r.tasks[0]!.status).toBe("in_progress");
 
     const c = parseList(
       await tool.execute(call({ action: "complete_task", id: 1 }), sb, ctx),
     );
-    expect(c.tasks[0].status).toBe("completed");
+    expect(c.tasks[0]!.status).toBe("completed");
   });
 
   it("unknown id is a recoverable error", async () => {
@@ -445,7 +445,7 @@ describe("TaskListTool", () => {
         ctx,
       ),
     );
-    expect(list.tasks[1].blockers).toEqual([1]);
+    expect(list.tasks[1]!.blockers).toEqual([1]);
   });
 
   // #118: omitting blockers defaults to empty (backward-compatible call).
@@ -456,7 +456,7 @@ describe("TaskListTool", () => {
       new AllowAllSandbox(),
       ctx,
     );
-    expect(parseList(out).tasks[0].blockers).toEqual([]);
+    expect(parseList(out).tasks[0]!.blockers).toEqual([]);
   });
 
   // #118: a self-blocking add maps to a recoverable tool error.
@@ -530,9 +530,9 @@ describe("TaskListTool", () => {
     expect(list.tasks).toHaveLength(1);
     expect(list.next_id).toBe(2);
     // R-143.2: `added` == the persisted task's id.
-    expect(parseAdded(out)).toBe(list.tasks[0].id);
+    expect(parseAdded(out)).toBe(list.tasks[0]!.id);
     const persisted = await loadFromStore(ctx.runStore);
-    expect(parseAdded(out)).toBe(persisted?.tasks[0].id);
+    expect(parseAdded(out)).toBe(persisted?.tasks[0]!.id);
   });
 
   // R-143.4: two adds → `added` is 1 then 2, with next_id 2 then 3.
@@ -666,7 +666,7 @@ describe("TaskListTool", () => {
       sb,
       ctx,
     );
-    expect(parseList(rb).tasks[1].blockers).toEqual([aId]);
+    expect(parseList(rb).tasks[1]!.blockers).toEqual([aId]);
 
     // Complete A by the surfaced id.
     const rc = await tool.execute(
@@ -718,7 +718,7 @@ describe("fixture: tasklist operations", () => {
       const sb = new AllowAllSandbox();
       const tool = new TaskListTool();
       for (let i = 0; i < sc.steps.length; i++) {
-        const step = sc.steps[i];
+        const step = sc.steps[i]!;
         const isAdd =
           (step.action as { action?: unknown } | null)?.action === "add_task";
         const out = await tool.execute(call(step.action), sb, ctx);

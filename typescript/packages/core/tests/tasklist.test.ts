@@ -35,7 +35,7 @@ function listWith(statuses: TaskStatus[]): TaskList {
   const l = defaultTaskList();
   for (const _ of statuses) add(l, "t");
   statuses.forEach((s, i) => {
-    l.tasks[i].status = s;
+    l.tasks[i]!.status = s;
   });
   return l;
 }
@@ -72,21 +72,21 @@ describe("tasklist helpers", () => {
   it("update applies a valid status transition", () => {
     const l = listWith(["pending"]);
     expect(updateTask(l, 1, "in_progress").ok).toBe(true);
-    expect(l.tasks[0].status).toBe("in_progress");
+    expect(l.tasks[0]!.status).toBe("in_progress");
   });
 
   it("update sets description only", () => {
     const l = listWith(["pending"]);
     expect(updateTask(l, 1, undefined, "rewritten").ok).toBe(true);
-    expect(l.tasks[0].description).toBe("rewritten");
-    expect(l.tasks[0].status).toBe("pending");
+    expect(l.tasks[0]!.description).toBe("rewritten");
+    expect(l.tasks[0]!.status).toBe("pending");
   });
 
   it("update sets status and description at once", () => {
     const l = listWith(["pending"]);
     expect(updateTask(l, 1, "blocked", "blocked on x").ok).toBe(true);
-    expect(l.tasks[0].status).toBe("blocked");
-    expect(l.tasks[0].description).toBe("blocked on x");
+    expect(l.tasks[0]!.status).toBe("blocked");
+    expect(l.tasks[0]!.description).toBe("blocked on x");
   });
 
   it("update with neither field is a no-op success", () => {
@@ -99,7 +99,7 @@ describe("tasklist helpers", () => {
   it("complete marks completed", () => {
     const l = listWith(["in_progress"]);
     expect(completeTask(l, 1).ok).toBe(true);
-    expect(l.tasks[0].status).toBe("completed");
+    expect(l.tasks[0]!.status).toBe("completed");
   });
 
   // R4
@@ -126,15 +126,15 @@ describe("tasklist helpers", () => {
   it("pending -> completed is allowed via complete", () => {
     const l = listWith(["pending"]);
     expect(completeTask(l, 1).ok).toBe(true);
-    expect(l.tasks[0].status).toBe("completed");
+    expect(l.tasks[0]!.status).toBe("completed");
   });
 
   it("blocked -> in_progress and blocked -> completed allowed", () => {
     const l = listWith(["blocked", "blocked"]);
     expect(updateTask(l, 1, "in_progress").ok).toBe(true);
     expect(completeTask(l, 2).ok).toBe(true);
-    expect(l.tasks[0].status).toBe("in_progress");
-    expect(l.tasks[1].status).toBe("completed");
+    expect(l.tasks[0]!.status).toBe("in_progress");
+    expect(l.tasks[1]!.status).toBe("completed");
   });
 
   // R7
@@ -142,7 +142,7 @@ describe("tasklist helpers", () => {
     const l = listWith(["completed"]);
     expect(updateTask(l, 1, "completed").ok).toBe(true);
     expect(completeTask(l, 1).ok).toBe(true);
-    expect(l.tasks[0].status).toBe("completed");
+    expect(l.tasks[0]!.status).toBe("completed");
   });
 });
 
@@ -251,7 +251,7 @@ describe("tasklist serialization", () => {
     const json = '{"tasks":[{"id":1,"description":"old","status":"pending"}],"next_id":2}';
     const l = parseTaskList(json);
     expect(l.tasks).toHaveLength(1);
-    expect(l.tasks[0].blockers).toEqual([]);
+    expect(l.tasks[0]!.blockers).toEqual([]);
     expect(serializeTaskList(l)).toBe(
       '{"tasks":[{"id":1,"description":"old","status":"pending","blockers":[]}],"next_id":2}',
     );
@@ -268,14 +268,14 @@ describe("tasklist blockers (#118)", () => {
     expect(add(l, "a")).toBe(1);
     expect(add(l, "b")).toBe(2);
     expect(add(l, "c", [1, 2])).toBe(3);
-    expect(l.tasks[2].blockers).toEqual([1, 2]);
+    expect(l.tasks[2]!.blockers).toEqual([1, 2]);
     expect(l.next_id).toBe(4);
   });
 
   it("empty blockers never reject and store as an empty array", () => {
     const l = defaultTaskList();
     add(l, "a");
-    expect(l.tasks[0].blockers).toEqual([]);
+    expect(l.tasks[0]!.blockers).toEqual([]);
   });
 
   it("rejects a self-block (blocker == about-to-assign id)", () => {
@@ -337,7 +337,7 @@ describe("tasklist blockers (#118)", () => {
     add(l, "a"); // id 1
     add(l, "b"); // id 2
     // Make task 1 depend on id 3 (the next id about to be assigned).
-    l.tasks[0].blockers = [3];
+    l.tasks[0]!.blockers = [3];
     // Now add task 3 blocked by 1: path 3 -> 1 -> 3 is a cycle.
     const r = addTask(l, "c", [1]);
     expect(r.ok).toBe(false);
@@ -363,8 +363,8 @@ describe("wouldCreateCycle", () => {
     add(l, "a"); // 1
     add(l, "b"); // 2
     add(l, "c"); // 3
-    l.tasks[2].blockers = [2]; // 3 -> 2
-    l.tasks[1].blockers = [1]; // 2 -> 1
+    l.tasks[2]!.blockers = [2]; // 3 -> 2
+    l.tasks[1]!.blockers = [1]; // 2 -> 1
     // Re-adding node 1 with a blocker on 3 closes 1 -> 3 -> 2 -> 1.
     expect(wouldCreateCycle(l, 1, [3])).toBe(true);
     // Node 4 with blocker 3 has no path back to 4, so no cycle.

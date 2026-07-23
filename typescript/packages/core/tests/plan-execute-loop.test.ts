@@ -411,7 +411,7 @@ describe("PlanExecute execute phase (issue #59)", () => {
     if (good.ok && bad.ok) addTask(tl, "never", [bad.id]);
     await h.persistTaskList(SID, tl);
 
-    const r = await h.run({ task: planTask() });
+    const r = await h.run({ task: planTask(), continue_task_list: true });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") {
       expect(r.reason.kind).toBe("tasks_blocked_by_failure");

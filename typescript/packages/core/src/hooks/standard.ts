@@ -242,7 +242,11 @@ export class CommandHook implements Hook {
         }
       });
 
-      child.stdin.on("error", (err) => fail(-1, err.message));
+      // A command is allowed to exit or close stdin before consuming the hook
+      // payload. In that race Node may emit EPIPE on stdin before `close`; do not
+      // let it mask the process's real exit code (CI saw `exit 7` reported as
+      // `-1`). Spawn errors still arrive on `child.on("error")` above.
+      child.stdin.on("error", () => {});
       child.stdin.write(stdinPayload);
       child.stdin.end();
     });

@@ -6,7 +6,12 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { harnessTesting, toolRegistry, type ToolCall } from "@spore/core";
+import {
+  WorkspaceScopedSandbox,
+  harnessTesting,
+  toolRegistry,
+  type ToolCall,
+} from "@spore/core";
 import { describe, expect, it } from "vitest";
 
 import { BashCommandTool, ExecTool } from "../src/index.js";
@@ -173,6 +178,26 @@ describe("BashCommandTool", () => {
     expect(r.kind).toBe("success");
     if (r.kind !== "success") throw new Error("unreachable");
     expect(r.content).toBe("HI");
+  });
+
+  it.runIf(IS_UNIX)("emits live progress through WorkspaceScopedSandbox", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "spore-bash-progress-"));
+    try {
+      const previews: string[] = [];
+      const progressCtx = {
+        commandProgress: () => (preview: string) => previews.push(preview),
+      } as unknown as toolRegistry.ToolContext;
+      const sb = new WorkspaceScopedSandbox({ root: dir });
+      const r = await new BashCommandTool().execute(
+        call("bash_command", { script: "printf progress-one" }),
+        sb,
+        progressCtx,
+      );
+      expect(r.kind).toBe("success");
+      expect(previews.some((p) => p.includes("progress-one"))).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it.runIf(IS_UNIX)("supports a redirect", async () => {

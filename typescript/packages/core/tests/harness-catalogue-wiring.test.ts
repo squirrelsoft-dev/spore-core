@@ -24,6 +24,7 @@ import {
   storage,
   newTask,
   toolRegistry,
+  type ToolRegistry as HarnessToolRegistry,
   type Agent,
   type Context,
   type LoopStrategy,
@@ -234,7 +235,7 @@ describe("RealToolRegistry bridge (#91)", () => {
 /** Dispatch a tool by name through a bridged registry and report whether it
  *  resolved to a *successful* tool output (vs an unknown-tool / not-available
  *  recoverable error). Mirrors the Rust `dispatched_ok` helper. */
-async function dispatchedOk(reg: toolRegistry.ToolRegistry, name: string): Promise<boolean> {
+async function dispatchedOk(reg: HarnessToolRegistry, name: string): Promise<boolean> {
   const out = await reg.dispatch({ id: "c", name, input: {} } as ToolCall);
   return out.kind !== "error";
 }
@@ -246,10 +247,10 @@ function effectiveFor(
   h: StandardHarness,
   sessionId: SessionId,
   toolset: string,
-): toolRegistry.ToolRegistry {
+): HarnessToolRegistry {
   return (
     h as unknown as {
-      effectiveToolRegistry(s: SessionId, t: string): toolRegistry.ToolRegistry;
+      effectiveToolRegistry(s: SessionId, t: string): HarnessToolRegistry;
     }
   ).effectiveToolRegistry(sessionId, toolset);
 }

@@ -21,6 +21,12 @@ export {
   type SharedFlag,
 } from "./prompt-tool-call.js";
 export {
+  mediaTypeForExtension,
+  isImagePath,
+  imageContent,
+  loadImageContent,
+} from "./image.js";
+export {
   AnthropicModelInterface,
   ANTHROPIC_VERSION,
   DEFAULT_BASE_URL as ANTHROPIC_DEFAULT_BASE_URL,

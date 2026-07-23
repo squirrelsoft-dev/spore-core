@@ -27,7 +27,6 @@ import {
   observability,
   type HarnessConfig,
   type RunResult,
-  type Span,
   type TokenUsage,
 } from "@spore/core";
 
@@ -83,7 +82,7 @@ function usage(): TokenUsage {
  *  that produces `nRunsNeeded` final responses (one per run). `success`
  *  controls whether each run succeeds or errors out (a weaker config). */
 function configWith(
-  obs: InMemoryObservabilityProvider,
+  obs: InstanceType<typeof InMemoryObservabilityProvider>,
   success: boolean,
   nRunsNeeded: number,
 ): HarnessConfig {
@@ -674,7 +673,7 @@ describe("Rule 29 — core_suite.json fixture", () => {
 describe("Rule 30 — TraceAnalyzer interface only", () => {
   it("a user can implement it; no built-in ships", async () => {
     class UserAnalyzer implements TraceAnalyzer {
-      async analyze(_traces: Span[]): Promise<HarnessConfigDiff[]> {
+      async analyze(_traces: observability.Span[]): Promise<HarnessConfigDiff[]> {
         return [{ description: "proposed" }];
       }
     }

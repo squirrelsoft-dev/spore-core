@@ -18,13 +18,11 @@ import { join } from "node:path";
 
 import {
   metric,
+  termination,
   MockModelInterface,
-  type MetricEvaluator,
-  type MetricOutcome,
   type OptimizationDirection,
   type ProviderInfo,
   type SandboxProvider,
-  type SessionStateSnapshot,
 } from "@spore/core";
 import { describe, expect, it } from "vitest";
 
@@ -47,12 +45,12 @@ function presetMockModel(): MockModelInterface {
 
 /** Minimal `MetricEvaluator` test double (mirrors the Rust `LatencyEvaluator`
  *  stand-in's role — only its registration is asserted, never `evaluate`). */
-class StubMetricEvaluator implements MetricEvaluator {
+class StubMetricEvaluator implements metric.MetricEvaluator {
   async evaluate(
     _sandbox: SandboxProvider,
-    _snapshot: SessionStateSnapshot,
+    _snapshot: termination.SessionStateSnapshot,
     _signal?: AbortSignal,
-  ): Promise<MetricOutcome> {
+  ): Promise<metric.MetricOutcome> {
     return { kind: "ok", result: metric.newMetricResult(1) };
   }
   direction(): OptimizationDirection {
@@ -130,8 +128,8 @@ describe("hillClimber preset", () => {
     const evaluator = new StubMetricEvaluator();
     const cfg = hillClimber(presetMockModel(), evaluator).buildConfig();
 
-    expect(cfg.registry.resolveMetricEvaluator("")).toBeDefined();
-    expect(cfg.registry.resolveMetricEvaluator("")).toBe(evaluator);
+    expect(cfg.registry!.resolveMetricEvaluator("")).toBeDefined();
+    expect(cfg.registry!.resolveMetricEvaluator("")).toBe(evaluator);
 
     expect(cfg.escalationMode?.kind).toBe("auto_continue");
   });

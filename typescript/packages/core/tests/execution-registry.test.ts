@@ -44,8 +44,10 @@ import {
   type ModelInterface,
   type ModelRequest,
   type ModelResponse,
+  type ProviderInfo,
   type ReactConfig,
   type RunStrategy,
+  type StreamEvent,
   type StrategyOutcome,
   type StrategyRef,
   type TurnResult,
@@ -514,6 +516,12 @@ function fakeModel(): ModelInterface {
     },
     async countTokens(_req: ModelRequest): Promise<number> {
       return 0;
+    },
+    async *callStreaming(_req: ModelRequest, _signal?: AbortSignal): AsyncIterable<StreamEvent> {
+      throw new Error("not called");
+    },
+    provider(): ProviderInfo {
+      return { name: "fake", model_id: "fake", context_window: 4096 };
     },
   };
 }
