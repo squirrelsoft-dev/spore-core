@@ -3,7 +3,7 @@ name = "spore-mcp"
 version = "0.0.0"
 edition = "2021"
 description = "MCP (Model Context Protocol) client tools for spore-core"
-license = "Apache-2.0"
+license = "MIT"
 
 [dependencies]
 spore-core = { path = "../spore-core" }

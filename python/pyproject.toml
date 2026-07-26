@@ -2,6 +2,7 @@
 name = "spore-core-workspace"
 version = "0.0.0"
 description = "spore-core Python workspace root"
+license = "MIT"
 requires-python = ">=3.12"
 
 [tool.uv.workspace]

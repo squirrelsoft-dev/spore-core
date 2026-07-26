@@ -3,7 +3,7 @@ name = "spore-sqlvec"
 version = "0.0.0"
 edition = "2021"
 description = "sqlite-vec VectorStore backend for spore-core"
-license = "Apache-2.0"
+license = "MIT"
 
 [dependencies]
 spore-core = { path = "../spore-core" }

@@ -3,7 +3,7 @@ name = "spore-cli"
 version = "0.0.0"
 edition = "2021"
 description = "spore-core command-line interface"
-license = "Apache-2.0"
+license = "MIT"
 
 [[bin]]
 name = "spore"
